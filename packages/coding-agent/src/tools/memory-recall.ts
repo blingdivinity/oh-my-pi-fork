@@ -121,17 +121,18 @@ export class MemoryRecallTool implements AgentTool<typeof memoryRecallSchema> {
 }
 
 /**
- * Detect `id:<…>` / `[id:<…>]` shapes anywhere in the query and return the
- * bare id. Used by the recall tool to short-circuit to an exact lookup when
- * the model already knows the id printed by `formatScopedRecallWithIds()`.
+ * Detect `id:<…>`, `[id:<…>]`, and `(id:<…>)` shapes anywhere in the query
+ * and return the bare id. Used by the recall tool to short-circuit to an exact
+ * lookup when the model already knows the id printed by
+ * `formatScopedRecallWithIds()`.
  */
 export function parseRecallIdQuery(query: string): string | undefined {
 	if (!query) return undefined;
 	const trimmed = query.trim();
 	const explicit = /^id:\s*([A-Za-z0-9_:-]{4,})$/.exec(trimmed);
 	if (explicit) return explicit[1];
-	const bracketed = /\[id:\s*([A-Za-z0-9_:-]{4,})\]/i.exec(trimmed);
-	if (bracketed) return bracketed[1];
+	const emittedToken = /(?:\[|\()id:\s*([A-Za-z0-9_:-]{4,})(?:\]|\))/i.exec(trimmed);
+	if (emittedToken) return emittedToken[1];
 	return undefined;
 }
 

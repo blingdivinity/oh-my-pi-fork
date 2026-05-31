@@ -12,6 +12,10 @@ describe("parseRecallIdQuery", () => {
 		expect(parseRecallIdQuery("Memory recall result included [ID: abc987654321]")).toBe("abc987654321");
 	});
 
+	test("returns the id from the parenthesized token emitted by recall results", () => {
+		expect(parseRecallIdQuery("show details for (id: memory-abc123)")).toBe("memory-abc123");
+		expect(parseRecallIdQuery("Recall output copied as (ID: scoped:deadbeef_1234)")).toBe("scoped:deadbeef_1234");
+	});
 	test("does NOT treat a natural-language query as an id lookup", () => {
 		expect(parseRecallIdQuery("what did we decide about auth?")).toBeUndefined();
 		expect(parseRecallIdQuery("user prefers boring changes")).toBeUndefined();
