@@ -384,18 +384,25 @@ const OPENAI_COMPLETIONS_FIRST_EVENT_TIMEOUT_MESSAGE =
 
 const GLM_CODING_PLAN_STREAM_IDLE_TIMEOUT_MS = 600_000;
 const GLM_CODING_PLAN_MODEL_PATTERN = /^glm-5(?:[.-]|$)/i;
+const XIAOMI_MIMO_PRO_STREAM_IDLE_TIMEOUT_MS = 300_000;
+const XIAOMI_MIMO_PRO_MODEL_PATTERN = /^mimo-v2\.5-pro$/i;
 
-/** Returns the widened OpenAI stream watchdog floor for slow GLM coding-plan reasoning models. */
+/** Returns the widened OpenAI stream watchdog floor for slow provider/model combinations. */
 export function getOpenAICompletionsStreamIdleTimeoutFallbackMs(
 	model: Model<"openai-completions">,
 ): number | undefined {
-	if (!GLM_CODING_PLAN_MODEL_PATTERN.test(model.id)) return undefined;
-	if (model.provider === "zhipu-coding-plan" || model.provider === "zai")
-		return GLM_CODING_PLAN_STREAM_IDLE_TIMEOUT_MS;
+	if (GLM_CODING_PLAN_MODEL_PATTERN.test(model.id)) {
+		if (model.provider === "zhipu-coding-plan" || model.provider === "zai")
+			return GLM_CODING_PLAN_STREAM_IDLE_TIMEOUT_MS;
 
-	const baseUrl = model.baseUrl.toLowerCase();
-	if (baseUrl.includes("open.bigmodel.cn") || baseUrl.includes("api.z.ai")) {
-		return GLM_CODING_PLAN_STREAM_IDLE_TIMEOUT_MS;
+		const baseUrl = model.baseUrl.toLowerCase();
+		if (baseUrl.includes("open.bigmodel.cn") || baseUrl.includes("api.z.ai")) {
+			return GLM_CODING_PLAN_STREAM_IDLE_TIMEOUT_MS;
+		}
+	}
+
+	if (model.provider === "xiaomi" && XIAOMI_MIMO_PRO_MODEL_PATTERN.test(model.id)) {
+		return XIAOMI_MIMO_PRO_STREAM_IDLE_TIMEOUT_MS;
 	}
 
 	return undefined;

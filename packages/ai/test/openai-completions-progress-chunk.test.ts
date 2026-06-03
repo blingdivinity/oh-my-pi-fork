@@ -108,6 +108,12 @@ describe("getOpenAICompletionsStreamIdleTimeoutFallbackMs", () => {
 		expect(getOpenAICompletionsStreamIdleTimeoutFallbackMs(model)).toBe(600_000);
 	});
 
+	it("widens Xiaomi MiMo Pro stream watchdogs", () => {
+		const model = getBundledModel("xiaomi", "mimo-v2.5-pro") as Model<"openai-completions">;
+
+		expect(getOpenAICompletionsStreamIdleTimeoutFallbackMs(model)).toBe(300_000);
+	});
+
 	it("keeps ordinary OpenAI-compatible models on the global timeout", () => {
 		expect(getOpenAICompletionsStreamIdleTimeoutFallbackMs(openAICompletionsModel)).toBeUndefined();
 	});

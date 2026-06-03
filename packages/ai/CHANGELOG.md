@@ -4,6 +4,7 @@
 
 ### Fixed
 
+- Fixed Xiaomi MiMo Pro OpenAI-completions streams using the generic 120s first-event watchdog, which could abort slow-but-valid `mimo-v2.5-pro` turns before the provider emitted its first token. ([#1770](https://github.com/can1357/oh-my-pi/issues/1770))
 - Fixed `opencode-zen/minimax-m3-free` (and forward-compat `opencode-zen/minimax-m3`) and `opencode-go/minimax-m3` being routed to `anthropic-messages` despite the OpenCode Zen/Go gateways only serving these ids at `/v1/chat/completions`, which surfaced raw MiniMax/tool-call markup (`<invoke name="bash">`, `<tool_call>`, `<description>`, `<cwd>`, `<|minimax|>`) in the UI. Resolver overrides now pin these ids to `openai-completions` and the bundled `models.json` entries are flipped to match. ([#1617](https://github.com/can1357/oh-my-pi/issues/1617))
 - Fixed MiniMax Coding Plan China login opening the international `platform.minimax.io` subscription page instead of the China `platform.minimaxi.com` page.
 
