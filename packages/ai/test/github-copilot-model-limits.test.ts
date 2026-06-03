@@ -159,22 +159,29 @@ describe("github copilot model limits mapping", () => {
 		expect(model?.maxTokens).toBe(16_000);
 	});
 
-	it("keeps bundled Copilot fallback limits truthful offline", () => {
+	it("keeps bundled Copilot fallback limits truthful and token costs zero offline", () => {
+		expect(getBundledModel("github-copilot", "claude-haiku-4.5")).toMatchObject({
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+		});
 		expect(getBundledModel("github-copilot", "claude-opus-4.6")).toMatchObject({
 			contextWindow: 168_000,
 			maxTokens: 32_000,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 		});
 		expect(getBundledModel("github-copilot", "gpt-5.2")).toMatchObject({
 			contextWindow: 272_000,
 			maxTokens: 128_000,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 		});
 		expect(getBundledModel("github-copilot", "gpt-5.4-mini")).toMatchObject({
 			contextWindow: 272_000,
 			maxTokens: 128_000,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 		});
 		expect(getBundledModel("github-copilot", "grok-code-fast-1")).toMatchObject({
 			contextWindow: 192_000,
 			maxTokens: 64_000,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 		});
 	});
 	it("inherits bundled GPT-5.4 mini reasoning metadata during discovery", async () => {

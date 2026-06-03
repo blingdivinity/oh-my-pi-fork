@@ -9,6 +9,8 @@ const COPILOT_PREMIUM_MULTIPLIERS: Record<string, number> = {
 	"github-copilot/grok-code-fast-1": 0.25,
 };
 
+const ZERO_COST = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } as const satisfies Model["cost"];
+
 import * as path from "node:path";
 import { $env } from "@oh-my-pi/pi-utils";
 import { AuthStorage, type OAuthAccess, SqliteAuthCredentialStore } from "../src/auth-storage";
@@ -168,18 +170,21 @@ function applyGlobalModelsDevFallback(models: readonly Model[], modelsDevModels:
 	});
 }
 
-function applyPremiumMultiplierOverrides(models: readonly Model[]): Model[] {
+function applyCopilotBillingOverrides(models: readonly Model[]): Model[] {
 	return models.map(model => {
-		const premiumMultiplier = COPILOT_PREMIUM_MULTIPLIERS[`${model.provider}/${model.id}`];
-		if (premiumMultiplier === undefined) {
+		if (model.provider !== "github-copilot") {
 			return model;
 		}
-		if (model.premiumMultiplier === premiumMultiplier) {
+
+		const premiumMultiplier = COPILOT_PREMIUM_MULTIPLIERS[`${model.provider}/${model.id}`];
+		const cost = hasBillableCost(model.cost) ? { ...ZERO_COST } : model.cost;
+		if (model.cost === cost && model.premiumMultiplier === premiumMultiplier) {
 			return model;
 		}
 		return {
 			...model,
-			premiumMultiplier,
+			cost,
+			...(premiumMultiplier === undefined ? {} : { premiumMultiplier }),
 		};
 	});
 }
@@ -389,7 +394,7 @@ async function generateModels() {
 	}
 
 	allModels = applyGlobalModelsDevFallback(allModels, modelsDevModels);
-	allModels = applyPremiumMultiplierOverrides(allModels);
+	allModels = applyCopilotBillingOverrides(allModels);
 	allModels = applyCodexPricingFallback(allModels);
 	applyGeneratedModelPolicies(allModels);
 	linkOpenAIPromotionTargets(allModels);
