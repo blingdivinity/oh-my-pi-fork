@@ -116,22 +116,21 @@ function isWindowsSubsystemForLinux(): boolean {
 /**
  * Whether the native console viewport-position probe should be consulted.
  *
- * Returns `true` only on native Windows that is *not* fronted by Windows
- * Terminal. The kernel32 `GetConsoleScreenBufferInfo` API answers about the
- * ConPTY pseudo-console — which is always pinned to its tail — and not about
- * the user-visible scrollback in modern hosts. Treat any such host as
- * unreportable so the renderer falls back to the deferred-rebuild path.
+ * Returns `false` on Windows because modern hosts (Windows Terminal, Tabby,
+ * VS Code, Hyper, Alacritty, etc.) front the process with ConPTY. The kernel32
+ * `GetConsoleScreenBufferInfo` API answers about that pseudo-console — which is
+ * always pinned to its tail — and not about the user-visible host scrollback.
+ * Treat Windows as unreportable so the renderer falls back to the deferred
+ * rebuild path rather than clearing native scrollback from a stale positive.
  *
- * Pure helper for unit testing; the runtime call site reads `$env` /
- * `process.platform`. See #1635.
+ * Parameters are retained for callers/tests that model host environments. See
+ * #1635 and #1746.
  */
 export function shouldTrustNativeViewportProbe(
-	env: { WT_SESSION?: string | undefined } = $env,
-	platform: NodeJS.Platform = process.platform,
+	_env?: { WT_SESSION?: string | undefined },
+	_platform?: NodeJS.Platform,
 ): boolean {
-	if (platform !== "win32") return false;
-	if (env.WT_SESSION) return false;
-	return true;
+	return false;
 }
 
 /**
@@ -236,14 +235,13 @@ export class ProcessTerminal implements Terminal {
 	 * Returns true when Windows' active console viewport is at the scrollback tail.
 	 * POSIX terminals do not expose native scrollback position through a standard API.
 	 *
-	 * On native Windows running under Windows Terminal (the default modern
-	 * host), the `kernel32` probe answers about the ConPTY pseudo-console — not
-	 * the user-visible WT viewport — so it would always read "at bottom" while
-	 * the user is scrolled up. Return `undefined` there so the renderer falls
-	 * back to the POSIX-style deferred-rebuild path: streaming mutations stay
-	 * non-destructive (no `\x1b[3J`), and the rebuild fires at the next prompt
-	 * checkpoint via {@link TUI.refreshNativeScrollbackIfDirty} where the user
-	 * is already pinned to the bottom by the editor keystroke. See #1635.
+	 * On Windows, modern hosts commonly route `omp` through ConPTY. The kernel32
+	 * probe answers about the pseudo-console — not the user-visible host viewport
+	 * — so it can always read "at bottom" while the user is scrolled up. Return
+	 * `undefined` there so the renderer falls back to the POSIX-style
+	 * deferred-rebuild path: streaming mutations stay non-destructive (no
+	 * `\x1b[3J`), and checkpoint rebuilds do not trust stale ConPTY positives.
+	 * See #1635 and #1746.
 	 */
 	isNativeViewportAtBottom(): boolean | undefined {
 		if (!shouldTrustNativeViewportProbe()) return undefined;

@@ -5,21 +5,22 @@ import { VirtualTerminal } from "./virtual-terminal";
 
 // Regression test for https://github.com/can1357/oh-my-pi/issues/1635
 //
-// Native Windows + Windows Terminal (ConPTY) routes `omp` through a
-// pseudo-console whose `GetConsoleScreenBufferInfo` answer always reports
-// "viewport at bottom" — it cannot see the WT host scrollback. When the user
-// scrolled up in WT and the renderer hit a `historyRebuild` intent (the
-// shrink-across-viewport branch), the destructive `\x1b[2J\x1b[H\x1b[3J`
-// sequence reset the WT viewport to the top of scrollback.
+// Native Windows terminals commonly route `omp` through ConPTY. The kernel32
+// `GetConsoleScreenBufferInfo` answer reports the pseudo-console viewport,
+// which is always pinned to its tail, not the user-visible host scrollback.
+// When the user scrolled up in a ConPTY host (Windows Terminal, Tabby, etc.)
+// and the renderer hit a `historyRebuild` intent (the shrink-across-viewport
+// branch), the destructive `\x1b[2J\x1b[H\x1b[3J` sequence reset the host
+// viewport to the top of scrollback.
 //
-// Fix: `shouldTrustNativeViewportProbe` returns false under WT_SESSION so the
-// probe falls back to `undefined`, and the renderer's existing
-// deferred-rebuild path keeps streaming-time mutations non-destructive.
+// Fix: `shouldTrustNativeViewportProbe` returns false on Windows so the probe
+// falls back to `undefined`, and the renderer's existing deferred-rebuild path
+// keeps streaming-time mutations non-destructive.
 //
 // The renderer assertions below override the VirtualTerminal probe to simulate
 // the two relevant post-fix outcomes:
 //
-//  - `undefined`: probe is unreportable (WT-hosted on win32, or any POSIX
+//  - `undefined`: probe is unreportable (Windows ConPTY hosts, or any POSIX
 //                 host where the probe never had an answer to begin with).
 //  - `false`:     the host can see scrollback and reports the user scrolled
 //                 up. Both must avoid `\x1b[3J`.
@@ -72,8 +73,8 @@ async function withPlatform<T>(platform: NodeJS.Platform, run: () => T | Promise
 const ERASE_SCROLLBACK = /\x1b\[3J/g;
 
 describe("issue #1635: shouldTrustNativeViewportProbe", () => {
-	it("returns true on bare native Windows (legacy console)", () => {
-		expect(shouldTrustNativeViewportProbe({}, "win32")).toBe(true);
+	it("returns false on unbranded native Windows ConPTY hosts", () => {
+		expect(shouldTrustNativeViewportProbe({}, "win32")).toBe(false);
 	});
 
 	it("returns false when running under Windows Terminal", () => {
