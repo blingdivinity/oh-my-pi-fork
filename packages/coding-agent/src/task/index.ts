@@ -673,7 +673,14 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		}
 
 		const planModeState = this.session.getPlanModeState?.();
-		const planModeTools = ["read", "search", "find", "lsp", "web_search"];
+		// Plan-mode subagents get a fixed read-only base. Additionally preserve any
+		// agent-declared tools that are already classified as read-only (e.g. the
+		// reviewer's `report_finding`, or `ast_grep`) so the agent's system prompt
+		// and tool inventory don't disagree (issue #1998).
+		const planModeBaseTools = ["read", "search", "find", "lsp", "web_search"];
+		const declaredReadOnlyExtras =
+			agent.tools?.filter(name => !planModeBaseTools.includes(name) && READ_ONLY_TOOL_NAMES.has(name)) ?? [];
+		const planModeTools = [...planModeBaseTools, ...declaredReadOnlyExtras];
 		const effectiveAgent: typeof agent = planModeState?.enabled
 			? {
 					...agent,

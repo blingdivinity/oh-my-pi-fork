@@ -253,4 +253,26 @@ describe("subagent LSP availability", () => {
 		expect(getOptions()?.enableLsp).toBe(true);
 		expect(getOptions()?.toolNames).toEqual(["read", "search", "find", "lsp", "web_search", "irc"]);
 	});
+
+	it("preserves agent-declared read-only specialty tools in plan mode (issue #1998)", async () => {
+		mockAgents({
+			name: "reviewer",
+			description: "Reviewer agent",
+			systemPrompt: "Call report_finding then yield.",
+			source: "bundled",
+			tools: ["read", "search", "find", "bash", "lsp", "web_search", "ast_grep", "report_finding"],
+		});
+		const { getOptions } = mockCreateAgentSession();
+		const planMode = { enabled: true, planFilePath: "local://PLAN.md" };
+
+		const tool = await TaskTool.create(createSession({ planMode }));
+		await tool.execute("tool-call", { ...TEST_TASK, agent: "reviewer" });
+
+		// `bash` dropped (not in READ_ONLY_TOOL_NAMES); `report_finding` and
+		// `ast_grep` preserved so reviewer's prompt and tool inventory agree.
+		const toolNames = getOptions()?.toolNames;
+		expect(toolNames).toContain("report_finding");
+		expect(toolNames).toContain("ast_grep");
+		expect(toolNames).not.toContain("bash");
+	});
 });
