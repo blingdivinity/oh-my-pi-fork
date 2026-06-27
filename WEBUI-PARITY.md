@@ -109,7 +109,7 @@ Web plumbing: gateway `packages/coding-agent/src/webui/gateway.ts`; client
 | `/stats` | text | 🟡 | launches local stats dashboard — web could link out |
 | `/debug` | TUI-only | ❌ | debug tools selector — overlay |
 | `/hotkeys` | TUI-only | ❌ | show shortcuts — web help overlay |
-| `/settings` | TUI-only | ❌ | **settings menu — BUILD read+write panel** |
+| `/settings` | TUI-only | ✅ | settings panel (read+write) over `get-settings`/`set-setting`, persists to the shared store |
 
 **Tally:** ✅ ~24 · 🟡 ~12 · ⛔/❌ ~20 · ➖ ~6. The "both" commands already run
 (text); the gap is (a) TUI-only selectors/dashboards and (b) richer surfaces for
@@ -148,10 +148,16 @@ commands that today only echo text.
 
 `omp --mode web` runs against the real `Settings` store (same instance as the
 TUI), so a web write lands in the user's config files and the TUI sees it on next
-read. **Status: ❌ no settings panel yet.** Plan: add `get`/`set` control frames
-to the gateway and a settings panel mirroring the TUI's `/settings` menu
-(approval mode, thinking default, model scope, advisor, etc.), then verify a web
-write is visible in the TUI.
+read. **Status: ✅ done.** The gateway projects the SAME declarative catalog the
+TUI menu uses (`settings-defs`/`settings-schema`) over `get-settings`, and
+`set-setting` writes back through `Settings.set` (the shared store) with type
+coercion + validation. The web `SettingsPanel` (`/settings`) renders the 10 tabs
+with boolean/enum/submenu/text controls. Verified: boolean + enum round-trip live
+and through a deterministic bridge test (`settings-bridge.test.ts`).
+
+_Gap:_ runtime-injected option lists (themes via `options: "runtime"`) arrive
+empty over the wire — the theme submenu shows only the current value. Needs a
+runtime option source (follow-up).
 
 ---
 
@@ -160,15 +166,15 @@ write is visible in the TUI.
 - Slash commands execute (don't leak to model); unknown slash → model (correct).
 - **One Enter runs the highlighted command** (Tab completes for arg-entry).
 - Model dropdown shows **provider prefix**.
-- shift+tab thinking · ctrl+p model · Esc abort.
+- shift+tab thinking · ctrl+p model · Esc abort · alt+m model picker.
 - `command-output` surfaces as a toast.
 - Dev serving rebuilds the SPA when source is stale.
+- **`/model` picker overlay** (provider/name, fuzzy, current) + `/settings` panel.
 
 ## Next up (priority order)
 
-1. **`/model` selector overlay** + alt+m / `/switch` / alt+p routing (provider/id, fuzzy, current).
-2. **Settings panel** (read+write control frames) + TUI↔web persistence check.
-3. Remaining shortcuts: ctrl+t, shift+ctrl+p, ctrl+o, alt+r, alt+up, follow-up.
-4. Mode toggles as control ops: `/plan`, `/loop`, `/goal`, `/retry`, `/btw`, `/tan`.
-5. Session overlays: `/resume`, `/tree`, `/branch`/`/fork`, `/new`/`/drop`.
-6. Richer surfaces: `/context` breakdown, `/todo` editor, `/dump`/`/export` browser copy/download, `/hotkeys` help.
+1. Remaining shortcuts: ctrl+t, shift+ctrl+p, ctrl+o, alt+r, alt+up, follow-up.
+2. Mode toggles as control ops: `/plan`, `/loop`, `/goal`, `/retry`, `/btw`, `/tan`.
+3. Session overlays: `/resume`, `/tree`, `/branch`/`/fork`, `/new`/`/drop`.
+4. Richer surfaces: `/context` breakdown, `/todo` editor, `/dump`/`/export` browser copy/download, `/hotkeys` help.
+5. Theme runtime options over the wire (settings panel gap).

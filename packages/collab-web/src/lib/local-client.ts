@@ -29,6 +29,7 @@ import type {
 	WebExtUIResponse,
 	WebMcpServerStatus,
 	WebModelInfo,
+	WebSettingsTab,
 	WebSlashCommand,
 	WebToolApprovalDecision,
 	WebToolApprovalRequest,
@@ -43,6 +44,7 @@ export interface LocalSnapshot extends GuestSnapshot {
 	commands: readonly WebSlashCommand[];
 	models: readonly WebModelInfo[];
 	mcp: readonly WebMcpServerStatus[];
+	settings: readonly WebSettingsTab[];
 	/** Slash-command stdout (e.g. /help, /mcp list), newest last, capped. */
 	commandOutput: readonly string[];
 	/** Head of the pending tool-approval queue, or null. */
@@ -98,6 +100,7 @@ export class LocalClient {
 	#commands: readonly WebSlashCommand[] = [];
 	#models: readonly WebModelInfo[] = [];
 	#mcp: readonly WebMcpServerStatus[] = [];
+	#settings: readonly WebSettingsTab[] = [];
 	#commandOutput: readonly string[] = [];
 	#extUiQueue: WebExtUIRequest[] = [];
 	#approvalQueue: WebToolApprovalRequest[] = [];
@@ -194,6 +197,12 @@ export class LocalClient {
 	}
 	cycleThinking(): Promise<unknown> {
 		return this.#ctl(reqId => ({ t: "ctl", op: "cycle-thinking", reqId }));
+	}
+	getSettings(): Promise<unknown> {
+		return this.#ctl(reqId => ({ t: "ctl", op: "get-settings", reqId }));
+	}
+	setSetting(path: string, value: boolean | string): Promise<unknown> {
+		return this.#ctl(reqId => ({ t: "ctl", op: "set-setting", reqId, path, value }));
 	}
 	compact(instructions?: string): Promise<unknown> {
 		return this.#ctl(reqId => ({ t: "ctl", op: "compact", reqId, instructions }));
@@ -339,6 +348,9 @@ export class LocalClient {
 				break;
 			case "mcp":
 				this.#mcp = frame.servers;
+				break;
+			case "settings":
+				this.#settings = frame.settings;
 				break;
 			case "command-output":
 				this.#commandOutput = [...this.#commandOutput, frame.text].slice(-MAX_COMMAND_OUTPUT);
@@ -500,6 +512,7 @@ export class LocalClient {
 			commands: this.#commands,
 			models: this.#models,
 			mcp: this.#mcp,
+			settings: this.#settings,
 			commandOutput: this.#commandOutput,
 			pendingApproval: this.#approvalQueue[0] ?? null,
 			pendingExtUI: this.#extUiQueue[0] ?? null,

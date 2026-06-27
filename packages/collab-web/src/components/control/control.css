@@ -190,3 +190,54 @@
 	opacity: 0.6;
 	padding: 8px;
 }
+
+.lc-settings {
+	width: min(680px, 94vw);
+	max-height: 78vh;
+	display: flex;
+	flex-direction: column;
+}
+.lc-settings-tabs {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 4px;
+	margin: 0 0 8px;
+	border-bottom: 1px solid var(--tv-border, #2a2a2a);
+	padding-bottom: 8px;
+}
+.lc-settings-tab[data-active="true"] {
+	background: var(--tv-accent-soft, #2a3a55);
+}
+.lc-settings-body {
+	overflow-y: auto;
+	flex: 1;
+	min-height: 0;
+	display: flex;
+	flex-direction: column;
+	gap: 8px;
+}
+.lc-setting {
+	display: flex;
+	justify-content: space-between;
+	align-items: center;
+	gap: 16px;
+}
+.lc-setting-info {
+	display: flex;
+	flex-direction: column;
+	min-width: 0;
+}
+.lc-setting-label {
+	font-weight: 600;
+}
+.lc-setting-desc {
+	opacity: 0.6;
+	font-size: 12px;
+}
+.lc-setting-control {
+	flex: 0 0 auto;
+}
+.lc-setting-control select,
+.lc-setting-control input[type="text"] {
+	max-width: 240px;
+}

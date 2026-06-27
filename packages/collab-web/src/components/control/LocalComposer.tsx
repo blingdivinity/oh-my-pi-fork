@@ -9,15 +9,22 @@ interface LocalComposerProps {
 	snapshot: LocalSnapshot;
 	/** Open the model picker overlay for /model, /models, /switch. */
 	onOpenModelPicker?: () => void;
+	/** Open the settings panel for /settings. */
+	onOpenSettings?: () => void;
 }
 
-export function LocalComposer({ client, snapshot, onOpenModelPicker }: LocalComposerProps): ReactNode {
+export function LocalComposer({ client, snapshot, onOpenModelPicker, onOpenSettings }: LocalComposerProps): ReactNode {
 	const [text, setText] = useState("");
 	const [activeSlash, setActiveSlash] = useState(0);
 	const readOnly = snapshot.readOnly;
-	const tryModelMenu = (name: string): boolean => {
-		if (onOpenModelPicker && MODEL_MENU_CMDS.has(name.toLowerCase())) {
+	const tryLocalUi = (name: string): boolean => {
+		const cmd = name.toLowerCase();
+		if (onOpenModelPicker && MODEL_MENU_CMDS.has(cmd)) {
 			onOpenModelPicker();
+			return true;
+		}
+		if (onOpenSettings && cmd === "settings") {
+			onOpenSettings();
 			return true;
 		}
 		return false;
@@ -35,7 +42,7 @@ export function LocalComposer({ client, snapshot, onOpenModelPicker }: LocalComp
 		if (!value || readOnly) return;
 		if (value.startsWith("/")) {
 			const [head, ...rest] = value.slice(1).split(/\s+/);
-			if (rest.length > 0 || !tryModelMenu(head ?? "")) void client.runSlash(value);
+			if (rest.length > 0 || !tryLocalUi(head ?? "")) void client.runSlash(value);
 		} else void client.prompt(value);
 		setText("");
 		setActiveSlash(0);
@@ -47,7 +54,7 @@ export function LocalComposer({ client, snapshot, onOpenModelPicker }: LocalComp
 	};
 	const runSlashName = (name: string): void => {
 		if (readOnly) return;
-		if (!tryModelMenu(name)) void client.runSlash(`/${name}`);
+		if (!tryLocalUi(name)) void client.runSlash(`/${name}`);
 		setText("");
 		setActiveSlash(0);
 	};

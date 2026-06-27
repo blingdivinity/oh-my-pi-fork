@@ -43,6 +43,7 @@ import { parseConfiguredThinkingLevel } from "../thinking";
 import type { EventBus } from "../utils/event-bus";
 import { type PendingExtensionUIRequest, WebExtensionUIContext } from "./extension-ui";
 import { toWebMcpStatus, toWebModels, toWebSlashCommands } from "./projections";
+import { applyWebSetting, buildWebSettings } from "./settings-bridge";
 import type { GatewayHostFrame, GatewayInbound, GatewayOutbound, GatewayPeer } from "./types";
 
 const STATE_DEBOUNCE_MS = 100;
@@ -263,13 +264,14 @@ export class SessionGateway {
 				capabilities: {
 					canWrite: peer.canWrite,
 					control: peer.control,
-					features: ["slash", "models", "mcp", "ext-ui"],
+					features: ["slash", "models", "mcp", "ext-ui", "settings"],
 					proto: WEB_CONTROL_PROTO,
 				} satisfies WebCapabilities,
 			});
 			void this.#broadcastCommands(peer);
 			this.#sendModels(peer);
 			this.#sendMcp(peer);
+			this.#sendSettings(peer);
 		}
 	}
 
@@ -382,6 +384,17 @@ export class SessionGateway {
 				case "get-mcp":
 					this.#sendMcp(peer);
 					return ack(true);
+				case "get-settings":
+					this.#sendSettings(peer);
+					return ack(true);
+				case "set-setting": {
+					this.#requireWrite(peer);
+					const err = applyWebSetting(this.#session.settings, frame.path, frame.value);
+					if (err) return ack(false, err);
+					this.#sendSettings();
+					this.#sendModels();
+					return ack(true);
+				}
 				case "tool-approval":
 					this.#pendingApprovals.get(frame.approvalId)?.resolve(frame.decision);
 					this.#pendingApprovals.delete(frame.approvalId);
@@ -559,6 +572,12 @@ export class SessionGateway {
 
 	#broadcastMcp(): void {
 		this.#sendMcp();
+	}
+
+	#sendSettings(target?: GatewayPeer): void {
+		const frame: GatewayOutbound = { t: "settings", settings: buildWebSettings(this.#session.settings) };
+		if (target) target.send(frame);
+		else this.#broadcastControl(frame);
 	}
 
 	// ── State + agents projections ────────────────────────────────────────────

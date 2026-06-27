@@ -84,6 +84,31 @@ export interface WebMcpServerStatus {
 	scope?: string;
 }
 
+/** An option for an enum/submenu setting. */
+export interface WebSettingOption {
+	value: string;
+	label: string;
+}
+
+/** A user-facing setting mirrored from the TUI settings menu (settings-defs). */
+export interface WebSetting {
+	path: string;
+	tab: string;
+	group?: string;
+	label: string;
+	description: string;
+	kind: "boolean" | "enum" | "submenu" | "text";
+	options?: WebSettingOption[];
+	value: boolean | string;
+}
+
+/** A settings tab (group of settings) for the web settings panel. */
+export interface WebSettingsTab {
+	id: string;
+	label: string;
+	settings: WebSetting[];
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // Tool approval (host → guest request, guest → host decision)
 // ═══════════════════════════════════════════════════════════════════════════
@@ -193,6 +218,8 @@ export type WebControlFrame =
 	| { t: "ctl"; op: "get-models"; reqId: number }
 	| { t: "ctl"; op: "get-commands"; reqId: number }
 	| { t: "ctl"; op: "get-mcp"; reqId: number }
+	| { t: "ctl"; op: "get-settings"; reqId: number }
+	| { t: "ctl"; op: "set-setting"; reqId: number; path: string; value: boolean | string }
 	| { t: "ctl"; op: "tool-approval"; reqId: number; approvalId: string; decision: WebToolApprovalDecision }
 	/** Reply to a {@link WebExtUIRequest}. */
 	| { t: "ext-ui-response"; response: WebExtUIResponse }
@@ -212,6 +239,7 @@ export type WebControlEvent =
 	| { t: "commands"; commands: WebSlashCommand[] }
 	| { t: "models"; models: WebModelInfo[] }
 	| { t: "mcp"; servers: WebMcpServerStatus[] }
+	| { t: "settings"; settings: WebSettingsTab[] }
 	/** Output text from a slash command run (e.g. /help, /mcp list). */
 	| { t: "command-output"; text: string }
 	| { t: "tool-approval-request"; request: WebToolApprovalRequest }

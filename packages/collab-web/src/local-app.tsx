@@ -5,6 +5,7 @@ import { ControlOverlays } from "./components/control/ControlOverlays";
 import { ExtPanelHost } from "./components/control/ExtPanelHost";
 import { LocalComposer } from "./components/control/LocalComposer";
 import { ModelPicker } from "./components/control/ModelPicker";
+import { SettingsPanel } from "./components/control/SettingsPanel";
 import { Banners } from "./components/shell/Banners";
 import { HeaderBar } from "./components/shell/HeaderBar";
 import { Toasts } from "./components/shell/Toasts";
@@ -40,6 +41,7 @@ function LocalSession({ client }: { client: LocalClient }): ReactNode {
 	const [railOpen, setRailOpen] = useState(false);
 	const [selectedId, setSelectedId] = useState<string | null>(null);
 	const [modelPicker, setModelPicker] = useState(false);
+	const [settingsOpen, setSettingsOpen] = useState(false);
 
 	const subCount = useMemo(() => snap.agents.filter(a => a.kind === "sub").length, [snap.agents]);
 	const agentIds = useMemo(() => new Set(snap.agents.map(a => a.id)), [snap.agents]);
@@ -125,9 +127,18 @@ function LocalSession({ client }: { client: LocalClient }): ReactNode {
 					<pre>{snap.commandOutput.join("\n")}</pre>
 				</details>
 			)}
-			<LocalComposer client={client} snapshot={snap} onOpenModelPicker={() => setModelPicker(true)} />
+			<LocalComposer
+				client={client}
+				snapshot={snap}
+				onOpenModelPicker={() => setModelPicker(true)}
+				onOpenSettings={() => {
+					void client.getSettings();
+					setSettingsOpen(true);
+				}}
+			/>
 			<ControlOverlays client={client} snapshot={snap} />
 			{modelPicker && <ModelPicker client={client} models={snap.models} onClose={() => setModelPicker(false)} />}
+			{settingsOpen && <SettingsPanel client={client} tabs={snap.settings} onClose={() => setSettingsOpen(false)} />}
 			<Banners
 				phase={snap.phase}
 				endedReason={snap.endedReason}
