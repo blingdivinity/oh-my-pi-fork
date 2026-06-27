@@ -59,13 +59,13 @@ Web plumbing: gateway `packages/coding-agent/src/webui/gateway.ts`; client
 | cmd | kind | web | notes / plan |
 |---|---|---|---|
 | `/plan` | TUI-only | ✅ | toggles plan mode (gateway sets PlanModeState, ACP-style) + mode bar |
-| `/plan-review` | TUI-only | ❌ | reopen latest plan review — overlay |
+| `/plan-review` | TUI-only | ❌ | reopen the written plan — deferred (needs `local://` plan-artifact read; plan toggle + mode bar ship) |
 | `/goal` | TUI-only | ✅ | goal panel: set/pause/resume/drop/budget via goalRuntime control ops; mode bar reflects state |
 | `/guided-goal` | TUI-only | ✅ | opens the goal panel (set/budget); the LLM interview is a TUI nicety, the panel reaches the same goal |
 | `/loop` | TUI-only | ✅ | client-side loop: re-sends your last prompt after each yield; Esc stops; mode-bar banner |
-| `/btw` | TUI-only | ❌ | ephemeral side question — deferred (branch flow) |
-| `/tan` | TUI-only | ❌ | background tangential agent — deferred |
-| `/omfg` | TUI-only | ❌ | forge TTSR rule from complaint — dialog |
+| `/btw` | TUI-only | ❌ | controller-coupled (`BtwController`); needs a session-API lift — out of UI scope |
+| `/tan` | TUI-only | ❌ | controller-coupled (`TanCommandController`); needs a session-API lift — out of UI scope |
+| `/omfg` | TUI-only | ❌ | controller-coupled (`OmfgController`); needs a session-API lift — out of UI scope |
 | `/retry` | TUI-only | ✅ | routed to session.retry() (also alt+r) |
 | `/force` | both | 🟡 | runs; needs tool arg (no selector yet) |
 
@@ -80,20 +80,20 @@ Web plumbing: gateway `packages/coding-agent/src/webui/gateway.ts`; client
 | `/todo` | both | ✅ | always-visible todo HUD (phases + status glyphs) from SessionState.todos |
 | `/dump` | both | ✅ | transcript in command-output + a copy button |
 | `/export` | both | ✅ | export-html op → browser download of the HTML |
-| `/copy` | TUI-only | ❌ | pick text/code to copy — selection overlay |
+| `/copy` | TUI-only | ➖ | native browser text selection + Ctrl/Cmd+C covers this |
 | `/memory` | both | ✅ | many subs; run as text |
 
 ### Providers, MCP, plugins, infra
 | cmd | kind | web | notes / plan |
 |---|---|---|---|
-| `/setup` `/providers` | TUI-only | ❌ | provider setup wizard — onboarding dialog; defer |
-| `/login` `/logout` | TUI-only | ❌/➖ | OAuth device flow — needs web auth surface |
+| `/setup` `/providers` | TUI-only | ➖ | first-run provider onboarding — done via the CLI/terminal |
+| `/login` `/logout` | TUI-only | ➖ | provider OAuth runs on the host/CLI; the web server itself is token-authed |
 | `/mcp` | both | ✅ | full sub-tree runs (text); MCP badge shows status |
 | `/ssh` | both | ✅ | `add`/`list`/`remove` run |
 | `/marketplace` | both | ✅ | runs (text) |
 | `/plugins` | both | ✅ | `list`/`enable`/`disable` run |
 | `/reload-plugins` | both | ✅ | runs |
-| `/extensions` | TUI-only | ❌ | Extension Control Center — panel |
+| `/extensions` | TUI-only | 🟡 | `/marketplace` + `/reload-plugins` manage plugins as text; the Control Center dashboard is a deferred panel |
 | `/agents` | TUI-only | ✅ | opens the agents rail (`AgentsPanel`) — the web Agent Control Center |
 
 ### Collab, sharing, misc
@@ -107,15 +107,18 @@ Web plumbing: gateway `packages/coding-agent/src/webui/gateway.ts`; client
 | `/usage` | both | ✅ | `show`/`reset` run |
 | `/changelog` | both | ✅ | runs |
 | `/stats` | text | 🟡 | launches local stats dashboard — web could link out |
-| `/debug` | TUI-only | ❌ | debug tools selector — overlay |
+| `/debug` | TUI-only | ➖ | terminal developer tool (memory/state dumps) |
 | `/hotkeys` | TUI-only | ✅ | keyboard + command reference overlay (Esc closes) |
 | `/settings` | TUI-only | ✅ | settings panel (read+write) over `get-settings`/`set-setting`, persists to the shared store |
 
-**Tally (updated):** ✅ ~35 · 🟡 ~8 · ⛔/❌ ~9 · ➖ ~6. Shipped: `/model` `/settings`
-`/hotkeys` `/new` `/resume` `/fork` `/branch` `/plan` `/retry` `/todo` `/goal` `/context`,
-plus every keyboard shortcut. Remaining gaps are deep interactive flows
-(`/tree`, `/loop`, `/btw`, `/tan`, `/guided-goal`) and a couple of polish items
-(`/dump` copy button, `/export` download).
+**Tally (updated):** ✅ ~46 · 🟡 ~5 · ➖ ~6 · ❌ 4. This round shipped `/todo`
+`/goal` `/context` `/dump` `/export` `/loop` `/tree` `/handoff` `/drop` `/guided-goal`
+`/agents`, theme runtime options, and the `ctrl+r` history / `alt+up` dequeue shortcuts.
+The only remaining ❌ are controller-coupled flows — `/btw`, `/tan`, `/omfg`
+(dedicated TUI controllers) and `/plan-review`'s plan-artifact overlay — which need
+a session-API lift to stay a thin UI consumer rather than reimplementing controller
+state machines. Browser-N/A flows (`/copy`, `/login`/`/logout`, `/setup`/`/providers`,
+`/debug`) are marked ➖ with their host/CLI/native resolution.
 
 ---
 
@@ -174,9 +177,13 @@ persists through `Settings.set` (verified live: dark theme → `amethyst` round-
 - Dev serving rebuilds the SPA when source is stale.
 - **`/model` picker overlay** (provider/name, fuzzy, current) + `/settings` panel.
 
-## Next up (priority order)
+## Remaining (core-refactor territory, not UI work)
 
-1. `/guided-goal` interview wizard.
-2. Web-appropriate resolutions for the remaining TUI-only flows (`/btw`, `/tan`,
-   `/omfg`, `/handoff`, `/drop`, `/login`/`/logout`, `/debug`, `/copy`,
-   `/extensions`, `/agents`).
+1. Lift `BtwController` / `TanCommandController` / `OmfgController` (the `/btw`,
+   `/tan`, `/omfg` flows) out of the interactive-mode controller into a
+   UI-agnostic session API, then add thin web overlays. Today the gateway shows an
+   honest "interactive-only" notice for them.
+2. `/plan-review`: expose a session method to read the `local://` plan artifact, then
+   render it in a panel (plan-mode toggle + mode bar already ship).
+3. `/extensions` Control Center dashboard (plugin management already runs as text via
+   `/marketplace` + `/reload-plugins`).
