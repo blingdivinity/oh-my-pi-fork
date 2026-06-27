@@ -1,13 +1,16 @@
 import type { AssistantMessage, ImageContent, SessionEntry, TextContent, ToolResultMessage } from "@oh-my-pi/pi-wire";
 import { ChevronRight } from "lucide-react";
 import type { ReactNode } from "react";
-import { memo, useEffect, useMemo, useRef, useState } from "react";
+import { createContext, memo, useContext, useEffect, useMemo, useRef, useState } from "react";
 import type { ActiveTool } from "../../lib/client";
 import { fmtTokens } from "../../lib/format";
 import type { ToolRenderHost } from "../../tool-render";
 import { Markdown } from "./Markdown";
 import { ToolCard } from "./ToolCard";
 import "./transcript.css";
+
+/** When true (set by the local app via ctrl+t) thinking blocks are hidden. */
+export const ThinkingHideContext = createContext(false);
 
 export interface TranscriptProps {
 	entries: readonly SessionEntry[];
@@ -42,7 +45,9 @@ function Row({
 }
 
 function ThinkingBlock({ text, redacted }: { text: string; redacted?: boolean }): ReactNode {
+	const hide = useContext(ThinkingHideContext);
 	const [open, setOpen] = useState(false);
+	if (hide) return null;
 	return (
 		<div className="tr-think">
 			<button type="button" className="tr-think-head" onClick={() => setOpen(v => !v)}>

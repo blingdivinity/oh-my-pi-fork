@@ -4,11 +4,14 @@
  */
 import { INTENT_FIELD } from "@oh-my-pi/pi-wire";
 import type { ReactNode } from "react";
-import { useState } from "react";
+import { createContext, useContext, useState } from "react";
 import { resolveToolRenderer } from "./registry";
 import type { ToolRenderHost, ToolRenderProps, ToolResultLike } from "./types";
 import { isRecord, replaceTabs, stripAnsi } from "./util";
 import "./tool-render.css";
+
+/** When true (set by the local app via ctrl+o) every tool body is forced open. */
+export const ToolExpandContext = createContext(false);
 
 export interface ToolViewProps {
 	name: string;
@@ -37,7 +40,9 @@ function normalizeArgs(raw: unknown): { args: Record<string, unknown>; intent: s
 }
 
 export function ToolView(props: ToolViewProps): ReactNode {
+	const expandAll = useContext(ToolExpandContext);
 	const [open, setOpen] = useState(props.defaultOpen ?? false);
+	const isOpen = expandAll || open;
 	const { args, intent: argIntent } = normalizeArgs(props.args);
 	const intent = props.intent?.trim() || argIntent;
 	const renderer = resolveToolRenderer(props.name);
@@ -58,7 +63,7 @@ export function ToolView(props: ToolViewProps): ReactNode {
 			<button
 				type="button"
 				className="tv-head"
-				aria-expanded={open}
+				aria-expanded={isOpen}
 				onClick={() => setOpen(v => !v)}
 				title={intent || undefined}
 			>
@@ -73,7 +78,7 @@ export function ToolView(props: ToolViewProps): ReactNode {
 				</span>
 				<span className="tv-chev" aria-hidden="true" />
 			</button>
-			{open && (
+			{isOpen && (
 				<div className="tv-body">
 					{intent && <div className="tv-intent">{intent}</div>}
 					{renderer.Body ? <renderer.Body {...renderProps} /> : null}

@@ -41,7 +41,9 @@ export async function startMockWebServer(options: { port?: number; reply?: strin
 	if (!model) throw new Error("bundled model unavailable");
 	// `handler` (not a fixed `responses` array) answers EVERY prompt the browser
 	// sends, so the harness stays interactive across multiple turns.
-	const mock = createMockModel({ handler: () => ({ content: [reply] }) });
+	const mock = createMockModel({
+		handler: () => ({ content: [{ type: "thinking", thinking: "Reasoning about the request." }, reply] }),
+	});
 	const agent = new Agent({
 		getApiKey: () => "test-key",
 		initialState: { model, systemPrompt: ["Test"], tools: [] },

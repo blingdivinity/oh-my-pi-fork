@@ -9,10 +9,10 @@ import { SettingsPanel } from "./components/control/SettingsPanel";
 import { Banners } from "./components/shell/Banners";
 import { HeaderBar } from "./components/shell/HeaderBar";
 import { Toasts } from "./components/shell/Toasts";
-import { Transcript } from "./components/transcript/Transcript";
+import { ThinkingHideContext, Transcript } from "./components/transcript/Transcript";
 import { LocalClient } from "./lib/local-client";
 import { localWsUrl, type OmpWebConfig, useLocalSnapshot } from "./lib/use-local";
-import type { ToolRenderHost } from "./tool-render";
+import { ToolExpandContext, type ToolRenderHost } from "./tool-render";
 import "./components/shell/shell.css";
 import "./components/control/control.css";
 
@@ -42,6 +42,8 @@ function LocalSession({ client }: { client: LocalClient }): ReactNode {
 	const [selectedId, setSelectedId] = useState<string | null>(null);
 	const [modelPicker, setModelPicker] = useState(false);
 	const [settingsOpen, setSettingsOpen] = useState(false);
+	const [expandTools, setExpandTools] = useState(false);
+	const [hideThinking, setHideThinking] = useState(false);
 
 	const subCount = useMemo(() => snap.agents.filter(a => a.kind === "sub").length, [snap.agents]);
 	const agentIds = useMemo(() => new Set(snap.agents.map(a => a.id)), [snap.agents]);
@@ -81,6 +83,12 @@ function LocalSession({ client }: { client: LocalClient }): ReactNode {
 			} else if (e.code === "KeyR" && e.altKey && !e.ctrlKey && !e.metaKey) {
 				e.preventDefault();
 				void client.retry();
+			} else if (e.code === "KeyT" && e.ctrlKey && !e.shiftKey && !e.metaKey && !e.altKey) {
+				e.preventDefault();
+				setHideThinking(v => !v);
+			} else if (e.code === "KeyO" && e.ctrlKey && !e.shiftKey && !e.metaKey && !e.altKey) {
+				e.preventDefault();
+				setExpandTools(v => !v);
 			} else if (e.code === "Escape" && working) {
 				e.preventDefault();
 				client.sendAbort();
@@ -102,14 +110,18 @@ function LocalSession({ client }: { client: LocalClient }): ReactNode {
 			<main className="sh-main">
 				<section className="sh-content" data-rail={railOpen ? "true" : "false"}>
 					<div className="sh-transcript">
-						<Transcript
-							entries={snap.entries}
-							stream={snap.stream}
-							streamDone={snap.streamDone}
-							activeTools={snap.activeTools}
-							working={snap.working}
-							host={toolHost}
-						/>
+						<ToolExpandContext.Provider value={expandTools}>
+							<ThinkingHideContext.Provider value={hideThinking}>
+								<Transcript
+									entries={snap.entries}
+									stream={snap.stream}
+									streamDone={snap.streamDone}
+									activeTools={snap.activeTools}
+									working={snap.working}
+									host={toolHost}
+								/>
+							</ThinkingHideContext.Provider>
+						</ToolExpandContext.Provider>
 					</div>
 				</section>
 				{railOpen && (
