@@ -152,3 +152,41 @@
 	overflow: auto;
 	white-space: pre-wrap;
 }
+
+.lc-picker {
+	width: min(560px, 92vw);
+	max-height: 70vh;
+	display: flex;
+	flex-direction: column;
+}
+.lc-picker-input {
+	width: 100%;
+	margin: 0 0 8px;
+}
+.lc-picker-list {
+	overflow-y: auto;
+	flex: 1;
+	min-height: 0;
+}
+.lc-picker-item {
+	display: flex;
+	justify-content: space-between;
+	gap: 12px;
+	padding: 4px 8px;
+	cursor: pointer;
+	border-radius: 4px;
+}
+.lc-picker-item[data-active="true"] {
+	background: var(--tv-accent-soft, #2a3a55);
+}
+.lc-picker-item[data-current="true"] .lc-picker-name {
+	font-weight: 600;
+}
+.lc-picker-id {
+	opacity: 0.6;
+	white-space: nowrap;
+}
+.lc-picker-empty {
+	opacity: 0.6;
+	padding: 8px;
+}

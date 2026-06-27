@@ -4,6 +4,7 @@ import { AgentsPanel } from "./components/agents/AgentsPanel";
 import { ControlOverlays } from "./components/control/ControlOverlays";
 import { ExtPanelHost } from "./components/control/ExtPanelHost";
 import { LocalComposer } from "./components/control/LocalComposer";
+import { ModelPicker } from "./components/control/ModelPicker";
 import { Banners } from "./components/shell/Banners";
 import { HeaderBar } from "./components/shell/HeaderBar";
 import { Toasts } from "./components/shell/Toasts";
@@ -38,6 +39,7 @@ function LocalSession({ client }: { client: LocalClient }): ReactNode {
 	const snap = useLocalSnapshot(client);
 	const [railOpen, setRailOpen] = useState(false);
 	const [selectedId, setSelectedId] = useState<string | null>(null);
+	const [modelPicker, setModelPicker] = useState(false);
 
 	const subCount = useMemo(() => snap.agents.filter(a => a.kind === "sub").length, [snap.agents]);
 	const agentIds = useMemo(() => new Set(snap.agents.map(a => a.id)), [snap.agents]);
@@ -60,13 +62,17 @@ function LocalSession({ client }: { client: LocalClient }): ReactNode {
 	const working = snap.working;
 	useEffect(() => {
 		const onKey = (e: KeyboardEvent): void => {
-			if (e.key === "Tab" && e.shiftKey && !e.ctrlKey && !e.metaKey && !e.altKey) {
+			if (e.code === "Tab" && e.shiftKey && !e.ctrlKey && !e.metaKey && !e.altKey) {
 				e.preventDefault();
 				void client.cycleThinking();
-			} else if ((e.key === "p" || e.key === "P") && e.ctrlKey && !e.metaKey && !e.altKey) {
+			} else if (e.code === "KeyP" && e.ctrlKey && !e.metaKey && !e.altKey) {
 				e.preventDefault();
 				void client.cycleModel();
-			} else if (e.key === "Escape" && working) {
+			} else if ((e.code === "KeyM" || e.code === "KeyP") && e.altKey && !e.ctrlKey && !e.metaKey) {
+				// alt+m (select) / alt+p (select temporary) both open the model picker.
+				e.preventDefault();
+				setModelPicker(true);
+			} else if (e.code === "Escape" && working) {
 				e.preventDefault();
 				client.sendAbort();
 			}
@@ -119,8 +125,9 @@ function LocalSession({ client }: { client: LocalClient }): ReactNode {
 					<pre>{snap.commandOutput.join("\n")}</pre>
 				</details>
 			)}
-			<LocalComposer client={client} snapshot={snap} />
+			<LocalComposer client={client} snapshot={snap} onOpenModelPicker={() => setModelPicker(true)} />
 			<ControlOverlays client={client} snapshot={snap} />
+			{modelPicker && <ModelPicker client={client} models={snap.models} onClose={() => setModelPicker(false)} />}
 			<Banners
 				phase={snap.phase}
 				endedReason={snap.endedReason}

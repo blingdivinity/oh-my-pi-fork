@@ -2,15 +2,26 @@ import type { ReactNode } from "react";
 import { useMemo, useState } from "react";
 import type { LocalClient, LocalSnapshot } from "../../lib/local-client";
 
+const MODEL_MENU_CMDS = new Set(["model", "models", "switch"]);
+
 interface LocalComposerProps {
 	client: LocalClient;
 	snapshot: LocalSnapshot;
+	/** Open the model picker overlay for /model, /models, /switch. */
+	onOpenModelPicker?: () => void;
 }
 
-export function LocalComposer({ client, snapshot }: LocalComposerProps): ReactNode {
+export function LocalComposer({ client, snapshot, onOpenModelPicker }: LocalComposerProps): ReactNode {
 	const [text, setText] = useState("");
 	const [activeSlash, setActiveSlash] = useState(0);
 	const readOnly = snapshot.readOnly;
+	const tryModelMenu = (name: string): boolean => {
+		if (onOpenModelPicker && MODEL_MENU_CMDS.has(name.toLowerCase())) {
+			onOpenModelPicker();
+			return true;
+		}
+		return false;
+	};
 
 	const slashMatches = useMemo(() => {
 		// Only while still typing the command name (no space/args yet).
@@ -22,8 +33,10 @@ export function LocalComposer({ client, snapshot }: LocalComposerProps): ReactNo
 	const submit = (): void => {
 		const value = text.trim();
 		if (!value || readOnly) return;
-		if (value.startsWith("/")) void client.runSlash(value);
-		else void client.prompt(value);
+		if (value.startsWith("/")) {
+			const [head, ...rest] = value.slice(1).split(/\s+/);
+			if (rest.length > 0 || !tryModelMenu(head ?? "")) void client.runSlash(value);
+		} else void client.prompt(value);
 		setText("");
 		setActiveSlash(0);
 	};
@@ -34,7 +47,7 @@ export function LocalComposer({ client, snapshot }: LocalComposerProps): ReactNo
 	};
 	const runSlashName = (name: string): void => {
 		if (readOnly) return;
-		void client.runSlash(`/${name}`);
+		if (!tryModelMenu(name)) void client.runSlash(`/${name}`);
 		setText("");
 		setActiveSlash(0);
 	};
