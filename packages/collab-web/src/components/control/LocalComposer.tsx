@@ -51,6 +51,12 @@ interface LocalComposerProps {
 	onOpenOmfg?: (complaint: string) => void;
 	/** Open the extensions panel for /extensions (alias /status). */
 	onOpenExtensions?: () => void;
+	/** Open the tool-force selector for /force (no args). */
+	onOpenForce?: () => void;
+	/** Open the session info panel for /session (no args). */
+	onOpenSession?: () => void;
+	/** Launch the local stats dashboard for /stats. */
+	onLaunchStats?: () => void;
 }
 
 export function LocalComposer({
@@ -69,6 +75,9 @@ export function LocalComposer({
 	onPromptSent,
 	onOpenOmfg,
 	onOpenExtensions,
+	onOpenForce,
+	onOpenSession,
+	onLaunchStats,
 }: LocalComposerProps): ReactNode {
 	const [text, setText] = useState("");
 	const [activeSlash, setActiveSlash] = useState(0);
@@ -116,6 +125,18 @@ export function LocalComposer({
 		}
 		if (onOpenExtensions && (cmd === "extensions" || cmd === "status")) {
 			onOpenExtensions();
+			return true;
+		}
+		if (onOpenForce && cmd === "force") {
+			onOpenForce();
+			return true;
+		}
+		if (onOpenSession && cmd === "session") {
+			onOpenSession();
+			return true;
+		}
+		if (onLaunchStats && cmd === "stats") {
+			onLaunchStats();
 			return true;
 		}
 		if (onExport && cmd === "export") {

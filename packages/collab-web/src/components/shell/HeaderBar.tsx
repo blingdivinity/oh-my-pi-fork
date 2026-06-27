@@ -1,10 +1,12 @@
 import { LogOut, PanelRight } from "lucide-react";
 import type { ReactNode } from "react";
+import { useState } from "react";
 import type { GuestSnapshot } from "../../lib/client";
 import { fmtPercent, shortenPath } from "../../lib/format";
+import type { LocalClient } from "../../lib/local-client";
 import { ThemeToggle } from "./ThemeToggle";
 
-export interface HeaderBarProps {
+interface HeaderBarBaseProps {
 	snapshot: GuestSnapshot;
 	subCount: number;
 	railOpen: boolean;
@@ -12,9 +14,53 @@ export interface HeaderBarProps {
 	onLeave(): void;
 }
 
-export function HeaderBar({ snapshot, subCount, railOpen, onToggleRail, onLeave }: HeaderBarProps): ReactNode {
+export interface HeaderBarProps extends HeaderBarBaseProps {
+	client: LocalClient;
+}
+
+interface HeaderBarWithoutClientProps extends HeaderBarBaseProps {
+	client?: undefined;
+}
+
+export function HeaderBar({
+	client,
+	snapshot,
+	subCount,
+	railOpen,
+	onToggleRail,
+	onLeave,
+}: HeaderBarProps | HeaderBarWithoutClientProps): ReactNode {
 	const { header, state, phase, readOnly } = snapshot;
-	const title = header?.title ?? state?.sessionName ?? "session";
+	const title = state?.sessionName ?? header?.title ?? "session";
+	const canRename = !readOnly && client != null;
+	const [editing, setEditing] = useState(false);
+	const [draft, setDraft] = useState(title);
+
+	function beginEdit(): void {
+		if (!canRename) {
+			return;
+		}
+		setDraft(title);
+		setEditing(true);
+	}
+
+	function cancelEdit(): void {
+		setDraft(title);
+		setEditing(false);
+	}
+
+	async function commitEdit(): Promise<void> {
+		const nextTitle = draft.trim();
+		if (!client) {
+			setEditing(false);
+			return;
+		}
+		if (nextTitle) {
+			await client.setSessionName(nextTitle);
+		}
+		setEditing(false);
+	}
+
 	const usage = state?.contextUsage;
 	let pct: number | null = null;
 	if (usage) {
@@ -28,9 +74,34 @@ export function HeaderBar({ snapshot, subCount, railOpen, onToggleRail, onLeave 
 	return (
 		<header className="sh-header">
 			<div className="sh-header-left">
-				<span className="sh-title" title={title}>
-					{title}
-				</span>
+				{editing && canRename ? (
+					<input
+						autoFocus
+						className="sh-title-input"
+						value={draft}
+						onBlur={cancelEdit}
+						onChange={event => setDraft(event.currentTarget.value)}
+						onKeyDown={event => {
+							if (event.key === "Escape") {
+								event.preventDefault();
+								cancelEdit();
+								return;
+							}
+							if (event.key === "Enter") {
+								event.preventDefault();
+								void commitEdit();
+							}
+						}}
+					/>
+				) : canRename ? (
+					<span className="sh-title" title="Click to rename" onClick={beginEdit}>
+						{title}
+					</span>
+				) : (
+					<span className="sh-title" title={title}>
+						{title}
+					</span>
+				)}
 				{state?.cwd && (
 					<span className="sh-cwd" title={state.cwd}>
 						{shortenPath(state.cwd)}

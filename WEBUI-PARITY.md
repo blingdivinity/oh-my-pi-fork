@@ -42,8 +42,8 @@ Web plumbing: gateway `packages/coding-agent/src/webui/gateway.ts`; client
 | `/branch` | TUI-only | ✅ | "⎇ branch" button on each user message → branch(entryId) + re-snapshot |
 | `/fork` | TUI-only | ✅ | session.fork() (history copied) + re-snapshot |
 | `/handoff` | TUI-only | ✅ | server-side `session.handoff(focus)` (same call RPC uses) → re-snapshot; generation errors report gracefully |
-| `/session` | both | 🟡 | `info`/`delete` run as text; fine |
-| `/rename` | both | 🟡 | runs (text); could inline-edit header title |
+| `/session` | both | ✅ | `SessionInfoPanel` (id/title/cwd/file/messages/model/thinking via `session-info`); `info`/`delete` also run as text |
+| `/rename` | both | ✅ | click the header title to inline-edit → `setSessionName` + state broadcast (live title); `/rename <t>` also runs as text |
 | `/move` | both | ✅ | runs (text) |
 | `/exit` `/quit` | TUI-only | ➖ | browser: close tab |
 
@@ -67,7 +67,7 @@ Web plumbing: gateway `packages/coding-agent/src/webui/gateway.ts`; client
 | `/tan` | TUI-only | ✅ | shared `dispatchTangent()` helper (extracted from the controller) forks a background clone + dispatch breadcrumb; agent shows in the rail |
 | `/omfg` | TUI-only | ✅ | rule-forge modal: `omfg-forge`/`omfg-save` ops compose `runEphemeralTurn` + the shared `omfg-rule` helpers (generate→validate→project/global→amend→save) |
 | `/retry` | TUI-only | ✅ | routed to session.retry() (also alt+r) |
-| `/force` | both | 🟡 | runs; needs tool arg (no selector yet) |
+| `/force` | both | ✅ | `ForceSelector` lists active tools (`get-tools`), filter + pick → `/force <tool>`; `/force <tool> [prompt]` also runs as text |
 
 ### Context & transcript
 | cmd | kind | web | notes / plan |
@@ -106,12 +106,12 @@ Web plumbing: gateway `packages/coding-agent/src/webui/gateway.ts`; client
 | `/jobs` | both | ✅ | runs |
 | `/usage` | both | ✅ | `show`/`reset` run |
 | `/changelog` | both | ✅ | runs |
-| `/stats` | text | 🟡 | launches local stats dashboard — web could link out |
+| `/stats` | text | ✅ | `StatsModal` launches the local dashboard (`launch-stats` → `launchStatsDashboard`) and links out to its URL |
 | `/debug` | TUI-only | ➖ | terminal developer tool (memory/state dumps) |
 | `/hotkeys` | TUI-only | ✅ | keyboard + command reference overlay (Esc closes) |
 | `/settings` | TUI-only | ✅ | settings panel (read+write) over `get-settings`/`set-setting`, persists to the shared store |
 
-**Tally (updated):** ✅ ~51 · 🟡 ~4 · ➖ ~6 · ❌ 0. Every TUI-only interactive flow
+**Tally (updated):** ✅ ~55 · 🟡 0 · ➖ ~6 · ❌ 0. Every TUI-only interactive flow
 now has a real web path: `/plan-review` (plan-artifact read), `/btw` + `/omfg`
 (server-side `runEphemeralTurn` + the shared `omfg-rule` helpers, with `/omfg`'s
 full generate→validate→project/global→amend→save modal), and `/tan` (the
@@ -179,9 +179,8 @@ persists through `Settings.set` (verified live: dark theme → `amethyst` round-
 - Dev serving rebuilds the SPA when source is stale.
 - **`/model` picker overlay** (provider/name, fuzzy, current) + `/settings` panel.
 
-## Remaining (🟡 polish — every command has a working web path)
+## Remaining (➖ browser-N/A only — every command has a working web path)
 
-1. `/force` tool selector, `/session`/`/rename` inline-edit affordances, `/stats`
-   deep-link — small UX upgrades over the working text behavior.
+1. ➖ items are platform-inherent: `/copy` (native selection), `/login`/`/logout`/`/setup`/`/providers` (CLI auth), `/debug` (terminal dev tool), `/exit`/`/quit` (close tab).
 2. The `/btw`/`/omfg`/`/handoff` LLM side-calls return real content with a real model;
    they 401 (and report gracefully) only under the mock test harness.

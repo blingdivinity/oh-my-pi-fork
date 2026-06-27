@@ -121,6 +121,17 @@ export interface WebSettingsTab {
 	settings: WebSetting[];
 }
 
+/** Detailed info about the active session for the /session panel. */
+export interface WebSessionDetail {
+	id: string;
+	title: string;
+	cwd: string;
+	path: string | null;
+	messageCount: number;
+	model: string | null;
+	thinkingLevel: string | null;
+}
+
 /** A saved session the UI can resume / switch to. */
 export interface WebSessionInfo {
 	path: string;
@@ -284,6 +295,9 @@ export type WebControlFrame =
 	| { t: "ctl"; op: "get-commands"; reqId: number }
 	| { t: "ctl"; op: "get-mcp"; reqId: number }
 	| { t: "ctl"; op: "get-extensions"; reqId: number }
+	| { t: "ctl"; op: "get-tools"; reqId: number }
+	| { t: "ctl"; op: "session-info"; reqId: number }
+	| { t: "ctl"; op: "launch-stats"; reqId: number }
 	| { t: "ctl"; op: "get-settings"; reqId: number }
 	| { t: "ctl"; op: "set-setting"; reqId: number; path: string; value: boolean | string }
 	| { t: "ctl"; op: "tool-approval"; reqId: number; approvalId: string; decision: WebToolApprovalDecision }

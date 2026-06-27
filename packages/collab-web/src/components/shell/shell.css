@@ -205,6 +205,19 @@
 	min-width: 0;
 }
 
+.sh-title-input {
+	min-width: 0;
+	max-width: 240px;
+	font: inherit;
+	font-size: 13px;
+	font-weight: 600;
+	color: inherit;
+	background: transparent;
+	border: 1px solid var(--border);
+	border-radius: var(--radius-sm);
+	padding: 1px 4px;
+}
+
 .sh-cwd {
 	font: 400 11px / 1.5 var(--font-mono);
 	color: var(--fg-faint);

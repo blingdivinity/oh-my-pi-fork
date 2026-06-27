@@ -31,6 +31,7 @@ import type {
 	WebExtUIResponse,
 	WebMcpServerStatus,
 	WebModelInfo,
+	WebSessionDetail,
 	WebSessionInfo,
 	WebSettingsTab,
 	WebSlashCommand,
@@ -243,6 +244,17 @@ export class LocalClient {
 	}
 	getExtensions(): Promise<WebExtension[]> {
 		return this.#ctl(reqId => ({ t: "ctl", op: "get-extensions", reqId })) as Promise<WebExtension[]>;
+	}
+	getTools(): Promise<string[]> {
+		return this.#ctl(reqId => ({ t: "ctl", op: "get-tools", reqId })) as Promise<string[]>;
+	}
+	getSessionDetail(): Promise<WebSessionDetail | null> {
+		return this.#ctl(reqId => ({ t: "ctl", op: "session-info", reqId })) as Promise<WebSessionDetail | null>;
+	}
+	launchStats(): Promise<{ url: string } | { error: string }> {
+		return this.#ctl(reqId => ({ t: "ctl", op: "launch-stats", reqId })) as Promise<
+			{ url: string } | { error: string }
+		>;
 	}
 	exportHtml(): Promise<{ filename: string; html: string } | null> {
 		return this.#ctl(reqId => ({ t: "ctl", op: "export-html", reqId })) as Promise<{

@@ -6,7 +6,8 @@
  */
 
 import * as path from "node:path";
-import { Agent } from "@oh-my-pi/pi-agent-core";
+import { Agent, type AgentTool } from "@oh-my-pi/pi-agent-core";
+import { z } from "@oh-my-pi/pi-ai";
 import { createMockModel } from "@oh-my-pi/pi-ai/providers/mock";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
@@ -21,6 +22,17 @@ import { Snowflake, TempDir } from "@oh-my-pi/pi-utils";
 
 /** Deterministic reply the mock model returns for every prompt. */
 export const MOCK_REPLY = "Hello from the omp web UI.";
+
+/** Minimal active tool so the web /force selector has entries (the mock never calls it). */
+function seedTool(name: string, label: string): AgentTool {
+	return {
+		name,
+		label,
+		description: `${label} tool`,
+		parameters: z.object({ input: z.string() }) as unknown as AgentTool["parameters"],
+		execute: async () => ({ content: [{ type: "text", text: "ok" }] }),
+	};
+}
 
 /** Built collab-web SPA directory the server serves. */
 export function spaDir(): string {
@@ -46,7 +58,7 @@ export async function startMockWebServer(options: { port?: number; reply?: strin
 	});
 	const agent = new Agent({
 		getApiKey: () => "test-key",
-		initialState: { model, systemPrompt: ["Test"], tools: [] },
+		initialState: { model, systemPrompt: ["Test"], tools: [seedTool("read", "Read"), seedTool("bash", "Bash")] },
 		streamFn: mock.stream,
 	});
 	const sessionManager = SessionManager.create(tempDir.path(), tempDir.join("sessions"));

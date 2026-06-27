@@ -5,13 +5,16 @@ import { ContextPanel } from "./components/control/ContextPanel";
 import { ControlOverlays } from "./components/control/ControlOverlays";
 import { ExtensionsPanel } from "./components/control/ExtensionsPanel";
 import { ExtPanelHost } from "./components/control/ExtPanelHost";
+import { ForceSelector } from "./components/control/ForceSelector";
 import { GoalPanel } from "./components/control/GoalPanel";
 import { HotkeysOverlay } from "./components/control/HotkeysOverlay";
 import { LocalComposer } from "./components/control/LocalComposer";
 import { ModelPicker } from "./components/control/ModelPicker";
 import { OmfgModal } from "./components/control/OmfgModal";
+import { SessionInfoPanel } from "./components/control/SessionInfoPanel";
 import { SessionPicker } from "./components/control/SessionPicker";
 import { SettingsPanel } from "./components/control/SettingsPanel";
+import { StatsModal } from "./components/control/StatsModal";
 import { TodoHud } from "./components/control/TodoHud";
 import { TreeOverlay } from "./components/control/TreeOverlay";
 import { Banners } from "./components/shell/Banners";
@@ -59,6 +62,9 @@ function LocalSession({ client }: { client: LocalClient }): ReactNode {
 	const [treeOpen, setTreeOpen] = useState(false);
 	const [omfg, setOmfg] = useState<{ complaint: string } | null>(null);
 	const [extOpen, setExtOpen] = useState(false);
+	const [forceOpen, setForceOpen] = useState(false);
+	const [sessionInfoOpen, setSessionInfoOpen] = useState(false);
+	const [statsOpen, setStatsOpen] = useState(false);
 	const [loopMode, setLoopMode] = useState(false);
 	const lastPromptRef = useRef<string | null>(null);
 	const prevWorkingRef = useRef(false);
@@ -131,6 +137,7 @@ function LocalSession({ client }: { client: LocalClient }): ReactNode {
 		<div className="sh-app">
 			<HeaderBar
 				snapshot={snap}
+				client={client}
 				subCount={subCount}
 				railOpen={railOpen}
 				onToggleRail={() => setRailOpen(open => !open)}
@@ -212,6 +219,9 @@ function LocalSession({ client }: { client: LocalClient }): ReactNode {
 				onOpenAgents={() => setRailOpen(true)}
 				onOpenOmfg={complaint => setOmfg({ complaint })}
 				onOpenExtensions={() => setExtOpen(true)}
+				onOpenForce={() => setForceOpen(true)}
+				onOpenSession={() => setSessionInfoOpen(true)}
+				onLaunchStats={() => setStatsOpen(true)}
 				onToggleLoop={() => setLoopMode(m => !m)}
 				onPromptSent={t => {
 					lastPromptRef.current = t;
@@ -236,6 +246,9 @@ function LocalSession({ client }: { client: LocalClient }): ReactNode {
 			{treeOpen && <TreeOverlay client={client} onClose={() => setTreeOpen(false)} />}
 			{omfg && <OmfgModal client={client} complaint={omfg.complaint} onClose={() => setOmfg(null)} />}
 			{extOpen && <ExtensionsPanel client={client} onClose={() => setExtOpen(false)} />}
+			{forceOpen && <ForceSelector client={client} onClose={() => setForceOpen(false)} />}
+			{sessionInfoOpen && <SessionInfoPanel client={client} onClose={() => setSessionInfoOpen(false)} />}
+			{statsOpen && <StatsModal client={client} onClose={() => setStatsOpen(false)} />}
 			{goalOpen && <GoalPanel client={client} snapshot={snap} onClose={() => setGoalOpen(false)} />}
 			{contextOpen && <ContextPanel client={client} onClose={() => setContextOpen(false)} />}
 			<Banners

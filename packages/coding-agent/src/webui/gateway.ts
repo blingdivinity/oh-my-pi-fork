@@ -52,6 +52,7 @@ import { SessionManager } from "../session/session-manager";
 import { executeAcpBuiltinSlashCommand } from "../slash-commands/acp-builtins";
 import { buildAvailableSlashCommands } from "../slash-commands/available-commands";
 import { lookupBuiltinSlashCommand } from "../slash-commands/builtin-registry";
+import { launchStatsDashboard, parseStatsDashboardArgs } from "../slash-commands/helpers/stats-dashboard";
 import type { SlashCommandRuntime } from "../slash-commands/types";
 import { TASK_SUBAGENT_LIFECYCLE_CHANNEL, TASK_SUBAGENT_PROGRESS_CHANNEL } from "../task";
 import { dispatchTangent } from "../task/dispatch-tangent";
@@ -388,6 +389,7 @@ export class SessionGateway {
 				case "set-session-name":
 					this.#requireWrite(peer);
 					await this.#session.setSessionName(frame.name, "user");
+					this.#scheduleStateBroadcast();
 					return ack(true);
 				case "branch": {
 					this.#requireWrite(peer);
@@ -420,6 +422,33 @@ export class SessionGateway {
 					return ack(true);
 				case "get-extensions":
 					return ack(true, await this.#listExtensions());
+				case "get-tools":
+					return ack(true, this.#session.getActiveToolNames());
+				case "session-info": {
+					const sm = this.#session.sessionManager;
+					const snap = sm.snapshotForReplication();
+					const messageCount = snap.entries.filter(e => e.type === "message").length;
+					return ack(true, {
+						id: this.#session.sessionId,
+						title: this.#session.sessionName,
+						cwd: sm.getCwd(),
+						path: sm.getSessionFile() ?? null,
+						messageCount,
+						model: this.#session.model?.name ?? null,
+						thinkingLevel: this.#session.thinkingLevel ?? null,
+					});
+				}
+				case "launch-stats": {
+					this.#requireWrite(peer);
+					try {
+						const parsed = parseStatsDashboardArgs("");
+						if ("error" in parsed) return ack(true, { error: parsed.error });
+						const result = await launchStatsDashboard(parsed);
+						return ack(true, { url: result.url });
+					} catch (err) {
+						return ack(true, { error: err instanceof Error ? err.message : String(err) });
+					}
+				}
 				case "get-settings":
 					this.#sendSettings(peer);
 					return ack(true);
