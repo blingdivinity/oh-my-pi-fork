@@ -8,6 +8,7 @@ import { GoalPanel } from "./components/control/GoalPanel";
 import { HotkeysOverlay } from "./components/control/HotkeysOverlay";
 import { LocalComposer } from "./components/control/LocalComposer";
 import { ModelPicker } from "./components/control/ModelPicker";
+import { OmfgModal } from "./components/control/OmfgModal";
 import { SessionPicker } from "./components/control/SessionPicker";
 import { SettingsPanel } from "./components/control/SettingsPanel";
 import { TodoHud } from "./components/control/TodoHud";
@@ -55,6 +56,7 @@ function LocalSession({ client }: { client: LocalClient }): ReactNode {
 	const [goalOpen, setGoalOpen] = useState(false);
 	const [contextOpen, setContextOpen] = useState(false);
 	const [treeOpen, setTreeOpen] = useState(false);
+	const [omfg, setOmfg] = useState<{ complaint: string } | null>(null);
 	const [loopMode, setLoopMode] = useState(false);
 	const lastPromptRef = useRef<string | null>(null);
 	const prevWorkingRef = useRef(false);
@@ -206,6 +208,7 @@ function LocalSession({ client }: { client: LocalClient }): ReactNode {
 				onOpenContext={() => setContextOpen(true)}
 				onOpenTree={() => setTreeOpen(true)}
 				onOpenAgents={() => setRailOpen(true)}
+				onOpenOmfg={complaint => setOmfg({ complaint })}
 				onToggleLoop={() => setLoopMode(m => !m)}
 				onPromptSent={t => {
 					lastPromptRef.current = t;
@@ -228,6 +231,7 @@ function LocalSession({ client }: { client: LocalClient }): ReactNode {
 			{hotkeysOpen && <HotkeysOverlay onClose={() => setHotkeysOpen(false)} />}
 			{sessionsOpen && <SessionPicker client={client} onClose={() => setSessionsOpen(false)} />}
 			{treeOpen && <TreeOverlay client={client} onClose={() => setTreeOpen(false)} />}
+			{omfg && <OmfgModal client={client} complaint={omfg.complaint} onClose={() => setOmfg(null)} />}
 			{goalOpen && <GoalPanel client={client} snapshot={snap} onClose={() => setGoalOpen(false)} />}
 			{contextOpen && <ContextPanel client={client} onClose={() => setContextOpen(false)} />}
 			<Banners

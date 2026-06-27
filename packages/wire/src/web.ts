@@ -258,6 +258,16 @@ export type WebControlFrame =
 	| { t: "ctl"; op: "get-context"; reqId: number }
 	| { t: "ctl"; op: "export-html"; reqId: number }
 	| { t: "ctl"; op: "dequeue"; reqId: number }
+	| { t: "ctl"; op: "omfg-forge"; reqId: number; complaint: string; feedback?: string; previousRule?: string }
+	| {
+			t: "ctl";
+			op: "omfg-save";
+			reqId: number;
+			ruleName: string;
+			fileContent: string;
+			level: "project" | "user";
+			overwrite?: boolean;
+	  }
 	| { t: "ctl"; op: "get-models"; reqId: number }
 	| { t: "ctl"; op: "get-commands"; reqId: number }
 	| { t: "ctl"; op: "get-mcp"; reqId: number }

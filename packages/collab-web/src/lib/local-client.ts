@@ -249,6 +249,31 @@ export class LocalClient {
 	dequeue(): Promise<{ text: string } | null> {
 		return this.#ctl(reqId => ({ t: "ctl", op: "dequeue", reqId })) as Promise<{ text: string } | null>;
 	}
+	omfgForge(
+		complaint: string,
+		feedback?: string,
+		previousRule?: string,
+	): Promise<{ ruleName: string; fileContent: string; validated: boolean } | { error: string }> {
+		return this.#ctl(reqId => ({ t: "ctl", op: "omfg-forge", reqId, complaint, feedback, previousRule })) as Promise<
+			{ ruleName: string; fileContent: string; validated: boolean } | { error: string }
+		>;
+	}
+	omfgSave(
+		ruleName: string,
+		fileContent: string,
+		level: "project" | "user",
+		overwrite?: boolean,
+	): Promise<{ savedPath: string } | { needsOverwrite: string } | { error: string }> {
+		return this.#ctl(reqId => ({
+			t: "ctl",
+			op: "omfg-save",
+			reqId,
+			ruleName,
+			fileContent,
+			level,
+			overwrite,
+		})) as Promise<{ savedPath: string } | { needsOverwrite: string } | { error: string }>;
+	}
 	bash(command: string): Promise<unknown> {
 		return this.#ctl(reqId => ({ t: "ctl", op: "bash", reqId, command }));
 	}

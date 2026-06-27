@@ -15,7 +15,7 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type { ImageContent } from "@oh-my-pi/pi-ai";
-import { logger, prompt, Snowflake } from "@oh-my-pi/pi-utils";
+import { CONFIG_DIR_NAME, logger, prompt, Snowflake } from "@oh-my-pi/pi-utils";
 import type {
 	WebCapabilities,
 	WebControlEvent,
@@ -32,8 +32,15 @@ import { buildSkillPromptMessage } from "../extensibility/skills";
 import { resolveLocalUrlToPath } from "../internal-urls";
 import type { MCPManager } from "../mcp";
 import { MCP_CONNECTION_STATUS_EVENT_CHANNEL } from "../mcp/startup-events";
+import {
+	buildOmfgRuleForPath,
+	extractGeneratedRuleJson,
+	parseGeneratedRule,
+	validateParsedRuleAgainstAssistantHistory,
+} from "../modes/controllers/omfg-rule";
 import { getAvailableThemesWithPaths } from "../modes/theme/theme";
 import btwUserPrompt from "../prompts/system/btw-user.md" with { type: "text" };
+import omfgUserPrompt from "../prompts/system/omfg-user.md" with { type: "text" };
 import { AgentLifecycleManager } from "../registry/agent-lifecycle";
 import { type AgentRef, AgentRegistry } from "../registry/agent-registry";
 import type { AgentSession, AgentSessionEvent } from "../session/agent-session";
@@ -467,6 +474,14 @@ export class SessionGateway {
 					const popped = this.#session.popLastQueuedMessage();
 					return ack(true, popped ? { text: popped.text } : null);
 				}
+				case "omfg-forge": {
+					this.#requireWrite(peer);
+					return ack(true, await this.#forgeRule(frame.complaint, frame.feedback, frame.previousRule));
+				}
+				case "omfg-save": {
+					this.#requireWrite(peer);
+					return ack(true, await this.#saveRule(frame.ruleName, frame.fileContent, frame.level, frame.overwrite));
+				}
 				case "tool-approval":
 					this.#pendingApprovals.get(frame.approvalId)?.resolve(frame.decision);
 					this.#pendingApprovals.delete(frame.approvalId);
@@ -793,6 +808,70 @@ export class SessionGateway {
 			current: currentFile ? path.resolve(s.path) === path.resolve(currentFile) : false,
 			parentPath: s.parentSessionPath,
 		}));
+	}
+
+	/** /omfg step 1: generate + validate a TTSR rule candidate from a complaint.
+	 *  Composes the same session.runEphemeralTurn + omfg-rule helpers the TUI uses. */
+	async #forgeRule(
+		complaint: string,
+		feedback?: string,
+		previousRule?: string,
+	): Promise<{ ruleName: string; fileContent: string; validated: boolean } | { error: string }> {
+		const MAX_ATTEMPTS = 3;
+		const failedAttempts = feedback ? [feedback] : [];
+		let previous = previousRule;
+		let last: { ruleName: string; fileContent: string } | undefined;
+		for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+			const promptText = prompt.render(omfgUserPrompt, {
+				complaint,
+				feedback: failedAttempts.length > 0 ? failedAttempts.join("\n\n") : undefined,
+				previousRule: previous,
+			});
+			const { replyText } = await this.#session.runEphemeralTurn({ promptText, dedupeReply: false });
+			const parsed = parseGeneratedRule(replyText);
+			if ("error" in parsed) {
+				const failedRule = extractGeneratedRuleJson(replyText) ?? replyText.trim();
+				failedAttempts.push(
+					`Attempt ${attempt} failed: invalid rule (${parsed.error}).\nFailed candidate:\n${failedRule}`,
+				);
+				previous = failedRule;
+				continue;
+			}
+			const validated = validateParsedRuleAgainstAssistantHistory(parsed, this.#session.messages);
+			const cand = validated.candidate;
+			if (validated.validation.matched) {
+				return { ruleName: cand.rule.name, fileContent: cand.fileContent, validated: true };
+			}
+			last = { ruleName: cand.rule.name, fileContent: cand.fileContent };
+			const failure =
+				validated.validation.feedback ?? "The rule condition did not match any earlier assistant output.";
+			failedAttempts.push(
+				`Attempt ${attempt} failed validation:\n${failure}\nFailed candidate:\n${cand.fileContent}`,
+			);
+			previous = cand.fileContent;
+		}
+		return last ? { ...last, validated: false } : { error: "The model did not return a valid TTSR rule." };
+	}
+
+	/** /omfg step 2: write the rule to project/global rules + register it live. */
+	async #saveRule(
+		ruleName: string,
+		fileContent: string,
+		level: "project" | "user",
+		overwrite?: boolean,
+	): Promise<{ savedPath: string } | { needsOverwrite: string } | { error: string }> {
+		const filePath =
+			level === "user"
+				? path.join(this.#session.settings.getAgentDir(), "rules", `${ruleName}.md`)
+				: path.join(this.#session.sessionManager.getCwd(), CONFIG_DIR_NAME, "rules", `${ruleName}.md`);
+		try {
+			if (!overwrite && (await Bun.file(filePath).exists())) return { needsOverwrite: filePath };
+			await Bun.write(filePath, fileContent);
+			this.#session.ttsrManager?.addRule(buildOmfgRuleForPath(ruleName, fileContent, filePath, level));
+			return { savedPath: filePath };
+		} catch (err) {
+			return { error: err instanceof Error ? err.message : String(err) };
+		}
 	}
 
 	// ── State + agents projections ────────────────────────────────────────────

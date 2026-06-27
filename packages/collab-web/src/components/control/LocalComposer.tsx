@@ -47,6 +47,8 @@ interface LocalComposerProps {
 	onToggleLoop?: () => void;
 	/** Called with each free-text prompt sent (loop re-submit + history). */
 	onPromptSent?: (text: string) => void;
+	/** Open the omfg rule-forge modal for /omfg (with optional prefilled complaint). */
+	onOpenOmfg?: (complaint: string) => void;
 }
 
 export function LocalComposer({
@@ -63,6 +65,7 @@ export function LocalComposer({
 	onExport,
 	onToggleLoop,
 	onPromptSent,
+	onOpenOmfg,
 }: LocalComposerProps): ReactNode {
 	const [text, setText] = useState("");
 	const [activeSlash, setActiveSlash] = useState(0);
@@ -104,6 +107,10 @@ export function LocalComposer({
 			onOpenAgents();
 			return true;
 		}
+		if (onOpenOmfg && cmd === "omfg") {
+			onOpenOmfg("");
+			return true;
+		}
 		if (onExport && cmd === "export") {
 			onExport();
 			return true;
@@ -129,7 +136,10 @@ export function LocalComposer({
 	const submit = (behavior: "steer" | "followUp" = "steer"): void => {
 		const value = text.trim();
 		if (!value || readOnly) return;
-		if (value.startsWith("/")) {
+		const lower = value.toLowerCase();
+		if (onOpenOmfg && (lower === "/omfg" || lower.startsWith("/omfg "))) {
+			onOpenOmfg(value.slice("/omfg".length).trim());
+		} else if (value.startsWith("/")) {
 			const [head, ...rest] = value.slice(1).split(/\s+/);
 			if (rest.length > 0 || !tryLocalUi(head ?? "")) void client.runSlash(value);
 		} else {

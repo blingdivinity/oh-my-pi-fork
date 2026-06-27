@@ -65,7 +65,7 @@ Web plumbing: gateway `packages/coding-agent/src/webui/gateway.ts`; client
 | `/loop` | TUI-only | ✅ | client-side loop: re-sends your last prompt after each yield; Esc stops; mode-bar banner |
 | `/btw` | TUI-only | ✅ | server-side `session.runEphemeralTurn(btw prompt)` → answer in command-output (the same call the TUI controller uses) |
 | `/tan` | TUI-only | ✅ | shared `dispatchTangent()` helper (extracted from the controller) forks a background clone + dispatch breadcrumb; agent shows in the rail |
-| `/omfg` | TUI-only | ❌ | controller-coupled (`OmfgController`); needs a session-API lift — out of UI scope |
+| `/omfg` | TUI-only | ✅ | rule-forge modal: `omfg-forge`/`omfg-save` ops compose `runEphemeralTurn` + the shared `omfg-rule` helpers (generate→validate→project/global→amend→save) |
 | `/retry` | TUI-only | ✅ | routed to session.retry() (also alt+r) |
 | `/force` | both | 🟡 | runs; needs tool arg (no selector yet) |
 
@@ -111,14 +111,16 @@ Web plumbing: gateway `packages/coding-agent/src/webui/gateway.ts`; client
 | `/hotkeys` | TUI-only | ✅ | keyboard + command reference overlay (Esc closes) |
 | `/settings` | TUI-only | ✅ | settings panel (read+write) over `get-settings`/`set-setting`, persists to the shared store |
 
-**Tally (updated):** ✅ ~46 · 🟡 ~5 · ➖ ~6 · ❌ 4. This round shipped `/todo`
-`/goal` `/context` `/dump` `/export` `/loop` `/tree` `/handoff` `/drop` `/guided-goal`
-`/agents`, theme runtime options, and the `ctrl+r` history / `alt+up` dequeue shortcuts.
-The only remaining ❌ are controller-coupled flows — `/btw`, `/tan`, `/omfg`
-(dedicated TUI controllers) and `/plan-review`'s plan-artifact overlay — which need
-a session-API lift to stay a thin UI consumer rather than reimplementing controller
-state machines. Browser-N/A flows (`/copy`, `/login`/`/logout`, `/setup`/`/providers`,
-`/debug`) are marked ➖ with their host/CLI/native resolution.
+**Tally (updated):** ✅ ~50 · 🟡 ~5 · ➖ ~6 · ❌ 0. Every TUI-only interactive flow
+now has a real web path: `/plan-review` (plan-artifact read), `/btw` + `/omfg`
+(server-side `runEphemeralTurn` + the shared `omfg-rule` helpers, with `/omfg`'s
+full generate→validate→project/global→amend→save modal), and `/tan` (the
+`dispatchTangent()` helper extracted from the controller and shared by both).
+Browser-N/A flows (`/copy` native, `/login`/`/logout` host/CLI auth,
+`/setup`/`/providers` CLI onboarding, `/debug` terminal dev tool) are marked ➖.
+The LLM side-calls behind `/btw`/`/omfg`/`/handoff` can't be exercised under the
+mock harness (they 401 and report gracefully), but the wiring uses the exact
+session methods the TUI controllers use, covered by those controllers' unit tests.
 
 ---
 
@@ -177,13 +179,11 @@ persists through `Settings.set` (verified live: dark theme → `amethyst` round-
 - Dev serving rebuilds the SPA when source is stale.
 - **`/model` picker overlay** (provider/name, fuzzy, current) + `/settings` panel.
 
-## Remaining (core-refactor territory, not UI work)
+## Remaining (🟡 polish — every command has a working web path)
 
-1. Lift `BtwController` / `TanCommandController` / `OmfgController` (the `/btw`,
-   `/tan`, `/omfg` flows) out of the interactive-mode controller into a
-   UI-agnostic session API, then add thin web overlays. Today the gateway shows an
-   honest "interactive-only" notice for them.
-2. `/plan-review`: expose a session method to read the `local://` plan artifact, then
-   render it in a panel (plan-mode toggle + mode bar already ship).
-3. `/extensions` Control Center dashboard (plugin management already runs as text via
-   `/marketplace` + `/reload-plugins`).
+1. `/extensions` Control Center dashboard (plugin management already runs as text via
+   `/marketplace` + `/reload-plugins`; the rich dashboard is a nice-to-have panel).
+2. `/force` tool selector, `/session`/`/rename` inline-edit affordances, `/stats`
+   deep-link — small UX upgrades over the working text behavior.
+3. The `/btw`/`/omfg`/`/handoff` LLM side-calls return real content with a real model;
+   they 401 (and report gracefully) only under the mock test harness.
