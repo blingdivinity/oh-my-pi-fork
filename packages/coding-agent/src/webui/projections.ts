@@ -27,6 +27,7 @@ export function toWebModels(models: readonly Model[], current: Model | undefined
 		const id = formatModelString(model);
 		return {
 			id,
+			modelId: model.id,
 			name: model.name,
 			provider: model.provider,
 			contextWindow: model.contextWindow,

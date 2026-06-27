@@ -64,8 +64,10 @@ export interface WebSlashCommand {
 
 /** A model the UI can switch to. */
 export interface WebModelInfo {
-	/** "provider/modelId". */
+	/** Stable selector "provider/modelId". */
 	id: string;
+	/** Bare provider model id (what `set-model` matches on; no routing suffix). */
+	modelId: string;
 	name: string;
 	provider: string;
 	contextWindow?: number | null;

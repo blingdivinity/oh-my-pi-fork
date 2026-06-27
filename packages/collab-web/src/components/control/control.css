@@ -1,0 +1,154 @@
+.lc-composer {
+	border-top: 1px solid var(--tv-border, #2a2a2a);
+	padding: 8px;
+	display: flex;
+	flex-direction: column;
+	gap: 6px;
+	background: var(--tv-bg, #111);
+}
+.lc-controls {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	font-size: 12px;
+	flex-wrap: wrap;
+}
+.lc-controls select,
+.lc-controls button,
+.lc-input-row button {
+	font: inherit;
+	font-size: 12px;
+	color: var(--tv-fg, #ddd);
+	background: var(--tv-bg-elev, #1b1b1b);
+	border: 1px solid var(--tv-border, #2a2a2a);
+	border-radius: 6px;
+	padding: 3px 8px;
+	cursor: pointer;
+}
+.lc-badge {
+	opacity: 0.75;
+}
+.lc-input-row {
+	display: flex;
+	gap: 6px;
+	align-items: flex-end;
+	position: relative;
+}
+.lc-input-row textarea {
+	flex: 1;
+	resize: none;
+	min-height: 38px;
+	max-height: 180px;
+	font: inherit;
+	color: var(--tv-fg, #ddd);
+	background: var(--tv-bg-elev, #1b1b1b);
+	border: 1px solid var(--tv-border, #2a2a2a);
+	border-radius: 8px;
+	padding: 8px;
+}
+.lc-slash {
+	position: absolute;
+	bottom: calc(100% + 4px);
+	left: 0;
+	right: 0;
+	max-height: 220px;
+	overflow: auto;
+	background: var(--tv-bg-elev, #1b1b1b);
+	border: 1px solid var(--tv-border, #2a2a2a);
+	border-radius: 8px;
+	z-index: 20;
+}
+.lc-slash-item {
+	padding: 6px 10px;
+	cursor: pointer;
+	display: flex;
+	gap: 8px;
+	justify-content: space-between;
+}
+.lc-slash-item[data-active="true"] {
+	background: var(--tv-accent-soft, #2a3a55);
+}
+.lc-slash-name {
+	font-weight: 600;
+}
+.lc-slash-desc {
+	opacity: 0.6;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+.lc-modal-backdrop {
+	position: fixed;
+	inset: 0;
+	background: rgba(0, 0, 0, 0.5);
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	z-index: 50;
+}
+.lc-modal {
+	background: var(--tv-bg-elev, #1b1b1b);
+	border: 1px solid var(--tv-border, #2a2a2a);
+	border-radius: 10px;
+	padding: 16px;
+	max-width: 560px;
+	width: calc(100% - 32px);
+	max-height: 80vh;
+	overflow: auto;
+	color: var(--tv-fg, #ddd);
+}
+.lc-modal h3 {
+	margin: 0 0 8px;
+}
+.lc-modal pre {
+	background: var(--tv-bg, #111);
+	border-radius: 6px;
+	padding: 8px;
+	overflow: auto;
+	font-size: 12px;
+}
+.lc-modal-actions {
+	display: flex;
+	gap: 8px;
+	justify-content: flex-end;
+	margin-top: 12px;
+	flex-wrap: wrap;
+}
+.lc-modal-actions button,
+.lc-modal input {
+	font: inherit;
+	color: var(--tv-fg, #ddd);
+	background: var(--tv-bg, #111);
+	border: 1px solid var(--tv-border, #2a2a2a);
+	border-radius: 6px;
+	padding: 6px 12px;
+	cursor: pointer;
+}
+.lc-modal input {
+	width: 100%;
+	cursor: text;
+}
+.lc-panels {
+	display: flex;
+	flex-direction: column;
+}
+.lc-panel iframe {
+	width: 100%;
+	height: 320px;
+	border: 0;
+	border-top: 1px solid var(--tv-border, #2a2a2a);
+	background: #fff;
+}
+.lc-cmdout {
+	font-size: 12px;
+	border-top: 1px solid var(--tv-border, #2a2a2a);
+	background: var(--tv-bg, #111);
+	color: var(--tv-fg, #ddd);
+}
+.lc-cmdout pre {
+	margin: 0;
+	padding: 8px;
+	max-height: 160px;
+	overflow: auto;
+	white-space: pre-wrap;
+}
