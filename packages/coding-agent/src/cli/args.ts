@@ -14,7 +14,7 @@ import {
 	STRING_VALUE_FLAGS,
 } from "./flag-tables";
 
-export type Mode = "text" | "json" | "rpc" | "acp" | "rpc-ui";
+export type Mode = "text" | "json" | "rpc" | "acp" | "rpc-ui" | "web";
 
 export interface Args {
 	cwd?: string;

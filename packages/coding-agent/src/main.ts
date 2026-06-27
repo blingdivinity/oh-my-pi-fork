@@ -83,6 +83,7 @@ import {
 	writeLastChangelogVersion,
 } from "./utils/changelog";
 import { EventBus } from "./utils/event-bus";
+import type { RunWebModeOptions } from "./webui/server";
 
 type RunAcpMode = (createSession: AcpSessionFactory) => Promise<never>;
 type RunPrintMode = (session: AgentSession, options: PrintModeOptions) => Promise<void>;
@@ -91,6 +92,7 @@ type RunRpcMode = (
 	setToolUIContext?: (uiContext: ExtensionUIContext, hasUI: boolean) => void,
 	eventBus?: EventBus,
 ) => Promise<never>;
+type RunWebMode = (session: AgentSession, options?: RunWebModeOptions) => Promise<never>;
 
 export function writeStartupNotice(parsedArgs: Pick<Args, "mode">, text: string): void {
 	(parsedArgs.mode === "json" ? process.stderr : process.stdout).write(text);
@@ -1040,11 +1042,17 @@ export async function runRootCommand(
 	if (parsedArgs.noPty || parsedArgs.mode === "rpc-ui") {
 		Bun.env.PI_NO_PTY = "1";
 	}
-	if (parsedArgs.noTitle || parsedArgs.mode === "rpc" || parsedArgs.mode === "rpc-ui" || parsedArgs.mode === "acp") {
+	if (
+		parsedArgs.noTitle ||
+		parsedArgs.mode === "rpc" ||
+		parsedArgs.mode === "rpc-ui" ||
+		parsedArgs.mode === "acp" ||
+		parsedArgs.mode === "web"
+	) {
 		Bun.env.PI_NO_TITLE = "1";
 	}
 	const mode = parsedArgs.mode || "text";
-	const isProtocolMode = mode === "rpc" || mode === "rpc-ui" || mode === "acp";
+	const isProtocolMode = mode === "rpc" || mode === "rpc-ui" || mode === "acp" || mode === "web";
 	// Protocol modes own stdin; treating it as prompt text would consume JSON-RPC frames before their transports start.
 	const pipedInput = isProtocolMode ? undefined : await logger.time("readPipedInput", readPipedInput);
 	const autoPrint = pipedInput !== undefined && !parsedArgs.print && parsedArgs.mode === undefined;
@@ -1215,7 +1223,7 @@ export async function runRootCommand(
 	);
 	sessionOptions.authStorage = authStorage;
 	sessionOptions.modelRegistry = modelRegistry;
-	sessionOptions.hasUI = isInteractive || mode === "rpc-ui";
+	sessionOptions.hasUI = isInteractive || mode === "rpc-ui" || mode === "web";
 	sessionOptions.settings = settingsInstance;
 
 	// OTEL: register the global OTLP trace exporter when an OTLP endpoint is
@@ -1371,6 +1379,11 @@ export async function runRootCommand(
 			const runRpcMode: RunRpcMode = (await import("./modes/rpc/rpc-mode")).runRpcMode;
 			stopStartupWatchdog();
 			await runRpcMode(session, mode === "rpc-ui" ? setToolUIContext : undefined, eventBus);
+		} else if (mode === "web") {
+			// Branch-only web runner: in-process Bun.serve UI server over the shared session.
+			const runWebMode: RunWebMode = (await import("./webui/server")).runWebMode;
+			stopStartupWatchdog();
+			await runWebMode(session, { setToolUIContext, eventBus, mcpManager });
 		} else if (isInteractive) {
 			const versionCheckPromise = checkForNewVersion(VERSION).catch(() => undefined);
 			const changelogMarkdown = await logger.time("main:getChangelogForDisplay", getChangelogForDisplay, parsedArgs);

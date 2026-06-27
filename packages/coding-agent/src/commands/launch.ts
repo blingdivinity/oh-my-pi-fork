@@ -59,8 +59,8 @@ export default class Index extends Command {
 			description: "Directory to start in (overrides the launch cwd)",
 		}),
 		mode: Flags.string({
-			description: "Output mode: text (default), json, rpc, or rpc-ui",
-			options: ["text", "json", "rpc", "acp", "rpc-ui"],
+			description: "Output mode: text (default), json, rpc, rpc-ui, acp, or web",
+			options: ["text", "json", "rpc", "acp", "rpc-ui", "web"],
 		}),
 		config: Flags.string({
 			description: "Load an extra config.yml-style overlay for this run (repeatable)",

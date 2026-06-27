@@ -412,3 +412,9 @@ export type RelayControlToHost = { t: "peer-joined" | "peer-left"; peer: number 
 /** Relay → guest control message. */
 export type RelayControlToGuest = { t: "room-closed" };
 export type RelayControlMessage = RelayControlToHost | RelayControlToGuest;
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Web control protocol (full-parity local web UI surface)
+// ═══════════════════════════════════════════════════════════════════════════
+
+export * from "./web";

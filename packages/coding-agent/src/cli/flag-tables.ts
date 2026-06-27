@@ -99,7 +99,7 @@ export const STRING_SETTERS: Record<string, StringSetter> = {
 		result.config = [...(result.config ?? []), value];
 	},
 	"--mode": (result, value) => {
-		if (value === "text" || value === "json" || value === "rpc" || value === "acp" || value === "rpc-ui") {
+		if (value === "text" || value === "json" || value === "rpc" || value === "acp" || value === "rpc-ui" || value === "web") {
 			result.mode = value;
 		}
 	},
