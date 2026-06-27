@@ -35,7 +35,7 @@ Web plumbing: gateway `packages/coding-agent/src/webui/gateway.ts`; client
 ### Session lifecycle & navigation
 | cmd | kind | web | notes / plan |
 |---|---|---|---|
-| `/new` | TUI-only | ❌ | new session — wire as control op (gateway `newSession`) |
+| `/new` | TUI-only | ✅ | starts a new session; gateway re-sends welcome+snapshot so the web transcript resets |
 | `/drop` | TUI-only | ❌ | delete current + start new — control op + confirm |
 | `/resume` | TUI-only | ❌ | session picker overlay |
 | `/tree` | TUI-only | ❌ | session-tree nav overlay (branches) |
@@ -173,7 +173,7 @@ runtime option source (follow-up).
 
 ## Next up (priority order)
 
-1. Session overlays: `/resume`, `/tree`, `/branch`/`/fork`, `/new`/`/drop`.
+1. Session overlays building on re-snapshot: `/resume`/`/switch` picker, `/tree`, `/branch`/`/fork`.
 2. Richer surfaces: `/context` breakdown, `/todo` editor, `/dump`/`/export` browser copy/download.
 3. Goal-mode mutation control ops (`/goal set/pause/resume/drop/budget`).
 4. `/loop` (client-side loop), `/btw`, `/tan`, `/guided-goal`, `/omfg` flows.

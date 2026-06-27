@@ -240,18 +240,7 @@ export class SessionGateway {
 
 	#onHello(peer: GatewayPeer, name: string): void {
 		peer.name = name.trim().slice(0, 64) || peer.id;
-		const snapshot = this.#session.sessionManager.snapshotForReplication();
-		const entries = snapshot.entries.filter(isWireSessionEntry);
-		peer.send({
-			t: "welcome",
-			proto: COLLAB_PROTO,
-			header: snapshot.header,
-			state: this.#buildState(),
-			agents: this.#snapshotAgents(),
-			entryCount: entries.length,
-			readOnly: peer.canWrite ? undefined : true,
-		});
-		this.#sendSnapshotChunks(peer, entries);
+		this.#sendWelcome(peer);
 		// Register for live broadcasts only AFTER the welcome + full snapshot are
 		// queued on this peer's socket. Adding earlier (e.g. on WS open) lets an
 		// in-flight entry/event/state frame reach a peer before its snapshot,
@@ -273,6 +262,23 @@ export class SessionGateway {
 			this.#sendMcp(peer);
 			this.#sendSettings(peer);
 		}
+	}
+
+	/** Send (or re-send) the welcome + full snapshot to one peer — also used to
+	 *  reset a peer's transcript after a session switch (/new). */
+	#sendWelcome(peer: GatewayPeer): void {
+		const snapshot = this.#session.sessionManager.snapshotForReplication();
+		const entries = snapshot.entries.filter(isWireSessionEntry);
+		peer.send({
+			t: "welcome",
+			proto: COLLAB_PROTO,
+			header: snapshot.header,
+			state: this.#buildState(),
+			agents: this.#snapshotAgents(),
+			entryCount: entries.length,
+			readOnly: peer.canWrite ? undefined : true,
+		});
+		this.#sendSnapshotChunks(peer, entries);
 	}
 
 	#sendSnapshotChunks(peer: GatewayPeer, entries: StoredSessionEntry[]): void {
@@ -480,6 +486,12 @@ export class SessionGateway {
 				t: "command-output",
 				text: on ? "Plan mode disabled." : "Plan mode enabled — draft local://PLAN.md before executing.",
 			});
+			return;
+		}
+		if (name === "new") {
+			const ok = await this.#session.newSession();
+			if (ok) for (const target of this.#peers) this.#sendWelcome(target);
+			peer.send({ t: "command-output", text: ok ? "Started a new session." : "Could not start a new session." });
 			return;
 		}
 		// Not handled by the text dispatcher. A KNOWN builtin here is TUI-only (no
