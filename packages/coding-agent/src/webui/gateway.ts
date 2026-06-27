@@ -452,6 +452,11 @@ export class SessionGateway {
 					const html = await Bun.file(filePath).text();
 					return ack(true, { filename: path.basename(filePath), html });
 				}
+				case "dequeue": {
+					this.#requireWrite(peer);
+					const popped = this.#session.popLastQueuedMessage();
+					return ack(true, popped ? { text: popped.text } : null);
+				}
 				case "tool-approval":
 					this.#pendingApprovals.get(frame.approvalId)?.resolve(frame.decision);
 					this.#pendingApprovals.delete(frame.approvalId);

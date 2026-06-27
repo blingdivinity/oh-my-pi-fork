@@ -62,7 +62,7 @@ Web plumbing: gateway `packages/coding-agent/src/webui/gateway.ts`; client
 | `/plan-review` | TUI-only | ❌ | reopen latest plan review — overlay |
 | `/goal` | TUI-only | ✅ | goal panel: set/pause/resume/drop/budget via goalRuntime control ops; mode bar reflects state |
 | `/guided-goal` | TUI-only | ❌ | goal interview — multi-step dialog; defer |
-| `/loop` | TUI-only | ❌ | loop driven by the TUI run loop — needs a client-side loop; deferred |
+| `/loop` | TUI-only | ✅ | client-side loop: re-sends your last prompt after each yield; Esc stops; mode-bar banner |
 | `/btw` | TUI-only | ❌ | ephemeral side question — deferred (branch flow) |
 | `/tan` | TUI-only | ❌ | background tangential agent — deferred |
 | `/omfg` | TUI-only | ❌ | forge TTSR rule from complaint — dialog |
@@ -133,10 +133,10 @@ plus every keyboard shortcut. Remaining gaps are deep interactive flows
 | `app.tools.expand` | ctrl+o | ✅ | expand all tool output |
 | `app.message.followUp` | ctrl+q / ctrl+enter | ✅ | send as follow-up |
 | `app.retry` | alt+r | ✅ | retry last failed turn |
-| `app.message.dequeue` | alt+up | ❌ | dequeue queued message |
+| `app.message.dequeue` | alt+up | ✅ | pops the last queued message back into the composer (dequeue op) |
 | `app.agents.hub` | alt+a | 🟡 | agent drawer exists |
 | `app.plan.toggle` | alt+shift+p | 🟡 | `/plan` toggles it; alt+shift+p chord not yet bound |
-| `app.history.search` | ctrl+r | ❌ | search input history |
+| `app.history.search` | ctrl+r | ✅ | history dropdown over past prompts (localStorage); filter + arrow/Enter select |
 | `app.editor.external` | ctrl+g | ➖ | external editor (browser) |
 | `app.clipboard.*` | various | ➖/❌ | browser-native copy/paste mostly |
 | `app.session.*` | various | ❌ | tree/fork/resume/rename/delete (session overlays) |

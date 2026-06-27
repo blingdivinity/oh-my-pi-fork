@@ -308,3 +308,12 @@
 	font-size: 11px;
 	cursor: pointer;
 }
+
+.lc-mode--loop {
+	background: var(--tv-accent-soft, #2a3a55);
+}
+.lc-history-text {
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}

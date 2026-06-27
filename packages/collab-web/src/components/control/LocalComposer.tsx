@@ -4,6 +4,24 @@ import type { LocalClient, LocalSnapshot } from "../../lib/local-client";
 
 const MODEL_MENU_CMDS = new Set(["model", "models", "switch"]);
 
+const HISTORY_KEY = "omp.web.history";
+function loadHistory(): string[] {
+	try {
+		const raw = localStorage.getItem(HISTORY_KEY);
+		const parsed = raw ? JSON.parse(raw) : [];
+		return Array.isArray(parsed) ? parsed.filter((x): x is string => typeof x === "string") : [];
+	} catch {
+		return [];
+	}
+}
+function saveHistory(list: string[]): void {
+	try {
+		localStorage.setItem(HISTORY_KEY, JSON.stringify(list));
+	} catch {
+		// localStorage unavailable — history is best-effort
+	}
+}
+
 interface LocalComposerProps {
 	client: LocalClient;
 	snapshot: LocalSnapshot;
@@ -21,6 +39,10 @@ interface LocalComposerProps {
 	onOpenContext?: () => void;
 	/** Export the session to HTML (browser download) for /export. */
 	onExport?: () => void;
+	/** Toggle client-side loop mode for /loop. */
+	onToggleLoop?: () => void;
+	/** Called with each free-text prompt sent (loop re-submit + history). */
+	onPromptSent?: (text: string) => void;
 }
 
 export function LocalComposer({
@@ -33,10 +55,15 @@ export function LocalComposer({
 	onOpenGoal,
 	onOpenContext,
 	onExport,
+	onToggleLoop,
+	onPromptSent,
 }: LocalComposerProps): ReactNode {
 	const [text, setText] = useState("");
 	const [activeSlash, setActiveSlash] = useState(0);
 	const readOnly = snapshot.readOnly;
+	const [promptHistory, setPromptHistory] = useState<string[]>(() => loadHistory());
+	const [historyOpen, setHistoryOpen] = useState(false);
+	const [historyIdx, setHistoryIdx] = useState(0);
 	const tryLocalUi = (name: string): boolean => {
 		const cmd = name.toLowerCase();
 		if (onOpenModelPicker && MODEL_MENU_CMDS.has(cmd)) {
@@ -67,6 +94,10 @@ export function LocalComposer({
 			onExport();
 			return true;
 		}
+		if (onToggleLoop && cmd === "loop") {
+			onToggleLoop();
+			return true;
+		}
 		return false;
 	};
 
@@ -76,6 +107,10 @@ export function LocalComposer({
 		const token = text.slice(1).toLowerCase();
 		return snapshot.commands.filter(c => c.name.toLowerCase().startsWith(token)).slice(0, 8);
 	}, [text, snapshot.commands]);
+	const historyMatches = useMemo(
+		() => (historyOpen ? promptHistory.filter(h => h.toLowerCase().includes(text.toLowerCase())).slice(0, 8) : []),
+		[historyOpen, promptHistory, text],
+	);
 
 	const submit = (behavior: "steer" | "followUp" = "steer"): void => {
 		const value = text.trim();
@@ -83,9 +118,18 @@ export function LocalComposer({
 		if (value.startsWith("/")) {
 			const [head, ...rest] = value.slice(1).split(/\s+/);
 			if (rest.length > 0 || !tryLocalUi(head ?? "")) void client.runSlash(value);
-		} else void client.prompt(value, behavior);
+		} else {
+			void client.prompt(value, behavior);
+			onPromptSent?.(value);
+		}
+		setPromptHistory(h => {
+			const next = [value, ...h.filter(x => x !== value)].slice(0, 100);
+			saveHistory(next);
+			return next;
+		});
 		setText("");
 		setActiveSlash(0);
+		setHistoryOpen(false);
 	};
 
 	const applySlash = (name: string): void => {
@@ -152,12 +196,66 @@ export function LocalComposer({
 						))}
 					</div>
 				)}
+				{historyOpen && historyMatches.length > 0 && (
+					<div className="lc-slash lc-history">
+						{historyMatches.map((h, i) => (
+							<div
+								key={h}
+								className="lc-slash-item"
+								data-active={i === historyIdx}
+								onMouseDown={e => {
+									e.preventDefault();
+									setText(h);
+									setHistoryOpen(false);
+								}}
+							>
+								<span className="lc-history-text">{h}</span>
+							</div>
+						))}
+					</div>
+				)}
 				<textarea
 					value={text}
 					placeholder={readOnly ? "read-only session" : "Message, or / for commands"}
 					disabled={readOnly}
 					onChange={e => setText(e.target.value)}
 					onKeyDown={e => {
+						if (historyOpen) {
+							if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+								e.preventDefault();
+								setHistoryIdx(prev => {
+									const n = historyMatches.length;
+									if (n === 0) return 0;
+									return e.key === "ArrowDown" ? (prev + 1) % n : (prev - 1 + n) % n;
+								});
+								return;
+							}
+							if (e.key === "Enter") {
+								e.preventDefault();
+								const pick = historyMatches[historyIdx];
+								if (pick) setText(pick);
+								setHistoryOpen(false);
+								return;
+							}
+							if (e.key === "Escape") {
+								e.preventDefault();
+								setHistoryOpen(false);
+								return;
+							}
+						}
+						if (e.ctrlKey && e.code === "KeyR") {
+							e.preventDefault();
+							setHistoryOpen(o => !o);
+							setHistoryIdx(0);
+							return;
+						}
+						if (e.altKey && e.key === "ArrowUp" && !readOnly) {
+							e.preventDefault();
+							void client.dequeue().then(r => {
+								if (r) setText(r.text);
+							});
+							return;
+						}
 						if (slashMatches.length > 0 && (e.key === "ArrowDown" || e.key === "ArrowUp")) {
 							e.preventDefault();
 							setActiveSlash(prev => {

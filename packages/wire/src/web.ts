@@ -255,6 +255,7 @@ export type WebControlFrame =
 	  }
 	| { t: "ctl"; op: "get-context"; reqId: number }
 	| { t: "ctl"; op: "export-html"; reqId: number }
+	| { t: "ctl"; op: "dequeue"; reqId: number }
 	| { t: "ctl"; op: "get-models"; reqId: number }
 	| { t: "ctl"; op: "get-commands"; reqId: number }
 	| { t: "ctl"; op: "get-mcp"; reqId: number }

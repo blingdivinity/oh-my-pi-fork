@@ -246,6 +246,9 @@ export class LocalClient {
 			html: string;
 		} | null>;
 	}
+	dequeue(): Promise<{ text: string } | null> {
+		return this.#ctl(reqId => ({ t: "ctl", op: "dequeue", reqId })) as Promise<{ text: string } | null>;
+	}
 	bash(command: string): Promise<unknown> {
 		return this.#ctl(reqId => ({ t: "ctl", op: "bash", reqId, command }));
 	}

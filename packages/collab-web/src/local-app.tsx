@@ -1,5 +1,5 @@
 import type { ReactNode } from "react";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { AgentsPanel } from "./components/agents/AgentsPanel";
 import { ContextPanel } from "./components/control/ContextPanel";
 import { ControlOverlays } from "./components/control/ControlOverlays";
@@ -53,6 +53,9 @@ function LocalSession({ client }: { client: LocalClient }): ReactNode {
 	const [sessionsOpen, setSessionsOpen] = useState(false);
 	const [goalOpen, setGoalOpen] = useState(false);
 	const [contextOpen, setContextOpen] = useState(false);
+	const [loopMode, setLoopMode] = useState(false);
+	const lastPromptRef = useRef<string | null>(null);
+	const prevWorkingRef = useRef(false);
 
 	const subCount = useMemo(() => snap.agents.filter(a => a.kind === "sub").length, [snap.agents]);
 	const agentIds = useMemo(() => new Set(snap.agents.map(a => a.id)), [snap.agents]);
@@ -98,14 +101,25 @@ function LocalSession({ client }: { client: LocalClient }): ReactNode {
 			} else if (e.code === "KeyO" && e.ctrlKey && !e.shiftKey && !e.metaKey && !e.altKey) {
 				e.preventDefault();
 				setExpandTools(v => !v);
-			} else if (e.code === "Escape" && working) {
+			} else if (e.code === "Escape" && (working || loopMode)) {
 				e.preventDefault();
-				client.sendAbort();
+				if (working) client.sendAbort();
+				setLoopMode(false);
 			}
 		};
 		window.addEventListener("keydown", onKey);
 		return () => window.removeEventListener("keydown", onKey);
-	}, [client, working]);
+	}, [client, working, loopMode]);
+
+	// Client-side /loop: re-send the last free-text prompt when a turn finishes
+	// (working true→false) while loop is on. Esc cancels.
+	useEffect(() => {
+		const wasWorking = prevWorkingRef.current;
+		prevWorkingRef.current = working;
+		if (wasWorking && !working && loopMode && lastPromptRef.current) {
+			void client.prompt(lastPromptRef.current);
+		}
+	}, [working, loopMode, client]);
 
 	return (
 		<div className="sh-app">
@@ -165,7 +179,7 @@ function LocalSession({ client }: { client: LocalClient }): ReactNode {
 				</details>
 			)}
 			<TodoHud snapshot={snap} />
-			{(snap.state?.planMode || snap.state?.goalMode) && (
+			{(snap.state?.planMode || snap.state?.goalMode || loopMode) && (
 				<div className="lc-modebar">
 					{snap.state?.planMode && <span className="lc-mode lc-mode--plan">plan mode</span>}
 					{snap.state?.goalMode && (
@@ -173,6 +187,7 @@ function LocalSession({ client }: { client: LocalClient }): ReactNode {
 							goal · {snap.state.goalMode.status}: {snap.state.goalMode.objective}
 						</span>
 					)}
+					{loopMode && <span className="lc-mode lc-mode--loop">loop · Esc to stop</span>}
 				</div>
 			)}
 			<LocalComposer
@@ -187,6 +202,10 @@ function LocalSession({ client }: { client: LocalClient }): ReactNode {
 				onOpenSessions={() => setSessionsOpen(true)}
 				onOpenGoal={() => setGoalOpen(true)}
 				onOpenContext={() => setContextOpen(true)}
+				onToggleLoop={() => setLoopMode(m => !m)}
+				onPromptSent={t => {
+					lastPromptRef.current = t;
+				}}
 				onExport={() => {
 					void client.exportHtml().then(res => {
 						if (!res) return;
