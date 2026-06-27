@@ -68,9 +68,17 @@ describe("browser e2e: full-parity web UI", () => {
 	}, 120_000);
 
 	afterAll(async () => {
-		await browser?.close();
-		await server?.stop();
-	});
+		try {
+			await browser?.close();
+		} catch {
+			// best-effort cleanup
+		}
+		try {
+			await server?.stop();
+		} catch {
+			// best-effort cleanup
+		}
+	}, 30_000);
 
 	it.skipIf(!chromiumPath)(
 		"loads the SPA, streams a real assistant turn, and exposes the model picker",
