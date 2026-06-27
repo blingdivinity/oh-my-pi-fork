@@ -1,0 +1,174 @@
+# omp web UI — TUI parity matrix
+
+Source of truth for re-implementing the TUI/UX **exactly** in the web UI
+(`omp --mode web`). Derived from the authoritative declarative registries, not
+from memory:
+
+- Keybindings → `packages/coding-agent/src/config/keybindings.ts` (`KEYBINDINGS`)
+- Slash commands → `packages/coding-agent/src/slash-commands/builtin-registry.ts`
+  (`BUILTIN_SLASH_COMMAND_REGISTRY`, 58 specs). Each spec carries `handle`
+  (text/ACP, runs headless) and/or `handleTui` (needs `InteractiveModeContext`).
+- Settings → `packages/coding-agent/src/config/settings.ts`
+- Theme tokens → `packages/coding-agent/src/modes/theme/theme-schema.json`
+
+Web plumbing: gateway `packages/coding-agent/src/webui/gateway.ts`; client
+`packages/collab-web/src/lib/local-client.ts`; UI `packages/collab-web/src/`.
+
+**Legend** — ✅ done · 🟡 partial / runs-but-not-TUI-grade · ⛔ stubbed
+("interactive-only" notice) · ❌ missing · ➖ N/A in a browser.
+
+> Maintenance: keep this in lockstep with the registries. When a registry entry
+> changes, update the matching row. A command's `handle`/`handleTui` columns are
+> regenerable via the dump in commit history (imports `BUILTIN_SLASH_COMMANDS_INTERNAL`).
+
+---
+
+## Slash commands (58)
+
+`kind` = which handlers the spec declares.
+- **both** → has `handle`, so the gateway runs it via `executeAcpBuiltinSlashCommand`
+  and emits text. Many also have a richer `handleTui` the web should match.
+- **TUI-only** → `handleTui` only; the gateway currently returns
+  "interactive-only" — these need a real web surface or ➖.
+- **text** → `handle` only.
+
+### Session lifecycle & navigation
+| cmd | kind | web | notes / plan |
+|---|---|---|---|
+| `/new` | TUI-only | ❌ | new session — wire as control op (gateway `newSession`) |
+| `/drop` | TUI-only | ❌ | delete current + start new — control op + confirm |
+| `/resume` | TUI-only | ❌ | session picker overlay |
+| `/tree` | TUI-only | ❌ | session-tree nav overlay (branches) |
+| `/branch` | TUI-only | ❌ | branch from a past message — needs transcript message picker |
+| `/fork` | TUI-only | ❌ | fork from a past message |
+| `/handoff` | TUI-only | ❌ | handoff context to new session |
+| `/session` | both | 🟡 | `info`/`delete` run as text; fine |
+| `/rename` | both | 🟡 | runs (text); could inline-edit header title |
+| `/move` | both | ✅ | runs (text) |
+| `/exit` `/quit` | TUI-only | ➖ | browser: close tab |
+
+### Model & thinking
+| cmd | kind | web | notes / plan |
+|---|---|---|---|
+| `/model` `/models` | both | 🟡 | **TUI opens a model selector menu** — web only sets via dropdown (provider prefix now shown). BUILD a model-picker overlay (provider/id, current marked, fuzzy) and route `/model`/`/switch`/alt+m to it. |
+| `/switch` | TUI-only | 🟡 | same selector as `/model` (alt+p / temporary) |
+| `/fast` | both | ✅ | `on`/`off`/`status` run (text) |
+| `/advisor` | both | ✅ | runs (text) |
+
+### Modes & autonomy
+| cmd | kind | web | notes / plan |
+|---|---|---|---|
+| `/plan` | TUI-only | ❌ | toggle plan mode — control op + indicator (alt+shift+p) |
+| `/plan-review` | TUI-only | ❌ | reopen latest plan review — overlay |
+| `/goal` | TUI-only | ❌ | `set/show/pause/resume/drop/budget` — control ops + goal banner |
+| `/guided-goal` | TUI-only | ❌ | goal interview — multi-step dialog; defer |
+| `/loop` | TUI-only | ❌ | toggle loop mode — control op + indicator |
+| `/btw` | TUI-only | ❌ | ephemeral side question — control op (prompt variant) |
+| `/tan` | TUI-only | ❌ | background tangential agent — control op |
+| `/omfg` | TUI-only | ❌ | forge TTSR rule from complaint — dialog |
+| `/retry` | TUI-only | ❌ | retry last failed turn — control op (alt+r) |
+| `/force` | both | 🟡 | runs; needs tool arg (no selector yet) |
+
+### Context & transcript
+| cmd | kind | web | notes / plan |
+|---|---|---|---|
+| `/context` | both | 🟡 | runs (text); TUI shows a breakdown panel |
+| `/compact` | both | ✅ | `soft`/`remote`/`snapcompact` run |
+| `/shake` | both | ✅ | `elide`/`images` run |
+| `/fresh` | both | ✅ | runs |
+| `/tools` | both | 🟡 | runs (text); ctrl+o expand has no web equiv |
+| `/todo` | both | 🟡 | runs (text); TUI has an editor + the todo HUD |
+| `/dump` | both | 🟡 | TUI copies to clipboard — web should copy in-browser |
+| `/export` | both | 🟡 | writes HTML server-side — web should offer a download |
+| `/copy` | TUI-only | ❌ | pick text/code to copy — selection overlay |
+| `/memory` | both | ✅ | many subs; run as text |
+
+### Providers, MCP, plugins, infra
+| cmd | kind | web | notes / plan |
+|---|---|---|---|
+| `/setup` `/providers` | TUI-only | ❌ | provider setup wizard — onboarding dialog; defer |
+| `/login` `/logout` | TUI-only | ❌/➖ | OAuth device flow — needs web auth surface |
+| `/mcp` | both | ✅ | full sub-tree runs (text); MCP badge shows status |
+| `/ssh` | both | ✅ | `add`/`list`/`remove` run |
+| `/marketplace` | both | ✅ | runs (text) |
+| `/plugins` | both | ✅ | `list`/`enable`/`disable` run |
+| `/reload-plugins` | both | ✅ | runs |
+| `/extensions` | TUI-only | ❌ | Extension Control Center — panel |
+| `/agents` | TUI-only | 🟡 | Agent Control Center — `AgentsPanel`/drawer exists, not full parity |
+
+### Collab, sharing, misc
+| cmd | kind | web | notes / plan |
+|---|---|---|---|
+| `/collab` | TUI-only | ➖ | host a relay — web is already the client |
+| `/join` `/leave` | TUI-only | ➖ | collab join/leave |
+| `/share` | both | ✅ | returns an encrypted link |
+| `/browser` | both | ✅ | headless/visible toggle |
+| `/jobs` | both | ✅ | runs |
+| `/usage` | both | ✅ | `show`/`reset` run |
+| `/changelog` | both | ✅ | runs |
+| `/stats` | text | 🟡 | launches local stats dashboard — web could link out |
+| `/debug` | TUI-only | ❌ | debug tools selector — overlay |
+| `/hotkeys` | TUI-only | ❌ | show shortcuts — web help overlay |
+| `/settings` | TUI-only | ❌ | **settings menu — BUILD read+write panel** |
+
+**Tally:** ✅ ~24 · 🟡 ~12 · ⛔/❌ ~20 · ➖ ~6. The "both" commands already run
+(text); the gap is (a) TUI-only selectors/dashboards and (b) richer surfaces for
+commands that today only echo text.
+
+---
+
+## Keybindings (`KEYBINDINGS`)
+
+| action | default | web | notes |
+|---|---|---|---|
+| `app.interrupt` | escape | ✅ | abort while streaming |
+| `app.thinking.cycle` | shift+tab | ✅ | cycle thinking |
+| `app.thinking.toggle` | ctrl+t | ❌ | toggle thinking on/off |
+| `app.model.cycleForward` | ctrl+p | ✅ | next model |
+| `app.model.cycleBackward` | shift+ctrl+p | ❌ | prev model (needs gateway backward cycle) |
+| `app.model.select` | alt+m | ❌ | open model menu (see `/model`) |
+| `app.model.selectTemporary` | alt+p | ❌ | temporary model |
+| `app.tools.expand` | ctrl+o | ❌ | expand tool output |
+| `app.message.followUp` | ctrl+q / ctrl+enter | ❌ | send as follow-up (streamingBehavior) |
+| `app.retry` | alt+r | ❌ | retry last failed turn |
+| `app.message.dequeue` | alt+up | ❌ | dequeue queued message |
+| `app.agents.hub` | alt+a | 🟡 | agent drawer exists |
+| `app.plan.toggle` | alt+shift+p | ❌ | toggle plan mode |
+| `app.history.search` | ctrl+r | ❌ | search input history |
+| `app.editor.external` | ctrl+g | ➖ | external editor (browser) |
+| `app.clipboard.*` | various | ➖/❌ | browser-native copy/paste mostly |
+| `app.session.*` | various | ❌ | tree/fork/resume/rename/delete (session overlays) |
+| `app.display.reset` | ctrl+l | ➖ | terminal-only |
+| `app.suspend` | ctrl+z | ➖ | terminal-only |
+| `app.stt.toggle` | (hold space) | ➖ | speech-to-text |
+
+---
+
+## Settings (`settings.ts`) & persistence
+
+`omp --mode web` runs against the real `Settings` store (same instance as the
+TUI), so a web write lands in the user's config files and the TUI sees it on next
+read. **Status: ❌ no settings panel yet.** Plan: add `get`/`set` control frames
+to the gateway and a settings panel mirroring the TUI's `/settings` menu
+(approval mode, thinking default, model scope, advisor, etc.), then verify a web
+write is visible in the TUI.
+
+---
+
+## Cross-cutting fixes already landed
+
+- Slash commands execute (don't leak to model); unknown slash → model (correct).
+- **One Enter runs the highlighted command** (Tab completes for arg-entry).
+- Model dropdown shows **provider prefix**.
+- shift+tab thinking · ctrl+p model · Esc abort.
+- `command-output` surfaces as a toast.
+- Dev serving rebuilds the SPA when source is stale.
+
+## Next up (priority order)
+
+1. **`/model` selector overlay** + alt+m / `/switch` / alt+p routing (provider/id, fuzzy, current).
+2. **Settings panel** (read+write control frames) + TUI↔web persistence check.
+3. Remaining shortcuts: ctrl+t, shift+ctrl+p, ctrl+o, alt+r, alt+up, follow-up.
+4. Mode toggles as control ops: `/plan`, `/loop`, `/goal`, `/retry`, `/btw`, `/tan`.
+5. Session overlays: `/resume`, `/tree`, `/branch`/`/fork`, `/new`/`/drop`.
+6. Richer surfaces: `/context` breakdown, `/todo` editor, `/dump`/`/export` browser copy/download, `/hotkeys` help.

@@ -32,6 +32,12 @@ export function LocalComposer({ client, snapshot }: LocalComposerProps): ReactNo
 		setText(`/${name} `);
 		setActiveSlash(0);
 	};
+	const runSlashName = (name: string): void => {
+		if (readOnly) return;
+		void client.runSlash(`/${name}`);
+		setText("");
+		setActiveSlash(0);
+	};
 
 	const currentModel = snapshot.models.find(m => m.current);
 	const connectedMcp = snapshot.mcp.filter(s => s.status === "connected").length;
@@ -50,7 +56,7 @@ export function LocalComposer({ client, snapshot }: LocalComposerProps): ReactNo
 					{snapshot.models.length === 0 && <option value="">no models</option>}
 					{snapshot.models.map(m => (
 						<option key={m.id} value={m.id}>
-							{m.name}
+							{m.provider}/{m.name}
 						</option>
 					))}
 				</select>
@@ -77,7 +83,7 @@ export function LocalComposer({ client, snapshot }: LocalComposerProps): ReactNo
 								data-active={i === activeSlash}
 								onMouseDown={e => {
 									e.preventDefault();
-									applySlash(c.name);
+									runSlashName(c.name);
 								}}
 							>
 								<span className="lc-slash-name">/{c.name}</span>
@@ -108,11 +114,11 @@ export function LocalComposer({ client, snapshot }: LocalComposerProps): ReactNo
 						}
 						if (e.key === "Enter" && !e.shiftKey) {
 							e.preventDefault();
-							// Palette open: Enter selects the highlighted command (fills it);
-							// a second Enter runs it. Otherwise submit.
+							// Palette open: one Enter runs the highlighted command directly.
+							// (Tab completes it into the input instead, for adding arguments.)
 							if (slashMatches.length > 0) {
 								const match = slashMatches[activeSlash];
-								if (match) applySlash(match.name);
+								if (match) runSlashName(match.name);
 								return;
 							}
 							submit();
