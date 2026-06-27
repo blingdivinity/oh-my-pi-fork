@@ -36,12 +36,12 @@ Web plumbing: gateway `packages/coding-agent/src/webui/gateway.ts`; client
 | cmd | kind | web | notes / plan |
 |---|---|---|---|
 | `/new` | TUI-only | ✅ | starts a new session; gateway re-sends welcome+snapshot so the web transcript resets |
-| `/drop` | TUI-only | ❌ | delete current + start new — control op + confirm |
+| `/drop` | TUI-only | ✅ | `newSession({ drop: true })` deletes the current session + starts fresh, then re-snapshots peers |
 | `/resume` | TUI-only | ✅ | session picker (list-sessions + switch-session); switch re-snapshots the transcript |
 | `/tree` | TUI-only | ✅ | session-tree overlay: fork/branch forest from `parentPath` (matched by path or id), click to switch |
 | `/branch` | TUI-only | ✅ | "⎇ branch" button on each user message → branch(entryId) + re-snapshot |
 | `/fork` | TUI-only | ✅ | session.fork() (history copied) + re-snapshot |
-| `/handoff` | TUI-only | ❌ | handoff context to new session |
+| `/handoff` | TUI-only | ✅ | server-side `session.handoff(focus)` (same call RPC uses) → re-snapshot; generation errors report gracefully |
 | `/session` | both | 🟡 | `info`/`delete` run as text; fine |
 | `/rename` | both | 🟡 | runs (text); could inline-edit header title |
 | `/move` | both | ✅ | runs (text) |
@@ -61,7 +61,7 @@ Web plumbing: gateway `packages/coding-agent/src/webui/gateway.ts`; client
 | `/plan` | TUI-only | ✅ | toggles plan mode (gateway sets PlanModeState, ACP-style) + mode bar |
 | `/plan-review` | TUI-only | ❌ | reopen latest plan review — overlay |
 | `/goal` | TUI-only | ✅ | goal panel: set/pause/resume/drop/budget via goalRuntime control ops; mode bar reflects state |
-| `/guided-goal` | TUI-only | ❌ | goal interview — multi-step dialog; defer |
+| `/guided-goal` | TUI-only | ✅ | opens the goal panel (set/budget); the LLM interview is a TUI nicety, the panel reaches the same goal |
 | `/loop` | TUI-only | ✅ | client-side loop: re-sends your last prompt after each yield; Esc stops; mode-bar banner |
 | `/btw` | TUI-only | ❌ | ephemeral side question — deferred (branch flow) |
 | `/tan` | TUI-only | ❌ | background tangential agent — deferred |
@@ -94,7 +94,7 @@ Web plumbing: gateway `packages/coding-agent/src/webui/gateway.ts`; client
 | `/plugins` | both | ✅ | `list`/`enable`/`disable` run |
 | `/reload-plugins` | both | ✅ | runs |
 | `/extensions` | TUI-only | ❌ | Extension Control Center — panel |
-| `/agents` | TUI-only | 🟡 | Agent Control Center — `AgentsPanel`/drawer exists, not full parity |
+| `/agents` | TUI-only | ✅ | opens the agents rail (`AgentsPanel`) — the web Agent Control Center |
 
 ### Collab, sharing, misc
 | cmd | kind | web | notes / plan |

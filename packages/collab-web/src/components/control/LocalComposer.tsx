@@ -39,6 +39,8 @@ interface LocalComposerProps {
 	onOpenContext?: () => void;
 	/** Open the session-tree overlay for /tree. */
 	onOpenTree?: () => void;
+	/** Open the agents rail for /agents. */
+	onOpenAgents?: () => void;
 	/** Export the session to HTML (browser download) for /export. */
 	onExport?: () => void;
 	/** Toggle client-side loop mode for /loop. */
@@ -57,6 +59,7 @@ export function LocalComposer({
 	onOpenGoal,
 	onOpenContext,
 	onOpenTree,
+	onOpenAgents,
 	onExport,
 	onToggleLoop,
 	onPromptSent,
@@ -85,7 +88,7 @@ export function LocalComposer({
 			onOpenSessions();
 			return true;
 		}
-		if (onOpenGoal && cmd === "goal") {
+		if (onOpenGoal && (cmd === "goal" || cmd === "guided-goal")) {
 			onOpenGoal();
 			return true;
 		}
@@ -95,6 +98,10 @@ export function LocalComposer({
 		}
 		if (onOpenTree && cmd === "tree") {
 			onOpenTree();
+			return true;
+		}
+		if (onOpenAgents && cmd === "agents") {
+			onOpenAgents();
 			return true;
 		}
 		if (onExport && cmd === "export") {

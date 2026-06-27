@@ -561,6 +561,37 @@ export class SessionGateway {
 			});
 			return;
 		}
+		if (name === "handoff") {
+			if (this.#session.isStreaming) {
+				peer.send({ t: "command-output", text: "Finish or abort the current turn before handing off." });
+				return;
+			}
+			const instructions = command.slice(1).slice(name.length).trim() || undefined;
+			try {
+				const result = await this.#session.handoff(instructions);
+				if (result) for (const target of this.#peers) this.#sendWelcome(target);
+				peer.send({
+					t: "command-output",
+					text: result ? "Handed off to a new session." : "Handoff cancelled (session not persisted, or aborted).",
+				});
+			} catch (err) {
+				peer.send({
+					t: "command-output",
+					text: `Handoff failed: ${err instanceof Error ? err.message : String(err)}`,
+				});
+			}
+			return;
+		}
+		if (name === "drop") {
+			if (!this.#session.sessionManager.getSessionFile()) {
+				peer.send({ t: "command-output", text: "Nothing to drop (in-memory session)." });
+				return;
+			}
+			await this.#session.newSession({ drop: true });
+			for (const target of this.#peers) this.#sendWelcome(target);
+			peer.send({ t: "command-output", text: "Dropped the session and started fresh." });
+			return;
+		}
 		// Not handled by the text dispatcher. A KNOWN builtin here is TUI-only (no
 		// text handle) — surface that rather than send "/cmd" to the model.
 		if (lookupBuiltinSlashCommand(name)) {

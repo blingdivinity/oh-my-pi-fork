@@ -205,6 +205,7 @@ function LocalSession({ client }: { client: LocalClient }): ReactNode {
 				onOpenGoal={() => setGoalOpen(true)}
 				onOpenContext={() => setContextOpen(true)}
 				onOpenTree={() => setTreeOpen(true)}
+				onOpenAgents={() => setRailOpen(true)}
 				onToggleLoop={() => setLoopMode(m => !m)}
 				onPromptSent={t => {
 					lastPromptRef.current = t;
