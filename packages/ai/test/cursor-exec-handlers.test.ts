@@ -1,13 +1,25 @@
 import { describe, expect, it } from "bun:test";
+import * as http2 from "node:http2";
+import { create, toBinary } from "@bufbuild/protobuf";
 import {
 	buildCursorHistoryForTest,
 	buildCursorSystemPromptJsons,
 	resolveExecHandler,
 	streamCursor,
 } from "@oh-my-pi/pi-ai/providers/cursor";
-import type { Context, Model } from "@oh-my-pi/pi-ai/types";
+import type { Context, CursorExecHandlers, Model, ToolResultMessage } from "@oh-my-pi/pi-ai/types";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
-import type { AgentRunRequest } from "@oh-my-pi/pi-catalog/discovery/cursor-gen/agent_pb";
+import {
+	type AgentRunRequest,
+	type AgentServerMessage,
+	AgentServerMessageSchema,
+	ExecServerMessageSchema,
+	GrepArgsSchema,
+	InteractionUpdateSchema,
+	ReadArgsSchema,
+	TextDeltaUpdateSchema,
+	TurnEndedUpdateSchema,
+} from "@oh-my-pi/pi-catalog/discovery/cursor-gen/agent_pb";
 
 const cursorModel: Model<"cursor-agent"> = buildModel({
 	id: "cursor-composer-2.5",
@@ -21,6 +33,72 @@ const cursorModel: Model<"cursor-agent"> = buildModel({
 	contextWindow: 1,
 	maxTokens: 1,
 });
+
+function frameServerMessage(message: AgentServerMessage): Buffer {
+	const bytes = toBinary(AgentServerMessageSchema, message);
+	const frame = Buffer.alloc(5 + bytes.length);
+	frame[0] = 0;
+	frame.writeUInt32BE(bytes.length, 1);
+	Buffer.from(bytes).copy(frame, 5);
+	return frame;
+}
+
+function cursorTextDelta(text: string): AgentServerMessage {
+	return create(AgentServerMessageSchema, {
+		message: {
+			case: "interactionUpdate",
+			value: create(InteractionUpdateSchema, {
+				message: { case: "textDelta", value: create(TextDeltaUpdateSchema, { text }) },
+			}),
+		},
+	});
+}
+
+function cursorTurnEnded(): AgentServerMessage {
+	return create(AgentServerMessageSchema, {
+		message: {
+			case: "interactionUpdate",
+			value: create(InteractionUpdateSchema, {
+				message: { case: "turnEnded", value: create(TurnEndedUpdateSchema, {}) },
+			}),
+		},
+	});
+}
+
+function cursorReadExec(id: number, toolCallId: string): AgentServerMessage {
+	return create(AgentServerMessageSchema, {
+		message: {
+			case: "execServerMessage",
+			value: create(ExecServerMessageSchema, {
+				id,
+				message: { case: "readArgs", value: create(ReadArgsSchema, { path: "a.ts", toolCallId }) },
+			}),
+		},
+	});
+}
+
+function cursorGrepExec(id: number, toolCallId: string): AgentServerMessage {
+	return create(AgentServerMessageSchema, {
+		message: {
+			case: "execServerMessage",
+			value: create(ExecServerMessageSchema, {
+				id,
+				message: { case: "grepArgs", value: create(GrepArgsSchema, { pattern: "needle", toolCallId }) },
+			}),
+		},
+	});
+}
+
+function makeCursorToolResult(toolCallId: string, toolName: string, text: string): ToolResultMessage {
+	return {
+		role: "toolResult",
+		toolCallId,
+		toolName,
+		content: [{ type: "text", text }],
+		isError: false,
+		timestamp: Date.now(),
+	};
+}
 
 function captureCursorPayload(context: Context): Promise<AgentRunRequest> {
 	const { promise, resolve, reject } = Promise.withResolvers<AgentRunRequest>();
@@ -81,6 +159,74 @@ function toolResultContext(): Context {
 		],
 	};
 }
+
+describe("Cursor stream message ordering", () => {
+	it("serializes async exec frames between surrounding text deltas", async () => {
+		const server = http2.createServer();
+		const messages = [
+			cursorTextDelta("before A "),
+			cursorReadExec(1, "a"),
+			cursorTextDelta("between A and B "),
+			cursorGrepExec(2, "b"),
+			cursorTextDelta("after B"),
+			cursorTurnEnded(),
+		];
+		server.on("stream", stream => {
+			const responseStream = stream as http2.ServerHttp2Stream;
+			responseStream.respond({ ":status": 200, "content-type": "application/connect+proto" });
+			for (const message of messages) {
+				responseStream.write(frameServerMessage(message));
+			}
+			responseStream.end();
+		});
+
+		const listening = Promise.withResolvers<void>();
+		server.listen(0, "127.0.0.1", listening.resolve);
+		await listening.promise;
+		const address = server.address();
+		if (!address || typeof address === "string") {
+			throw new Error("Expected test server address");
+		}
+
+		const sequence: string[] = [];
+		const execHandlers: CursorExecHandlers = {
+			async read(args) {
+				await Bun.sleep(20);
+				return makeCursorToolResult(args.toolCallId, "read", "A result");
+			},
+			async grep(args) {
+				return makeCursorToolResult(args.toolCallId, "grep", "B result");
+			},
+		};
+
+		try {
+			const stream = streamCursor(
+				{ ...cursorModel, baseUrl: `http://127.0.0.1:${address.port}` },
+				{ messages: [{ role: "user", content: "go", timestamp: 0 }] },
+				{
+					apiKey: "test-token",
+					execHandlers,
+					onToolResult: message => {
+						sequence.push(`tool:${message.toolCallId}`);
+						return message;
+					},
+				},
+			);
+
+			for await (const event of stream) {
+				if (event.type === "text_delta") {
+					sequence.push(`text:${event.delta}`);
+				}
+			}
+		} finally {
+			const closed = Promise.withResolvers<void>();
+			server.close(() => closed.resolve());
+			await closed.promise;
+		}
+
+		expect(sequence).toEqual(["text:before A ", "tool:a", "text:between A and B ", "tool:b", "text:after B"]);
+	});
+});
 
 describe("Cursor resolveExecHandler execHandlers binding", () => {
 	it("invokes handler with correct this when passed as bound method", async () => {

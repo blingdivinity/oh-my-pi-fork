@@ -11,6 +11,7 @@
 
 ### Fixed
 
+- Fixed Cursor provider streaming to process async exec/tool frames in server order, preventing tool results and final text from appearing randomly out of order.
 - Fixed llama.cpp OpenAI-compatible capture follow-ups sending named forced `tool_choice` as an object; the chat-completions encoder now downgrades that shape to string `"required"` for llama.cpp so its parser no longer falls back with `type must be string, but is object`. ([#3593](https://github.com/can1357/oh-my-pi/issues/3593))
 - Fixed `omp usage` silently omitting Ollama and Ollama Cloud accounts by registering placeholder usage providers for both until an upstream quota endpoint is available. ([#3555](https://github.com/can1357/oh-my-pi/issues/3555))
 - Fixed Gemini reasoning-runaway detection to expose a dedicated thought-summary header guard for streams that keep emitting fresh planning titles without making a tool call, so higher layers can interrupt that shape without reusing the generic silent retry marker.

@@ -436,6 +436,29 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 			};
 
 			let resolveH2: (() => void) | undefined;
+			let serverMessageQueue: Promise<void> = Promise.resolve();
+			const processServerMessage = (serverMessage: AgentServerMessage): Promise<void> => {
+				serverMessageQueue = serverMessageQueue
+					.then(() =>
+						handleServerMessage(
+							serverMessage,
+							output,
+							stream,
+							state,
+							blobStore,
+							h2Request!,
+							options?.execHandlers,
+							options?.onToolResult,
+							usageState,
+							requestContextTools,
+							onConversationCheckpoint,
+						),
+					)
+					.catch(error => {
+						log("error", "handleServerMessage", { error: String(error) });
+					});
+				return serverMessageQueue;
+			};
 
 			h2Request.on("response", headers => {
 				debugResponseLogPromise = debugSession?.openResponseLog(
@@ -474,28 +497,18 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 						const isTurnEnded =
 							serverMessage.message.case === "interactionUpdate" &&
 							serverMessage.message.value.message?.case === "turnEnded";
-						void handleServerMessage(
-							serverMessage,
-							output,
-							stream,
-							state,
-							blobStore,
-							h2Request!,
-							options?.execHandlers,
-							options?.onToolResult,
-							usageState,
-							requestContextTools,
-							onConversationCheckpoint,
-						).catch(error => {
-							log("error", "handleServerMessage", { error: String(error) });
-						});
+						const processed = processServerMessage(serverMessage);
 
-						// Resolve only on explicit turnEnded. stopReason defaults to "stop"
-						// and is not a reliable signal for stream completion.
-						if (isTurnEnded && resolveH2) {
-							const r = resolveH2;
-							resolveH2 = undefined;
-							r();
+						// Resolve only on explicit turnEnded, after every earlier frame has
+						// drained through the serialized async handler queue. stopReason defaults
+						// to "stop" and is not a reliable signal for stream completion.
+						if (isTurnEnded) {
+							void processed.then(() => {
+								if (!resolveH2) return;
+								const r = resolveH2;
+								resolveH2 = undefined;
+								r();
+							});
 						}
 					} catch (e) {
 						log("error", "parseServerMessage", { error: String(e) });
@@ -539,6 +552,7 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 				h2Request!.on("end", () => {
 					resolveH2 = undefined;
 					void closeDebugLog()
+						.then(() => serverMessageQueue)
 						.then(() => {
 							if (endStreamError) {
 								reject(endStreamError);

@@ -309,10 +309,11 @@ export interface AgentPromptOptions {
 	toolChoice?: ToolChoice;
 }
 
-/** Buffered Cursor tool result with text position at time of call */
+/** Buffered Cursor tool result with text position at tool-call start */
 interface CursorToolResultEntry {
 	toolResult: ToolResultMessage;
 	textLengthAtCall: number;
+	order: number;
 }
 
 export class Agent {
@@ -380,8 +381,10 @@ export class Agent {
 	#telemetry?: AgentLoopConfig["telemetry"];
 	#appendOnlyContext?: AppendOnlyContextManager;
 
-	/** Buffered Cursor tool results with text length at time of call (for correct ordering) */
+	/** Buffered Cursor tool results with text length at tool-call start (for correct ordering) */
 	#cursorToolResultBuffer: CursorToolResultEntry[] = [];
+	#cursorToolStartPositions = new Map<string, { textLength: number; order: number }>();
+	#cursorToolOrder = 0;
 
 	streamFn: StreamFn;
 	getApiKey?: (model: Model) => Promise<ApiKey | undefined> | ApiKey | undefined;
@@ -759,6 +762,7 @@ export class Agent {
 				this.appendMessage(event.message);
 				break;
 			case "tool_execution_start":
+				this.#recordCursorToolStart(event.toolCallId);
 				this.#state.pendingToolCalls.add(event.toolCallId);
 				break;
 			case "tool_execution_end":
@@ -1054,8 +1058,10 @@ export class Agent {
 		this.#state.streamMessage = null;
 		this.#state.error = undefined;
 
-		// Clear Cursor tool result buffer at start of each run
+		// Clear Cursor tool ordering state at start of each run.
 		this.#cursorToolResultBuffer = [];
+		this.#cursorToolStartPositions.clear();
+		this.#cursorToolOrder = 0;
 
 		const reasoning = this.#state.thinkingLevel;
 
@@ -1077,12 +1083,16 @@ export class Agent {
 								}
 							} catch {}
 						}
-						// Buffer tool result with current text length for correct ordering later.
-						// Cursor executes tools server-side during streaming, so the assistant message
-						// already incorporates results. We buffer here and emit in correct order
-						// when the assistant message ends.
-						const textLength = this.#getAssistantTextLength(this.#state.streamMessage);
-						this.#cursorToolResultBuffer.push({ toolResult: finalMessage, textLengthAtCall: textLength });
+						// Cursor executes native tools out-of-band while the assistant text is still
+						// streaming. Anchor the transcript insertion point at tool START, not result
+						// completion; result completion can race later text deltas and randomly move
+						// the result toward the final response.
+						const startPosition = this.#cursorTextLengthForResult(finalMessage);
+						this.#cursorToolResultBuffer.push({
+							toolResult: finalMessage,
+							textLengthAtCall: startPosition.textLength,
+							order: startPosition.order,
+						});
 						return finalMessage;
 					}
 				: undefined;
@@ -1203,6 +1213,7 @@ export class Agent {
 						break;
 
 					case "tool_execution_start":
+						this.#recordCursorToolStart(event.toolCallId);
 						this.#state.pendingToolCalls.add(event.toolCallId);
 						break;
 
@@ -1320,7 +1331,7 @@ export class Agent {
 		}
 	}
 
-	/** Calculate total text length from an assistant message's content blocks */
+	/** Calculate total text length from an assistant message's content blocks. */
 	#getAssistantTextLength(message: AgentMessage | null): number {
 		if (message?.role !== "assistant" || !Array.isArray(message.content)) {
 			return 0;
@@ -1334,101 +1345,137 @@ export class Agent {
 		return length;
 	}
 
+	#recordCursorToolStart(toolCallId: string): void {
+		if (!this.#cursorExecHandlers && !this.#cursorOnToolResult) return;
+		if (this.#cursorToolStartPositions.has(toolCallId)) return;
+		this.#cursorToolStartPositions.set(toolCallId, {
+			textLength: this.#getAssistantTextLength(this.#state.streamMessage),
+			order: this.#cursorToolOrder++,
+		});
+	}
+
+	#cursorTextLengthForResult(message: ToolResultMessage): { textLength: number; order: number } {
+		const position = this.#cursorToolStartPositions.get(message.toolCallId);
+		if (position) {
+			this.#cursorToolStartPositions.delete(message.toolCallId);
+			return position;
+		}
+		return {
+			textLength: this.#getAssistantTextLength(this.#state.streamMessage),
+			order: this.#cursorToolOrder++,
+		};
+	}
+
+	#createCursorAssistantTextSegment(
+		assistantMessage: AssistantMessage,
+		text: string,
+		includeUsage: boolean,
+	): AssistantMessage {
+		const content: AssistantMessage["content"] = includeUsage
+			? assistantMessage.content.filter(block => block.type !== "text")
+			: [];
+		if (text.length > 0 || content.length === 0) {
+			content.push({ type: "text", text });
+		}
+		return {
+			...assistantMessage,
+			content,
+			usage: includeUsage
+				? assistantMessage.usage
+				: {
+						input: 0,
+						output: 0,
+						cacheRead: 0,
+						cacheWrite: 0,
+						totalTokens: 0,
+						cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+					},
+		};
+	}
+
+	#emitMessageEnd(message: AgentMessage): void {
+		this.appendMessage(message);
+		this.#emit({ type: "message_end", message });
+	}
+
 	/**
-	 * Emit a Cursor assistant message split around tool results.
-	 * This fixes the ordering issue where tool results appear after the full explanation.
+	 * Emit a Cursor assistant message split around out-of-band native tool results.
 	 *
-	 * Output order: Assistant(preamble) -> ToolResults -> Assistant(continuation)
+	 * Cursor's native exec tools do not arrive as `toolCall` content blocks. They
+	 * are emitted through external `tool_execution_*` events while assistant text
+	 * continues streaming. We therefore anchor each result at the text length
+	 * recorded when its tool started, then replay text/result/text/result in that
+	 * order when the assistant message finalizes.
 	 */
 	#emitCursorSplitAssistantMessage(assistantMessage: AssistantMessage): void {
-		const buffer = this.#cursorToolResultBuffer;
-		this.#cursorToolResultBuffer = [];
+		const buffer = this.#cursorToolResultBuffer
+			.splice(0)
+			.sort((a, b) => a.textLengthAtCall - b.textLengthAtCall || a.order - b.order);
 
 		if (buffer.length === 0) {
-			// No tool results, emit normally
 			this.#state.streamMessage = null;
-			this.appendMessage(assistantMessage);
-			this.#emit({ type: "message_end", message: assistantMessage });
+			this.#emitMessageEnd(assistantMessage);
 			return;
 		}
 
-		// Find the split point: minimum text length at first tool call
-		const splitPoint = Math.min(...buffer.map(r => r.textLengthAtCall));
-
-		// Extract text content from assistant message
-		const content = assistantMessage.content;
 		let fullText = "";
-		for (const block of content) {
+		for (const block of assistantMessage.content) {
 			if (block.type === "text") {
 				fullText += block.text;
 			}
 		}
 
-		// If no text or split point is 0 or at/past end, don't split
-		if (fullText.length === 0 || splitPoint <= 0 || splitPoint >= fullText.length) {
-			// Emit assistant message first, then tool results (original behavior but with buffered results)
+		if (fullText.length === 0) {
 			this.#state.streamMessage = null;
-			this.appendMessage(assistantMessage);
-			this.#emit({ type: "message_end", message: assistantMessage });
-
-			// Emit buffered tool results
+			this.#emitMessageEnd(assistantMessage);
 			for (const { toolResult } of buffer) {
 				this.#emit({ type: "message_start", message: toolResult });
-				this.appendMessage(toolResult);
-				this.#emit({ type: "message_end", message: toolResult });
+				this.#emitMessageEnd(toolResult);
 			}
 			return;
 		}
 
-		// Split the text
-		const preambleText = fullText.slice(0, splitPoint);
-		const continuationText = fullText.slice(splitPoint);
-
-		// Create preamble message (text before tools)
-		const preambleContent = content.map(block => {
-			if (block.type === "text") {
-				return { ...block, text: preambleText };
-			}
-			return block;
-		});
-		const preambleMessage: AssistantMessage = {
-			...assistantMessage,
-			content: preambleContent,
-		};
-
-		// Emit preamble
 		this.#state.streamMessage = null;
-		this.appendMessage(preambleMessage);
-		this.#emit({ type: "message_end", message: preambleMessage });
-
-		// Emit buffered tool results
-		for (const { toolResult } of buffer) {
-			this.#emit({ type: "message_start", message: toolResult });
-			this.appendMessage(toolResult);
-			this.#emit({ type: "message_end", message: toolResult });
+		let cursor = 0;
+		let emittedAssistantUsage = false;
+		if (
+			buffer[0] &&
+			Math.max(0, Math.min(buffer[0].textLengthAtCall, fullText.length)) === 0 &&
+			assistantMessage.content.some(block => block.type !== "text")
+		) {
+			this.#emitMessageEnd(this.#createCursorAssistantTextSegment(assistantMessage, "", true));
+			emittedAssistantUsage = true;
 		}
 
-		// Emit continuation message (text after tools) if non-empty
-		const trimmedContinuation = continuationText.trim();
-		if (trimmedContinuation.length > 0) {
-			// Create continuation message with only text content (no thinking/toolCalls)
-			const continuationContent: TextContent[] = [{ type: "text", text: continuationText }];
-			const continuationMessage: AssistantMessage = {
-				...assistantMessage,
-				content: continuationContent,
-				// Zero out usage for continuation since it's part of same response
-				usage: {
-					input: 0,
-					output: 0,
-					cacheRead: 0,
-					cacheWrite: 0,
-					totalTokens: 0,
-					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-				},
-			};
-			this.#emit({ type: "message_start", message: continuationMessage });
-			this.appendMessage(continuationMessage);
-			this.#emit({ type: "message_end", message: continuationMessage });
+		for (const entry of buffer) {
+			const splitPoint = Math.max(0, Math.min(entry.textLengthAtCall, fullText.length));
+			if (splitPoint > cursor) {
+				const segment = this.#createCursorAssistantTextSegment(
+					assistantMessage,
+					fullText.slice(cursor, splitPoint),
+					!emittedAssistantUsage,
+				);
+				if (emittedAssistantUsage) {
+					this.#emit({ type: "message_start", message: segment });
+				}
+				this.#emitMessageEnd(segment);
+				emittedAssistantUsage = true;
+			}
+			this.#emit({ type: "message_start", message: entry.toolResult });
+			this.#emitMessageEnd(entry.toolResult);
+			cursor = splitPoint;
+		}
+
+		if (cursor < fullText.length) {
+			const segment = this.#createCursorAssistantTextSegment(
+				assistantMessage,
+				fullText.slice(cursor),
+				!emittedAssistantUsage,
+			);
+			if (emittedAssistantUsage) {
+				this.#emit({ type: "message_start", message: segment });
+			}
+			this.#emitMessageEnd(segment);
 		}
 	}
 }
