@@ -45,7 +45,7 @@ import { TASK_SUBAGENT_LIFECYCLE_CHANNEL, TASK_SUBAGENT_PROGRESS_CHANNEL } from 
 import { parseConfiguredThinkingLevel } from "../thinking";
 import type { EventBus } from "../utils/event-bus";
 import { type PendingExtensionUIRequest, WebExtensionUIContext } from "./extension-ui";
-import { toWebMcpStatus, toWebModels, toWebSlashCommands } from "./projections";
+import { toWebContextBreakdown, toWebMcpStatus, toWebModels, toWebSlashCommands, toWebTodos } from "./projections";
 import { applyWebSetting, buildWebSettings } from "./settings-bridge";
 import type { GatewayHostFrame, GatewayInbound, GatewayOutbound, GatewayPeer } from "./types";
 
@@ -418,6 +418,34 @@ export class SessionGateway {
 					if (switched) for (const target of this.#peers) this.#sendWelcome(target);
 					return ack(true, { switched });
 				}
+				case "goal": {
+					this.#requireWrite(peer);
+					const rt = this.#session.goalRuntime;
+					if (frame.action === "set") {
+						const objective = (frame.objective ?? "").trim();
+						if (!objective) return ack(false, "objective is required");
+						const st = this.#session.getGoalModeState();
+						if (st?.goal && st.goal.status !== "dropped" && st.goal.status !== "complete") {
+							await rt.replaceGoal({ objective });
+						} else {
+							await rt.createGoal({ objective });
+						}
+					} else if (frame.action === "pause") {
+						await rt.pauseGoal();
+					} else if (frame.action === "resume") {
+						await rt.resumeGoal();
+					} else if (frame.action === "drop") {
+						await rt.dropGoal();
+					} else {
+						await rt.onBudgetMutated(frame.budget ?? undefined);
+					}
+					this.#scheduleStateBroadcast();
+					return ack(true);
+				}
+				case "get-context": {
+					const breakdown = this.#session.getContextBreakdown?.();
+					return ack(true, breakdown ? toWebContextBreakdown(breakdown) : null);
+				}
 				case "tool-approval":
 					this.#pendingApprovals.get(frame.approvalId)?.resolve(frame.decision);
 					this.#pendingApprovals.delete(frame.approvalId);
@@ -671,6 +699,7 @@ export class SessionGateway {
 			participants: this.#participants(),
 			planMode: session.getPlanModeState?.()?.enabled === true,
 			goalMode: goal ? { status: goal.goal.status, objective: goal.goal.objective } : null,
+			todos: toWebTodos(this.#session.getTodoPhases?.() ?? []),
 		};
 	}
 

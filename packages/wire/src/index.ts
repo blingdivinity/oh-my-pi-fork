@@ -237,6 +237,17 @@ export interface SessionState {
 	planMode?: boolean;
 	/** Goal-mode objective + status, or null when inactive. */
 	goalMode?: { status: string; objective: string } | null;
+	/** Agent todo phases (web todo HUD), omitted when empty. */
+	todos?: SessionTodoPhase[];
+}
+
+export interface SessionTodoItem {
+	content: string;
+	status: "pending" | "in_progress" | "completed" | "abandoned";
+}
+export interface SessionTodoPhase {
+	name: string;
+	tasks: SessionTodoItem[];
 }
 
 export interface AgentSnapshot {

@@ -4,10 +4,13 @@
  */
 
 import type { Model } from "@oh-my-pi/pi-ai";
-import type { WebMcpServerStatus, WebModelInfo, WebSlashCommand } from "@oh-my-pi/pi-wire/web";
+import type { SessionTodoPhase } from "@oh-my-pi/pi-wire";
+import type { WebContextBreakdown, WebMcpServerStatus, WebModelInfo, WebSlashCommand } from "@oh-my-pi/pi-wire/web";
 import { formatModelString } from "../config/model-resolver";
 import type { MCPManager } from "../mcp";
+import type { ContextUsageBreakdown } from "../session/agent-session";
 import type { InternalAvailableSlashCommand } from "../slash-commands/available-commands";
+import type { TodoPhase } from "../tools/todo";
 
 /** Project the available-commands list into the wire palette shape. */
 export function toWebSlashCommands(commands: readonly InternalAvailableSlashCommand[]): WebSlashCommand[] {
@@ -49,4 +52,33 @@ export function toWebMcpStatus(manager: MCPManager | undefined): WebMcpServerSta
 		const toolCount = status === "connected" ? tools.filter(tool => tool.mcpServerName === name).length : undefined;
 		return { name, status, toolCount };
 	});
+}
+
+/** Project the agent's todo phases into the wire snapshot shape (drop empty phases). */
+export function toWebTodos(phases: readonly TodoPhase[]): SessionTodoPhase[] {
+	return phases
+		.filter(phase => phase.tasks.length > 0)
+		.map(phase => ({
+			name: phase.name,
+			tasks: phase.tasks.map(task => ({ content: task.content, status: task.status })),
+		}));
+}
+
+/** Project a context-usage breakdown into the web /context panel shape. */
+export function toWebContextBreakdown(b: ContextUsageBreakdown): WebContextBreakdown {
+	const win = b.contextWindow;
+	return {
+		contextWindow: win,
+		usedTokens: b.usedTokens,
+		freeTokens: Math.max(0, win - b.usedTokens),
+		percent: win > 0 ? (b.usedTokens / win) * 100 : 0,
+		anchored: b.anchored,
+		categories: [
+			{ label: "System prompt", tokens: b.systemPromptTokens },
+			{ label: "Tools", tokens: b.systemToolsTokens },
+			{ label: "Context", tokens: b.systemContextTokens },
+			{ label: "Skills", tokens: b.skillsTokens },
+			{ label: "Messages", tokens: b.messagesTokens },
+		],
+	};
 }

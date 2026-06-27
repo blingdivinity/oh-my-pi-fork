@@ -23,6 +23,7 @@ import type {
 import { COLLAB_PROTO } from "@oh-my-pi/pi-wire";
 import type {
 	WebCapabilities,
+	WebContextBreakdown,
 	WebControlFrame,
 	WebExtPanel,
 	WebExtUIRequest,
@@ -222,6 +223,22 @@ export class LocalClient {
 	}
 	switchSession(path: string): Promise<unknown> {
 		return this.#ctl(reqId => ({ t: "ctl", op: "switch-session", reqId, path }));
+	}
+	goalCommand(
+		action: "set" | "pause" | "resume" | "drop" | "budget",
+		opts?: { objective?: string; budget?: number | null },
+	): Promise<unknown> {
+		return this.#ctl(reqId => ({
+			t: "ctl",
+			op: "goal",
+			reqId,
+			action,
+			objective: opts?.objective,
+			budget: opts?.budget,
+		}));
+	}
+	getContextBreakdown(): Promise<WebContextBreakdown | null> {
+		return this.#ctl(reqId => ({ t: "ctl", op: "get-context", reqId })) as Promise<WebContextBreakdown | null>;
 	}
 	bash(command: string): Promise<unknown> {
 		return this.#ctl(reqId => ({ t: "ctl", op: "bash", reqId, command }));

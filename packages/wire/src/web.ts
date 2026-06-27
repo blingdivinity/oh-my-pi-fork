@@ -120,6 +120,22 @@ export interface WebSessionInfo {
 	current: boolean;
 }
 
+/** One section of the context window for the web /context panel. */
+export interface WebContextCategory {
+	label: string;
+	tokens: number;
+}
+
+/** Context-window breakdown surfaced by the get-context control op. */
+export interface WebContextBreakdown {
+	contextWindow: number;
+	usedTokens: number;
+	freeTokens: number;
+	percent: number;
+	anchored: boolean;
+	categories: WebContextCategory[];
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // Tool approval (host → guest request, guest → host decision)
 // ═══════════════════════════════════════════════════════════════════════════
@@ -229,6 +245,15 @@ export type WebControlFrame =
 	| { t: "ctl"; op: "retry"; reqId: number }
 	| { t: "ctl"; op: "list-sessions"; reqId: number }
 	| { t: "ctl"; op: "switch-session"; reqId: number; path: string }
+	| {
+			t: "ctl";
+			op: "goal";
+			reqId: number;
+			action: "set" | "pause" | "resume" | "drop" | "budget";
+			objective?: string;
+			budget?: number | null;
+	  }
+	| { t: "ctl"; op: "get-context"; reqId: number }
 	| { t: "ctl"; op: "get-models"; reqId: number }
 	| { t: "ctl"; op: "get-commands"; reqId: number }
 	| { t: "ctl"; op: "get-mcp"; reqId: number }
