@@ -111,9 +111,11 @@ Web plumbing: gateway `packages/coding-agent/src/webui/gateway.ts`; client
 | `/hotkeys` | TUI-only | ✅ | keyboard + command reference overlay (Esc closes) |
 | `/settings` | TUI-only | ✅ | settings panel (read+write) over `get-settings`/`set-setting`, persists to the shared store |
 
-**Tally:** ✅ ~24 · 🟡 ~12 · ⛔/❌ ~20 · ➖ ~6. The "both" commands already run
-(text); the gap is (a) TUI-only selectors/dashboards and (b) richer surfaces for
-commands that today only echo text.
+**Tally (updated):** ✅ ~32 · 🟡 ~11 · ⛔/❌ ~10 · ➖ ~6. Shipped this round:
+`/model` `/settings` `/hotkeys` `/new` `/resume` `/fork` `/branch` `/plan` `/retry`,
+plus every keyboard shortcut. Remaining gaps are deep interactive flows
+(`/tree`, `/goal` mutation, `/loop`, `/btw`, `/tan`, `/guided-goal`) and richer
+panels for commands that already echo text (`/context`, `/todo`, `/dump`/`/export`).
 
 ---
 
