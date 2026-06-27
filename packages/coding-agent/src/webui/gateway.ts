@@ -15,7 +15,7 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type { ImageContent } from "@oh-my-pi/pi-ai";
-import { logger, Snowflake } from "@oh-my-pi/pi-utils";
+import { logger, prompt, Snowflake } from "@oh-my-pi/pi-utils";
 import type {
 	WebCapabilities,
 	WebControlEvent,
@@ -29,9 +29,11 @@ import type { AgentSnapshot, CollabParticipant, CollabSessionState } from "../co
 import { COLLAB_PROTO } from "../collab/protocol";
 import type { ExtensionUIContext } from "../extensibility/extensions";
 import { buildSkillPromptMessage } from "../extensibility/skills";
+import { resolveLocalUrlToPath } from "../internal-urls";
 import type { MCPManager } from "../mcp";
 import { MCP_CONNECTION_STATUS_EVENT_CHANNEL } from "../mcp/startup-events";
 import { getAvailableThemesWithPaths } from "../modes/theme/theme";
+import btwUserPrompt from "../prompts/system/btw-user.md" with { type: "text" };
 import { AgentLifecycleManager } from "../registry/agent-lifecycle";
 import { type AgentRef, AgentRegistry } from "../registry/agent-registry";
 import type { AgentSession, AgentSessionEvent } from "../session/agent-session";
@@ -43,6 +45,7 @@ import { buildAvailableSlashCommands } from "../slash-commands/available-command
 import { lookupBuiltinSlashCommand } from "../slash-commands/builtin-registry";
 import type { SlashCommandRuntime } from "../slash-commands/types";
 import { TASK_SUBAGENT_LIFECYCLE_CHANNEL, TASK_SUBAGENT_PROGRESS_CHANNEL } from "../task";
+import { dispatchTangent } from "../task/dispatch-tangent";
 import { parseConfiguredThinkingLevel } from "../thinking";
 import type { EventBus } from "../utils/event-bus";
 import { type PendingExtensionUIRequest, WebExtensionUIContext } from "./extension-ui";
@@ -590,6 +593,66 @@ export class SessionGateway {
 			await this.#session.newSession({ drop: true });
 			for (const target of this.#peers) this.#sendWelcome(target);
 			peer.send({ t: "command-output", text: "Dropped the session and started fresh." });
+			return;
+		}
+		if (name === "plan-review") {
+			const state = this.#session.getPlanModeState();
+			if (!state?.enabled) {
+				peer.send({ t: "command-output", text: "Plan review: plan mode is inactive." });
+				return;
+			}
+			try {
+				const resolved = resolveLocalUrlToPath(state.planFilePath, {
+					getArtifactsDir: () => this.#session.sessionManager.getArtifactsDir(),
+					getSessionId: () => this.#session.sessionManager.getSessionId(),
+				});
+				const content = (await Bun.file(resolved).text()).trim();
+				peer.send({ t: "command-output", text: content || "(plan file is empty)" });
+			} catch {
+				peer.send({ t: "command-output", text: "No plan written yet." });
+			}
+			return;
+		}
+		if (name === "btw") {
+			const question = command.slice(1).slice(name.length).trim();
+			if (!question) {
+				peer.send({ t: "command-output", text: "Usage: /btw <question>" });
+				return;
+			}
+			if (!this.#session.model) {
+				peer.send({ t: "command-output", text: "No active model available for /btw." });
+				return;
+			}
+			try {
+				const { replyText } = await this.#session.runEphemeralTurn({
+					promptText: prompt.render(btwUserPrompt, { question }),
+				});
+				peer.send({ t: "command-output", text: `btw: ${question}\n\n${replyText || "(no answer)"}` });
+			} catch (err) {
+				peer.send({ t: "command-output", text: `btw failed: ${err instanceof Error ? err.message : String(err)}` });
+			}
+			return;
+		}
+		if (name === "tan") {
+			const work = command.slice(1).slice(name.length).trim();
+			if (!work) {
+				peer.send({ t: "command-output", text: "Usage: /tan <work>" });
+				return;
+			}
+			try {
+				const { jobId } = await dispatchTangent(work, {
+					session: this.#session,
+					sessionManager: this.#session.sessionManager,
+					settings: this.#session.settings,
+					mcpManager: this.#mcpManager,
+				});
+				peer.send({ t: "command-output", text: `Dispatched background tan ${jobId} — see the agents rail.` });
+			} catch (err) {
+				peer.send({
+					t: "command-output",
+					text: `/tan failed: ${err instanceof Error ? err.message : String(err)}`,
+				});
+			}
 			return;
 		}
 		// Not handled by the text dispatcher. A KNOWN builtin here is TUI-only (no

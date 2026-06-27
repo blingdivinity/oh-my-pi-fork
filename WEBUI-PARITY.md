@@ -59,12 +59,12 @@ Web plumbing: gateway `packages/coding-agent/src/webui/gateway.ts`; client
 | cmd | kind | web | notes / plan |
 |---|---|---|---|
 | `/plan` | TUI-only | ✅ | toggles plan mode (gateway sets PlanModeState, ACP-style) + mode bar |
-| `/plan-review` | TUI-only | ❌ | reopen the written plan — deferred (needs `local://` plan-artifact read; plan toggle + mode bar ship) |
+| `/plan-review` | TUI-only | ✅ | reads the `local://` plan artifact (resolved via session manager) → command-output; inactive/no-plan handled |
 | `/goal` | TUI-only | ✅ | goal panel: set/pause/resume/drop/budget via goalRuntime control ops; mode bar reflects state |
 | `/guided-goal` | TUI-only | ✅ | opens the goal panel (set/budget); the LLM interview is a TUI nicety, the panel reaches the same goal |
 | `/loop` | TUI-only | ✅ | client-side loop: re-sends your last prompt after each yield; Esc stops; mode-bar banner |
-| `/btw` | TUI-only | ❌ | controller-coupled (`BtwController`); needs a session-API lift — out of UI scope |
-| `/tan` | TUI-only | ❌ | controller-coupled (`TanCommandController`); needs a session-API lift — out of UI scope |
+| `/btw` | TUI-only | ✅ | server-side `session.runEphemeralTurn(btw prompt)` → answer in command-output (the same call the TUI controller uses) |
+| `/tan` | TUI-only | ✅ | shared `dispatchTangent()` helper (extracted from the controller) forks a background clone + dispatch breadcrumb; agent shows in the rail |
 | `/omfg` | TUI-only | ❌ | controller-coupled (`OmfgController`); needs a session-API lift — out of UI scope |
 | `/retry` | TUI-only | ✅ | routed to session.retry() (also alt+r) |
 | `/force` | both | 🟡 | runs; needs tool arg (no selector yet) |
