@@ -31,6 +31,7 @@ import type { ExtensionUIContext } from "../extensibility/extensions";
 import { buildSkillPromptMessage } from "../extensibility/skills";
 import type { MCPManager } from "../mcp";
 import { MCP_CONNECTION_STATUS_EVENT_CHANNEL } from "../mcp/startup-events";
+import { getAvailableThemesWithPaths } from "../modes/theme/theme";
 import { AgentLifecycleManager } from "../registry/agent-lifecycle";
 import { type AgentRef, AgentRegistry } from "../registry/agent-registry";
 import type { AgentSession, AgentSessionEvent } from "../session/agent-session";
@@ -140,6 +141,7 @@ export class SessionGateway {
 	#lastStateJson = "";
 	#started = false;
 	#stopped = false;
+	#themeNames: string[] = [];
 
 	constructor(deps: SessionGatewayDeps) {
 		this.#session = deps.session;
@@ -161,6 +163,11 @@ export class SessionGateway {
 	start(): void {
 		if (this.#started) return;
 		this.#started = true;
+		void getAvailableThemesWithPaths()
+			.then(themes => {
+				this.#themeNames = themes.map(t => t.name);
+			})
+			.catch(() => undefined);
 		this.#unsubscribeSession = this.#session.subscribe(event => {
 			if (isWireAgentEvent(event)) this.#broadcast({ t: "event", event });
 			this.#onEventForState(event);
@@ -670,7 +677,10 @@ export class SessionGateway {
 	}
 
 	#sendSettings(target?: GatewayPeer): void {
-		const frame: GatewayOutbound = { t: "settings", settings: buildWebSettings(this.#session.settings) };
+		const frame: GatewayOutbound = {
+			t: "settings",
+			settings: buildWebSettings(this.#session.settings, this.#themeNames),
+		};
 		if (target) target.send(frame);
 		else this.#broadcastControl(frame);
 	}

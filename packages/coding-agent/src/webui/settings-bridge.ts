@@ -12,7 +12,7 @@ import { getType, SETTING_TABS, type SettingPath } from "../config/settings-sche
 import { getSettingDef, getSettingsForTab } from "../modes/components/settings-defs";
 
 /** Build the serializable settings catalog (tabs → settings) from current values. */
-export function buildWebSettings(settings: Settings): WebSettingsTab[] {
+export function buildWebSettings(settings: Settings, themeNames: readonly string[] = []): WebSettingsTab[] {
 	const tabs: WebSettingsTab[] = [];
 	for (const tab of SETTING_TABS) {
 		const defs = getSettingsForTab(tab).filter(def => !def.condition || def.condition());
@@ -42,12 +42,13 @@ export function buildWebSettings(settings: Settings): WebSettingsTab[] {
 					value: String(raw ?? ""),
 				});
 			} else if (def.type === "submenu") {
-				out.push({
-					...base,
-					kind: "submenu",
-					options: def.options.map(o => ({ value: o.value, label: o.label })),
-					value: String(raw ?? ""),
-				});
+				// Empty options mark a runtime-injected list (`options: "runtime"` in the
+				// schema) — today that's the theme submenus; fill them from the registry.
+				const options =
+					def.options.length > 0
+						? def.options.map(o => ({ value: o.value, label: o.label }))
+						: themeNames.map(name => ({ value: name, label: name }));
+				out.push({ ...base, kind: "submenu", options, value: String(raw ?? "") });
 			} else {
 				out.push({ ...base, kind: "text", value: String(raw ?? "") });
 			}

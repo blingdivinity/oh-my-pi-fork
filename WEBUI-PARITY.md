@@ -157,9 +157,10 @@ coercion + validation. The web `SettingsPanel` (`/settings`) renders the 10 tabs
 with boolean/enum/submenu/text controls. Verified: boolean + enum round-trip live
 and through a deterministic bridge test (`settings-bridge.test.ts`).
 
-_Gap:_ runtime-injected option lists (themes via `options: "runtime"`) arrive
-empty over the wire — the theme submenu shows only the current value. Needs a
-runtime option source (follow-up).
+Runtime-injected option lists (themes via `options: "runtime"`) are now populated
+over the wire: the gateway loads `getAvailableThemesWithPaths()` and feeds the
+names into `buildWebSettings`, so the theme submenus list all themes and a pick
+persists through `Settings.set` (verified live: dark theme → `amethyst` round-trips).
 
 ---
 
@@ -175,7 +176,8 @@ runtime option source (follow-up).
 
 ## Next up (priority order)
 
-1. `/dump` copy button + `/export` download (the two remaining richer-surface polish items).
-2. Session-tree overlay (`/tree`).
-3. `/loop` (client-side loop), `/btw`, `/tan`, `/guided-goal`, `/omfg` flows.
-4. Theme runtime options over the wire (settings panel gap); history-search + dequeue.
+1. Session-tree overlay (`/tree`).
+2. `/guided-goal` interview wizard.
+3. Web-appropriate resolutions for the remaining TUI-only flows (`/btw`, `/tan`,
+   `/omfg`, `/handoff`, `/drop`, `/login`/`/logout`, `/debug`, `/copy`,
+   `/extensions`, `/agents`).
