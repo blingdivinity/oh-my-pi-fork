@@ -109,6 +109,17 @@ export interface WebSettingsTab {
 	settings: WebSetting[];
 }
 
+/** A saved session the UI can resume / switch to. */
+export interface WebSessionInfo {
+	path: string;
+	id: string;
+	title?: string;
+	firstMessage: string;
+	messageCount: number;
+	modified: number;
+	current: boolean;
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // Tool approval (host → guest request, guest → host decision)
 // ═══════════════════════════════════════════════════════════════════════════
@@ -216,6 +227,8 @@ export type WebControlFrame =
 	| { t: "ctl"; op: "bash"; reqId: number; command: string }
 	| { t: "ctl"; op: "abort-bash"; reqId: number }
 	| { t: "ctl"; op: "retry"; reqId: number }
+	| { t: "ctl"; op: "list-sessions"; reqId: number }
+	| { t: "ctl"; op: "switch-session"; reqId: number; path: string }
 	| { t: "ctl"; op: "get-models"; reqId: number }
 	| { t: "ctl"; op: "get-commands"; reqId: number }
 	| { t: "ctl"; op: "get-mcp"; reqId: number }

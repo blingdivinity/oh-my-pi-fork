@@ -29,6 +29,7 @@ import type {
 	WebExtUIResponse,
 	WebMcpServerStatus,
 	WebModelInfo,
+	WebSessionInfo,
 	WebSettingsTab,
 	WebSlashCommand,
 	WebToolApprovalDecision,
@@ -215,6 +216,12 @@ export class LocalClient {
 	}
 	branch(entryId: string): Promise<unknown> {
 		return this.#ctl(reqId => ({ t: "ctl", op: "branch", reqId, entryId }));
+	}
+	listSessions(): Promise<WebSessionInfo[]> {
+		return this.#ctl(reqId => ({ t: "ctl", op: "list-sessions", reqId })) as Promise<WebSessionInfo[]>;
+	}
+	switchSession(path: string): Promise<unknown> {
+		return this.#ctl(reqId => ({ t: "ctl", op: "switch-session", reqId, path }));
 	}
 	bash(command: string): Promise<unknown> {
 		return this.#ctl(reqId => ({ t: "ctl", op: "bash", reqId, command }));

@@ -13,6 +13,8 @@ interface LocalComposerProps {
 	onOpenSettings?: () => void;
 	/** Open the hotkeys reference for /hotkeys. */
 	onOpenHotkeys?: () => void;
+	/** Open the session picker for /resume. */
+	onOpenSessions?: () => void;
 }
 
 export function LocalComposer({
@@ -21,6 +23,7 @@ export function LocalComposer({
 	onOpenModelPicker,
 	onOpenSettings,
 	onOpenHotkeys,
+	onOpenSessions,
 }: LocalComposerProps): ReactNode {
 	const [text, setText] = useState("");
 	const [activeSlash, setActiveSlash] = useState(0);
@@ -37,6 +40,10 @@ export function LocalComposer({
 		}
 		if (onOpenHotkeys && cmd === "hotkeys") {
 			onOpenHotkeys();
+			return true;
+		}
+		if (onOpenSessions && cmd === "resume") {
+			onOpenSessions();
 			return true;
 		}
 		return false;

@@ -49,7 +49,7 @@ export async function startMockWebServer(options: { port?: number; reply?: strin
 		initialState: { model, systemPrompt: ["Test"], tools: [] },
 		streamFn: mock.stream,
 	});
-	const sessionManager = SessionManager.inMemory(tempDir.path());
+	const sessionManager = SessionManager.create(tempDir.path(), tempDir.join("sessions"));
 	const settings = Settings.isolated({ "compaction.enabled": false });
 	const authStorage = await AuthStorage.create(tempDir.join(`auth-${Snowflake.next()}.db`));
 	authStorage.setRuntimeApiKey("anthropic", "test-key");

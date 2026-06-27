@@ -13,12 +13,14 @@
  */
 
 import * as fs from "node:fs/promises";
+import * as path from "node:path";
 import type { ImageContent } from "@oh-my-pi/pi-ai";
 import { logger, Snowflake } from "@oh-my-pi/pi-utils";
 import type {
 	WebCapabilities,
 	WebControlEvent,
 	WebControlFrame,
+	WebSessionInfo,
 	WebToolApprovalDecision,
 	WebToolApprovalRequest,
 } from "@oh-my-pi/pi-wire/web";
@@ -34,6 +36,7 @@ import { type AgentRef, AgentRegistry } from "../registry/agent-registry";
 import type { AgentSession, AgentSessionEvent } from "../session/agent-session";
 import { SKILL_PROMPT_MESSAGE_TYPE, USER_INTERRUPT_LABEL } from "../session/messages";
 import type { SessionEntry as StoredSessionEntry } from "../session/session-entries";
+import { SessionManager } from "../session/session-manager";
 import { executeAcpBuiltinSlashCommand } from "../slash-commands/acp-builtins";
 import { buildAvailableSlashCommands } from "../slash-commands/available-commands";
 import { lookupBuiltinSlashCommand } from "../slash-commands/builtin-registry";
@@ -406,6 +409,14 @@ export class SessionGateway {
 					this.#sendModels();
 					return ack(true);
 				}
+				case "list-sessions":
+					return ack(true, await this.#listSessions());
+				case "switch-session": {
+					this.#requireWrite(peer);
+					const switched = await this.#session.switchSession(frame.path);
+					if (switched) for (const target of this.#peers) this.#sendWelcome(target);
+					return ack(true, { switched });
+				}
 				case "tool-approval":
 					this.#pendingApprovals.get(frame.approvalId)?.resolve(frame.decision);
 					this.#pendingApprovals.delete(frame.approvalId);
@@ -613,6 +624,21 @@ export class SessionGateway {
 		const frame: GatewayOutbound = { t: "settings", settings: buildWebSettings(this.#session.settings) };
 		if (target) target.send(frame);
 		else this.#broadcastControl(frame);
+	}
+
+	async #listSessions(): Promise<WebSessionInfo[]> {
+		const sm = this.#session.sessionManager;
+		const currentFile = sm.getSessionFile();
+		const sessions = await SessionManager.list(sm.getCwd(), sm.getSessionDir());
+		return sessions.map(s => ({
+			path: s.path,
+			id: s.id,
+			title: s.title,
+			firstMessage: s.firstMessage,
+			messageCount: s.messageCount,
+			modified: s.modified.getTime(),
+			current: currentFile ? path.resolve(s.path) === path.resolve(currentFile) : false,
+		}));
 	}
 
 	// ── State + agents projections ────────────────────────────────────────────

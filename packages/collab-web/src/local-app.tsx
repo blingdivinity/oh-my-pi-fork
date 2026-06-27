@@ -6,6 +6,7 @@ import { ExtPanelHost } from "./components/control/ExtPanelHost";
 import { HotkeysOverlay } from "./components/control/HotkeysOverlay";
 import { LocalComposer } from "./components/control/LocalComposer";
 import { ModelPicker } from "./components/control/ModelPicker";
+import { SessionPicker } from "./components/control/SessionPicker";
 import { SettingsPanel } from "./components/control/SettingsPanel";
 import { Banners } from "./components/shell/Banners";
 import { HeaderBar } from "./components/shell/HeaderBar";
@@ -46,6 +47,7 @@ function LocalSession({ client }: { client: LocalClient }): ReactNode {
 	const [expandTools, setExpandTools] = useState(false);
 	const [hideThinking, setHideThinking] = useState(false);
 	const [hotkeysOpen, setHotkeysOpen] = useState(false);
+	const [sessionsOpen, setSessionsOpen] = useState(false);
 
 	const subCount = useMemo(() => snap.agents.filter(a => a.kind === "sub").length, [snap.agents]);
 	const agentIds = useMemo(() => new Set(snap.agents.map(a => a.id)), [snap.agents]);
@@ -167,11 +169,13 @@ function LocalSession({ client }: { client: LocalClient }): ReactNode {
 					setSettingsOpen(true);
 				}}
 				onOpenHotkeys={() => setHotkeysOpen(true)}
+				onOpenSessions={() => setSessionsOpen(true)}
 			/>
 			<ControlOverlays client={client} snapshot={snap} />
 			{modelPicker && <ModelPicker client={client} models={snap.models} onClose={() => setModelPicker(false)} />}
 			{settingsOpen && <SettingsPanel client={client} tabs={snap.settings} onClose={() => setSettingsOpen(false)} />}
 			{hotkeysOpen && <HotkeysOverlay onClose={() => setHotkeysOpen(false)} />}
+			{sessionsOpen && <SessionPicker client={client} onClose={() => setSessionsOpen(false)} />}
 			<Banners
 				phase={snap.phase}
 				endedReason={snap.endedReason}
