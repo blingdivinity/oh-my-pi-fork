@@ -154,6 +154,13 @@ function LocalSession({ client }: { client: LocalClient }): ReactNode {
 			{snap.commandOutput.length > 0 && (
 				<details className="lc-cmdout">
 					<summary>command output ({snap.commandOutput.length})</summary>
+					<button
+						type="button"
+						className="lc-cmdout-copy"
+						onClick={() => void navigator.clipboard?.writeText(snap.commandOutput.join("\n"))}
+					>
+						copy
+					</button>
 					<pre>{snap.commandOutput.join("\n")}</pre>
 				</details>
 			)}
@@ -180,6 +187,17 @@ function LocalSession({ client }: { client: LocalClient }): ReactNode {
 				onOpenSessions={() => setSessionsOpen(true)}
 				onOpenGoal={() => setGoalOpen(true)}
 				onOpenContext={() => setContextOpen(true)}
+				onExport={() => {
+					void client.exportHtml().then(res => {
+						if (!res) return;
+						const url = URL.createObjectURL(new Blob([res.html], { type: "text/html" }));
+						const a = document.createElement("a");
+						a.href = url;
+						a.download = res.filename;
+						a.click();
+						URL.revokeObjectURL(url);
+					});
+				}}
 			/>
 			<ControlOverlays client={client} snapshot={snap} />
 			{modelPicker && <ModelPicker client={client} models={snap.models} onClose={() => setModelPicker(false)} />}

@@ -302,3 +302,9 @@
 	opacity: 1;
 	text-decoration: underline;
 }
+
+.lc-cmdout-copy {
+	margin: 0 0 6px;
+	font-size: 11px;
+	cursor: pointer;
+}

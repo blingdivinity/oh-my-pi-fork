@@ -78,8 +78,8 @@ Web plumbing: gateway `packages/coding-agent/src/webui/gateway.ts`; client
 | `/fresh` | both | ✅ | runs |
 | `/tools` | both | 🟡 | runs (text); ctrl+o expand has no web equiv |
 | `/todo` | both | ✅ | always-visible todo HUD (phases + status glyphs) from SessionState.todos |
-| `/dump` | both | 🟡 | TUI copies to clipboard — web should copy in-browser |
-| `/export` | both | 🟡 | writes HTML server-side — web should offer a download |
+| `/dump` | both | ✅ | transcript in command-output + a copy button |
+| `/export` | both | ✅ | export-html op → browser download of the HTML |
 | `/copy` | TUI-only | ❌ | pick text/code to copy — selection overlay |
 | `/memory` | both | ✅ | many subs; run as text |
 

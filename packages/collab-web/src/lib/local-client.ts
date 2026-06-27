@@ -240,6 +240,12 @@ export class LocalClient {
 	getContextBreakdown(): Promise<WebContextBreakdown | null> {
 		return this.#ctl(reqId => ({ t: "ctl", op: "get-context", reqId })) as Promise<WebContextBreakdown | null>;
 	}
+	exportHtml(): Promise<{ filename: string; html: string } | null> {
+		return this.#ctl(reqId => ({ t: "ctl", op: "export-html", reqId })) as Promise<{
+			filename: string;
+			html: string;
+		} | null>;
+	}
 	bash(command: string): Promise<unknown> {
 		return this.#ctl(reqId => ({ t: "ctl", op: "bash", reqId, command }));
 	}

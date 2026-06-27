@@ -19,6 +19,8 @@ interface LocalComposerProps {
 	onOpenGoal?: () => void;
 	/** Open the context panel for /context. */
 	onOpenContext?: () => void;
+	/** Export the session to HTML (browser download) for /export. */
+	onExport?: () => void;
 }
 
 export function LocalComposer({
@@ -30,6 +32,7 @@ export function LocalComposer({
 	onOpenSessions,
 	onOpenGoal,
 	onOpenContext,
+	onExport,
 }: LocalComposerProps): ReactNode {
 	const [text, setText] = useState("");
 	const [activeSlash, setActiveSlash] = useState(0);
@@ -58,6 +61,10 @@ export function LocalComposer({
 		}
 		if (onOpenContext && cmd === "context") {
 			onOpenContext();
+			return true;
+		}
+		if (onExport && cmd === "export") {
+			onExport();
 			return true;
 		}
 		return false;

@@ -446,6 +446,12 @@ export class SessionGateway {
 					const breakdown = this.#session.getContextBreakdown?.();
 					return ack(true, breakdown ? toWebContextBreakdown(breakdown) : null);
 				}
+				case "export-html": {
+					this.#requireWrite(peer);
+					const filePath = await this.#session.exportToHtml();
+					const html = await Bun.file(filePath).text();
+					return ack(true, { filename: path.basename(filePath), html });
+				}
 				case "tool-approval":
 					this.#pendingApprovals.get(frame.approvalId)?.resolve(frame.decision);
 					this.#pendingApprovals.delete(frame.approvalId);
