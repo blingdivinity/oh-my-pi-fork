@@ -154,11 +154,13 @@ async function generateBundle(): Promise<void> {
 		console.log("DRY RUN bun --cwd=packages/stats scripts/generate-client-bundle.ts --generate");
 		console.log("DRY RUN bun --cwd=packages/coding-agent scripts/generate-docs-index.ts --generate");
 		console.log("DRY RUN bun --cwd=packages/coding-agent scripts/embed-mupdf-wasm.ts --generate");
+		console.log("DRY RUN bun --cwd=packages/coding-agent scripts/embed-spa.ts --generate");
 		return;
 	}
 	await runCommand(["bun", "--cwd=packages/stats", "scripts/generate-client-bundle.ts", "--generate"], repoRoot);
 	await runCommand(["bun", "--cwd=packages/coding-agent", "scripts/generate-docs-index.ts", "--generate"], repoRoot);
 	await runCommand(["bun", "--cwd=packages/coding-agent", "scripts/embed-mupdf-wasm.ts", "--generate"], repoRoot);
+	await runCommand(["bun", "--cwd=packages/coding-agent", "scripts/embed-spa.ts", "--generate"], repoRoot);
 }
 
 async function resetArtifacts(): Promise<void> {
@@ -167,12 +169,14 @@ async function resetArtifacts(): Promise<void> {
 		console.log("DRY RUN bun --cwd=packages/stats scripts/generate-client-bundle.ts --reset");
 		console.log("DRY RUN bun --cwd=packages/coding-agent scripts/generate-docs-index.ts --reset");
 		console.log("DRY RUN bun --cwd=packages/coding-agent scripts/embed-mupdf-wasm.ts --reset");
+		console.log("DRY RUN bun --cwd=packages/coding-agent scripts/embed-spa.ts --reset");
 		return;
 	}
 	await runCommand(["bun", "--cwd=packages/natives", "run", "embed:native", "--reset"], repoRoot);
 	await runCommand(["bun", "--cwd=packages/stats", "scripts/generate-client-bundle.ts", "--reset"], repoRoot);
 	await runCommand(["bun", "--cwd=packages/coding-agent", "scripts/generate-docs-index.ts", "--reset"], repoRoot);
 	await runCommand(["bun", "--cwd=packages/coding-agent", "scripts/embed-mupdf-wasm.ts", "--reset"], repoRoot);
+	await runCommand(["bun", "--cwd=packages/coding-agent", "scripts/embed-spa.ts", "--reset"], repoRoot);
 }
 
 async function main(): Promise<void> {
