@@ -505,6 +505,15 @@ export class SessionGateway {
 			peer.send({ t: "command-output", text: ok ? "Started a new session." : "Could not start a new session." });
 			return;
 		}
+		if (name === "fork") {
+			const ok = await this.#session.fork();
+			if (ok) for (const target of this.#peers) this.#sendWelcome(target);
+			peer.send({
+				t: "command-output",
+				text: ok ? "Forked the session (history copied)." : "Could not fork the session.",
+			});
+			return;
+		}
 		// Not handled by the text dispatcher. A KNOWN builtin here is TUI-only (no
 		// text handle) — surface that rather than send "/cmd" to the model.
 		if (lookupBuiltinSlashCommand(name)) {

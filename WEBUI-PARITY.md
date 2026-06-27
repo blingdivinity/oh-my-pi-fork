@@ -40,7 +40,7 @@ Web plumbing: gateway `packages/coding-agent/src/webui/gateway.ts`; client
 | `/resume` | TUI-only | ✅ | session picker (list-sessions + switch-session); switch re-snapshots the transcript |
 | `/tree` | TUI-only | ❌ | session-tree nav overlay (branches) |
 | `/branch` | TUI-only | ❌ | branch from a past message — needs transcript message picker |
-| `/fork` | TUI-only | ❌ | fork from a past message |
+| `/fork` | TUI-only | ✅ | session.fork() (history copied) + re-snapshot |
 | `/handoff` | TUI-only | ❌ | handoff context to new session |
 | `/session` | both | 🟡 | `info`/`delete` run as text; fine |
 | `/rename` | both | 🟡 | runs (text); could inline-edit header title |
