@@ -59,21 +59,28 @@ function LocalSession({ client }: { client: LocalClient }): ReactNode {
 	useEffect(() => {
 		document.title = `${title} · omp`;
 	}, [title]);
-	// TUI keybinding parity: shift+tab cycle thinking, ctrl+p cycle model,
-	// Esc abort while streaming. Captured globally so they work from the composer.
+	// TUI keybinding parity: shift+tab thinking · ctrl+p / shift+ctrl+p model
+	// fwd/back · alt+m/alt+p model picker · alt+r retry · Esc abort. Captured
+	// globally so they work from the composer.
 	const working = snap.working;
 	useEffect(() => {
 		const onKey = (e: KeyboardEvent): void => {
 			if (e.code === "Tab" && e.shiftKey && !e.ctrlKey && !e.metaKey && !e.altKey) {
 				e.preventDefault();
 				void client.cycleThinking();
-			} else if (e.code === "KeyP" && e.ctrlKey && !e.metaKey && !e.altKey) {
+			} else if (e.code === "KeyP" && e.ctrlKey && e.shiftKey && !e.metaKey && !e.altKey) {
 				e.preventDefault();
-				void client.cycleModel();
+				void client.cycleModel("backward");
+			} else if (e.code === "KeyP" && e.ctrlKey && !e.shiftKey && !e.metaKey && !e.altKey) {
+				e.preventDefault();
+				void client.cycleModel("forward");
 			} else if ((e.code === "KeyM" || e.code === "KeyP") && e.altKey && !e.ctrlKey && !e.metaKey) {
 				// alt+m (select) / alt+p (select temporary) both open the model picker.
 				e.preventDefault();
 				setModelPicker(true);
+			} else if (e.code === "KeyR" && e.altKey && !e.ctrlKey && !e.metaKey) {
+				e.preventDefault();
+				void client.retry();
 			} else if (e.code === "Escape" && working) {
 				e.preventDefault();
 				client.sendAbort();

@@ -339,7 +339,7 @@ export class SessionGateway {
 				}
 				case "cycle-model":
 					this.#requireWrite(peer);
-					await this.#session.cycleModel();
+					await this.#session.cycleModel(frame.direction);
 					this.#sendModels();
 					return ack(true);
 				case "set-thinking": {
@@ -375,6 +375,11 @@ export class SessionGateway {
 					this.#requireWrite(peer);
 					await this.#session.abortBash();
 					return ack(true);
+				case "retry": {
+					this.#requireWrite(peer);
+					const ok = await this.#session.retry();
+					return ack(true, { retried: ok });
+				}
 				case "get-models":
 					this.#sendModels(peer);
 					return ack(true);

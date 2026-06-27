@@ -37,13 +37,13 @@ export function LocalComposer({ client, snapshot, onOpenModelPicker, onOpenSetti
 		return snapshot.commands.filter(c => c.name.toLowerCase().startsWith(token)).slice(0, 8);
 	}, [text, snapshot.commands]);
 
-	const submit = (): void => {
+	const submit = (behavior: "steer" | "followUp" = "steer"): void => {
 		const value = text.trim();
 		if (!value || readOnly) return;
 		if (value.startsWith("/")) {
 			const [head, ...rest] = value.slice(1).split(/\s+/);
 			if (rest.length > 0 || !tryLocalUi(head ?? "")) void client.runSlash(value);
-		} else void client.prompt(value);
+		} else void client.prompt(value, behavior);
 		setText("");
 		setActiveSlash(0);
 	};
@@ -132,6 +132,15 @@ export function LocalComposer({ client, snapshot, onOpenModelPicker, onOpenSetti
 							if (match) applySlash(match.name);
 							return;
 						}
+						if (
+							(e.key === "Enter" && (e.ctrlKey || e.metaKey)) ||
+							(e.code === "KeyQ" && e.ctrlKey && !e.altKey)
+						) {
+							// app.message.followUp (ctrl+enter / ctrl+q): send as a follow-up turn.
+							e.preventDefault();
+							submit("followUp");
+							return;
+						}
 						if (e.key === "Enter" && !e.shiftKey) {
 							e.preventDefault();
 							// Palette open: one Enter runs the highlighted command directly.
@@ -141,7 +150,7 @@ export function LocalComposer({ client, snapshot, onOpenModelPicker, onOpenSetti
 								if (match) runSlashName(match.name);
 								return;
 							}
-							submit();
+							submit("steer");
 						}
 					}}
 				/>
@@ -150,7 +159,7 @@ export function LocalComposer({ client, snapshot, onOpenModelPicker, onOpenSetti
 						Stop
 					</button>
 				) : (
-					<button type="button" disabled={readOnly} onClick={submit}>
+					<button type="button" disabled={readOnly} onClick={() => submit()}>
 						Send
 					</button>
 				)}

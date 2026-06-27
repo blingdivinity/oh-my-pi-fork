@@ -189,8 +189,11 @@ export class LocalClient {
 	setModel(provider: string, modelId: string): Promise<unknown> {
 		return this.#ctl(reqId => ({ t: "ctl", op: "set-model", reqId, provider, modelId }));
 	}
-	cycleModel(): Promise<unknown> {
-		return this.#ctl(reqId => ({ t: "ctl", op: "cycle-model", reqId }));
+	cycleModel(direction?: "forward" | "backward"): Promise<unknown> {
+		return this.#ctl(reqId => ({ t: "ctl", op: "cycle-model", reqId, direction }));
+	}
+	retry(): Promise<unknown> {
+		return this.#ctl(reqId => ({ t: "ctl", op: "retry", reqId }));
 	}
 	setThinking(level: string): Promise<unknown> {
 		return this.#ctl(reqId => ({ t: "ctl", op: "set-thinking", reqId, level }));

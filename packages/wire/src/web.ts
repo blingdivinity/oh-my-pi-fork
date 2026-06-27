@@ -207,7 +207,7 @@ export type WebControlFrame =
 	| { t: "ctl"; op: "follow-up"; reqId: number; text: string; images?: ImageContent[] }
 	| { t: "ctl"; op: "abort"; reqId: number }
 	| { t: "ctl"; op: "set-model"; reqId: number; provider: string; modelId: string }
-	| { t: "ctl"; op: "cycle-model"; reqId: number }
+	| { t: "ctl"; op: "cycle-model"; reqId: number; direction?: "forward" | "backward" }
 	| { t: "ctl"; op: "set-thinking"; reqId: number; level: string }
 	| { t: "ctl"; op: "cycle-thinking"; reqId: number }
 	| { t: "ctl"; op: "compact"; reqId: number; instructions?: string }
@@ -215,6 +215,7 @@ export type WebControlFrame =
 	| { t: "ctl"; op: "branch"; reqId: number; entryId: string }
 	| { t: "ctl"; op: "bash"; reqId: number; command: string }
 	| { t: "ctl"; op: "abort-bash"; reqId: number }
+	| { t: "ctl"; op: "retry"; reqId: number }
 	| { t: "ctl"; op: "get-models"; reqId: number }
 	| { t: "ctl"; op: "get-commands"; reqId: number }
 	| { t: "ctl"; op: "get-mcp"; reqId: number }

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import { type SettingPath, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { applyWebSetting, buildWebSettings } from "@oh-my-pi/pi-coding-agent/webui/settings-bridge";
 
 describe("web settings bridge", () => {
@@ -36,7 +36,10 @@ describe("web settings bridge", () => {
 			const next = enumSetting.options.find(o => o.value !== enumSetting.value)?.value;
 			expect(next).toBeDefined();
 			expect(applyWebSetting(settings, enumSetting.path, next as string)).toBeNull();
-			expect(String(settings.get(enumSetting.path as SettingPath))).toBe(next);
+			const afterEnum = buildWebSettings(settings)
+				.flatMap(t => t.settings)
+				.find(s => s.path === enumSetting.path);
+			expect(afterEnum?.value).toBe(next);
 		}
 
 		// Boolean round-trip.
@@ -45,7 +48,10 @@ describe("web settings bridge", () => {
 		if (boolSetting) {
 			const target = boolSetting.value !== true;
 			expect(applyWebSetting(settings, boolSetting.path, target)).toBeNull();
-			expect(settings.get(boolSetting.path as SettingPath)).toBe(target);
+			const afterBool = buildWebSettings(settings)
+				.flatMap(t => t.settings)
+				.find(s => s.path === boolSetting.path);
+			expect(afterBool?.value).toBe(target);
 		}
 
 		// Unknown path and invalid enum value are rejected with an error message.
