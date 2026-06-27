@@ -11,6 +11,7 @@ import { ModelPicker } from "./components/control/ModelPicker";
 import { SessionPicker } from "./components/control/SessionPicker";
 import { SettingsPanel } from "./components/control/SettingsPanel";
 import { TodoHud } from "./components/control/TodoHud";
+import { TreeOverlay } from "./components/control/TreeOverlay";
 import { Banners } from "./components/shell/Banners";
 import { HeaderBar } from "./components/shell/HeaderBar";
 import { Toasts } from "./components/shell/Toasts";
@@ -53,6 +54,7 @@ function LocalSession({ client }: { client: LocalClient }): ReactNode {
 	const [sessionsOpen, setSessionsOpen] = useState(false);
 	const [goalOpen, setGoalOpen] = useState(false);
 	const [contextOpen, setContextOpen] = useState(false);
+	const [treeOpen, setTreeOpen] = useState(false);
 	const [loopMode, setLoopMode] = useState(false);
 	const lastPromptRef = useRef<string | null>(null);
 	const prevWorkingRef = useRef(false);
@@ -202,6 +204,7 @@ function LocalSession({ client }: { client: LocalClient }): ReactNode {
 				onOpenSessions={() => setSessionsOpen(true)}
 				onOpenGoal={() => setGoalOpen(true)}
 				onOpenContext={() => setContextOpen(true)}
+				onOpenTree={() => setTreeOpen(true)}
 				onToggleLoop={() => setLoopMode(m => !m)}
 				onPromptSent={t => {
 					lastPromptRef.current = t;
@@ -223,6 +226,7 @@ function LocalSession({ client }: { client: LocalClient }): ReactNode {
 			{settingsOpen && <SettingsPanel client={client} tabs={snap.settings} onClose={() => setSettingsOpen(false)} />}
 			{hotkeysOpen && <HotkeysOverlay onClose={() => setHotkeysOpen(false)} />}
 			{sessionsOpen && <SessionPicker client={client} onClose={() => setSessionsOpen(false)} />}
+			{treeOpen && <TreeOverlay client={client} onClose={() => setTreeOpen(false)} />}
 			{goalOpen && <GoalPanel client={client} snapshot={snap} onClose={() => setGoalOpen(false)} />}
 			{contextOpen && <ContextPanel client={client} onClose={() => setContextOpen(false)} />}
 			<Banners

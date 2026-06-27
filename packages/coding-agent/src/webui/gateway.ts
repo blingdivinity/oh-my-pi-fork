@@ -697,6 +697,7 @@ export class SessionGateway {
 			messageCount: s.messageCount,
 			modified: s.modified.getTime(),
 			current: currentFile ? path.resolve(s.path) === path.resolve(currentFile) : false,
+			parentPath: s.parentSessionPath,
 		}));
 	}
 

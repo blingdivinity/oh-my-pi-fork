@@ -38,7 +38,7 @@ Web plumbing: gateway `packages/coding-agent/src/webui/gateway.ts`; client
 | `/new` | TUI-only | ✅ | starts a new session; gateway re-sends welcome+snapshot so the web transcript resets |
 | `/drop` | TUI-only | ❌ | delete current + start new — control op + confirm |
 | `/resume` | TUI-only | ✅ | session picker (list-sessions + switch-session); switch re-snapshots the transcript |
-| `/tree` | TUI-only | ❌ | session-tree nav overlay (branches) |
+| `/tree` | TUI-only | ✅ | session-tree overlay: fork/branch forest from `parentPath` (matched by path or id), click to switch |
 | `/branch` | TUI-only | ✅ | "⎇ branch" button on each user message → branch(entryId) + re-snapshot |
 | `/fork` | TUI-only | ✅ | session.fork() (history copied) + re-snapshot |
 | `/handoff` | TUI-only | ❌ | handoff context to new session |
@@ -176,8 +176,7 @@ persists through `Settings.set` (verified live: dark theme → `amethyst` round-
 
 ## Next up (priority order)
 
-1. Session-tree overlay (`/tree`).
-2. `/guided-goal` interview wizard.
-3. Web-appropriate resolutions for the remaining TUI-only flows (`/btw`, `/tan`,
+1. `/guided-goal` interview wizard.
+2. Web-appropriate resolutions for the remaining TUI-only flows (`/btw`, `/tan`,
    `/omfg`, `/handoff`, `/drop`, `/login`/`/logout`, `/debug`, `/copy`,
    `/extensions`, `/agents`).

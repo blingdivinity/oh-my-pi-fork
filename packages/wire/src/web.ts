@@ -118,6 +118,8 @@ export interface WebSessionInfo {
 	messageCount: number;
 	modified: number;
 	current: boolean;
+	/** Path to the parent session, if this was forked/branched from another. */
+	parentPath?: string;
 }
 
 /** One section of the context window for the web /context panel. */
