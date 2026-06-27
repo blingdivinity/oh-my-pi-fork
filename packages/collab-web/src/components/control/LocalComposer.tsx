@@ -15,6 +15,10 @@ interface LocalComposerProps {
 	onOpenHotkeys?: () => void;
 	/** Open the session picker for /resume. */
 	onOpenSessions?: () => void;
+	/** Open the goal panel for /goal. */
+	onOpenGoal?: () => void;
+	/** Open the context panel for /context. */
+	onOpenContext?: () => void;
 }
 
 export function LocalComposer({
@@ -24,6 +28,8 @@ export function LocalComposer({
 	onOpenSettings,
 	onOpenHotkeys,
 	onOpenSessions,
+	onOpenGoal,
+	onOpenContext,
 }: LocalComposerProps): ReactNode {
 	const [text, setText] = useState("");
 	const [activeSlash, setActiveSlash] = useState(0);
@@ -44,6 +50,14 @@ export function LocalComposer({
 		}
 		if (onOpenSessions && cmd === "resume") {
 			onOpenSessions();
+			return true;
+		}
+		if (onOpenGoal && cmd === "goal") {
+			onOpenGoal();
+			return true;
+		}
+		if (onOpenContext && cmd === "context") {
+			onOpenContext();
 			return true;
 		}
 		return false;

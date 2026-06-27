@@ -55,6 +55,17 @@ export async function startMockWebServer(options: { port?: number; reply?: strin
 	authStorage.setRuntimeApiKey("anthropic", "test-key");
 	const modelRegistry = new ModelRegistry(authStorage, tempDir.join("models.yml"));
 	const session = new AgentSession({ agent, sessionManager, settings, modelRegistry });
+	// Seed a demo todo list so the web TodoHud is exercisable (the mock has no todo tool).
+	session.setTodoPhases([
+		{
+			name: "Demo plan",
+			tasks: [
+				{ content: "Wire the web UI", status: "in_progress" },
+				{ content: "Ship the model picker", status: "completed" },
+				{ content: "Build the todo HUD", status: "pending" },
+			],
+		},
+	]);
 
 	const gateway = new SessionGateway({ session });
 	gateway.start();

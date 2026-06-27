@@ -60,7 +60,7 @@ Web plumbing: gateway `packages/coding-agent/src/webui/gateway.ts`; client
 |---|---|---|---|
 | `/plan` | TUI-only | ✅ | toggles plan mode (gateway sets PlanModeState, ACP-style) + mode bar |
 | `/plan-review` | TUI-only | ❌ | reopen latest plan review — overlay |
-| `/goal` | TUI-only | 🟡 | goal status+objective shown in the mode bar; mutation (set/pause/resume) deferred (TUI controller has no clean API) |
+| `/goal` | TUI-only | ✅ | goal panel: set/pause/resume/drop/budget via goalRuntime control ops; mode bar reflects state |
 | `/guided-goal` | TUI-only | ❌ | goal interview — multi-step dialog; defer |
 | `/loop` | TUI-only | ❌ | loop driven by the TUI run loop — needs a client-side loop; deferred |
 | `/btw` | TUI-only | ❌ | ephemeral side question — deferred (branch flow) |
@@ -72,12 +72,12 @@ Web plumbing: gateway `packages/coding-agent/src/webui/gateway.ts`; client
 ### Context & transcript
 | cmd | kind | web | notes / plan |
 |---|---|---|---|
-| `/context` | both | 🟡 | runs (text); TUI shows a breakdown panel |
+| `/context` | both | ✅ | context panel: per-category breakdown (system/tools/context/skills/messages) + totals via get-context |
 | `/compact` | both | ✅ | `soft`/`remote`/`snapcompact` run |
 | `/shake` | both | ✅ | `elide`/`images` run |
 | `/fresh` | both | ✅ | runs |
 | `/tools` | both | 🟡 | runs (text); ctrl+o expand has no web equiv |
-| `/todo` | both | 🟡 | runs (text); TUI has an editor + the todo HUD |
+| `/todo` | both | ✅ | always-visible todo HUD (phases + status glyphs) from SessionState.todos |
 | `/dump` | both | 🟡 | TUI copies to clipboard — web should copy in-browser |
 | `/export` | both | 🟡 | writes HTML server-side — web should offer a download |
 | `/copy` | TUI-only | ❌ | pick text/code to copy — selection overlay |
@@ -111,11 +111,11 @@ Web plumbing: gateway `packages/coding-agent/src/webui/gateway.ts`; client
 | `/hotkeys` | TUI-only | ✅ | keyboard + command reference overlay (Esc closes) |
 | `/settings` | TUI-only | ✅ | settings panel (read+write) over `get-settings`/`set-setting`, persists to the shared store |
 
-**Tally (updated):** ✅ ~32 · 🟡 ~11 · ⛔/❌ ~10 · ➖ ~6. Shipped this round:
-`/model` `/settings` `/hotkeys` `/new` `/resume` `/fork` `/branch` `/plan` `/retry`,
+**Tally (updated):** ✅ ~35 · 🟡 ~8 · ⛔/❌ ~9 · ➖ ~6. Shipped: `/model` `/settings`
+`/hotkeys` `/new` `/resume` `/fork` `/branch` `/plan` `/retry` `/todo` `/goal` `/context`,
 plus every keyboard shortcut. Remaining gaps are deep interactive flows
-(`/tree`, `/goal` mutation, `/loop`, `/btw`, `/tan`, `/guided-goal`) and richer
-panels for commands that already echo text (`/context`, `/todo`, `/dump`/`/export`).
+(`/tree`, `/loop`, `/btw`, `/tan`, `/guided-goal`) and a couple of polish items
+(`/dump` copy button, `/export` download).
 
 ---
 
@@ -175,8 +175,7 @@ runtime option source (follow-up).
 
 ## Next up (priority order)
 
-1. Session overlays building on re-snapshot: `/tree`, `/branch`/`/fork` (transcript message picker).
-2. Richer surfaces: `/context` breakdown, `/todo` editor, `/dump`/`/export` browser copy/download.
-3. Goal-mode mutation control ops (`/goal set/pause/resume/drop/budget`).
-4. `/loop` (client-side loop), `/btw`, `/tan`, `/guided-goal`, `/omfg` flows.
-5. Theme runtime options over the wire (settings panel gap).
+1. `/dump` copy button + `/export` download (the two remaining richer-surface polish items).
+2. Session-tree overlay (`/tree`).
+3. `/loop` (client-side loop), `/btw`, `/tan`, `/guided-goal`, `/omfg` flows.
+4. Theme runtime options over the wire (settings panel gap); history-search + dequeue.

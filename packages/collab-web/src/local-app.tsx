@@ -1,13 +1,16 @@
 import type { ReactNode } from "react";
 import { useEffect, useMemo, useState } from "react";
 import { AgentsPanel } from "./components/agents/AgentsPanel";
+import { ContextPanel } from "./components/control/ContextPanel";
 import { ControlOverlays } from "./components/control/ControlOverlays";
 import { ExtPanelHost } from "./components/control/ExtPanelHost";
+import { GoalPanel } from "./components/control/GoalPanel";
 import { HotkeysOverlay } from "./components/control/HotkeysOverlay";
 import { LocalComposer } from "./components/control/LocalComposer";
 import { ModelPicker } from "./components/control/ModelPicker";
 import { SessionPicker } from "./components/control/SessionPicker";
 import { SettingsPanel } from "./components/control/SettingsPanel";
+import { TodoHud } from "./components/control/TodoHud";
 import { Banners } from "./components/shell/Banners";
 import { HeaderBar } from "./components/shell/HeaderBar";
 import { Toasts } from "./components/shell/Toasts";
@@ -48,6 +51,8 @@ function LocalSession({ client }: { client: LocalClient }): ReactNode {
 	const [hideThinking, setHideThinking] = useState(false);
 	const [hotkeysOpen, setHotkeysOpen] = useState(false);
 	const [sessionsOpen, setSessionsOpen] = useState(false);
+	const [goalOpen, setGoalOpen] = useState(false);
+	const [contextOpen, setContextOpen] = useState(false);
 
 	const subCount = useMemo(() => snap.agents.filter(a => a.kind === "sub").length, [snap.agents]);
 	const agentIds = useMemo(() => new Set(snap.agents.map(a => a.id)), [snap.agents]);
@@ -152,6 +157,7 @@ function LocalSession({ client }: { client: LocalClient }): ReactNode {
 					<pre>{snap.commandOutput.join("\n")}</pre>
 				</details>
 			)}
+			<TodoHud snapshot={snap} />
 			{(snap.state?.planMode || snap.state?.goalMode) && (
 				<div className="lc-modebar">
 					{snap.state?.planMode && <span className="lc-mode lc-mode--plan">plan mode</span>}
@@ -172,12 +178,16 @@ function LocalSession({ client }: { client: LocalClient }): ReactNode {
 				}}
 				onOpenHotkeys={() => setHotkeysOpen(true)}
 				onOpenSessions={() => setSessionsOpen(true)}
+				onOpenGoal={() => setGoalOpen(true)}
+				onOpenContext={() => setContextOpen(true)}
 			/>
 			<ControlOverlays client={client} snapshot={snap} />
 			{modelPicker && <ModelPicker client={client} models={snap.models} onClose={() => setModelPicker(false)} />}
 			{settingsOpen && <SettingsPanel client={client} tabs={snap.settings} onClose={() => setSettingsOpen(false)} />}
 			{hotkeysOpen && <HotkeysOverlay onClose={() => setHotkeysOpen(false)} />}
 			{sessionsOpen && <SessionPicker client={client} onClose={() => setSessionsOpen(false)} />}
+			{goalOpen && <GoalPanel client={client} snapshot={snap} onClose={() => setGoalOpen(false)} />}
+			{contextOpen && <ContextPanel client={client} onClose={() => setContextOpen(false)} />}
 			<Banners
 				phase={snap.phase}
 				endedReason={snap.endedReason}

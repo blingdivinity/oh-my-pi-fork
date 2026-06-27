@@ -1,0 +1,94 @@
+.lc-ctx {
+	width: min(640px, 94vw);
+	max-height: 78vh;
+	display: flex;
+	flex-direction: column;
+	gap: 12px;
+}
+
+.lc-ctx-body {
+	display: flex;
+	flex-direction: column;
+	gap: 12px;
+	min-height: 0;
+}
+
+.lc-ctx-summary {
+	display: flex;
+	justify-content: space-between;
+	align-items: baseline;
+	gap: 12px;
+	padding: 10px 12px;
+	background: var(--tv-bg, #111);
+	border: 1px solid var(--tv-border, #2a2a2a);
+	border-radius: 8px;
+}
+
+.lc-ctx-used,
+.lc-ctx-free,
+.lc-ctx-tokens {
+	font-variant-numeric: tabular-nums;
+}
+
+.lc-ctx-free,
+.lc-ctx-note,
+.lc-ctx-empty {
+	opacity: 0.65;
+}
+
+.lc-ctx-note,
+.lc-ctx-empty {
+	font-size: 12px;
+}
+
+.lc-ctx-empty {
+	padding: 8px 0;
+}
+
+.lc-ctx-list {
+	display: flex;
+	flex-direction: column;
+	gap: 10px;
+	overflow-y: auto;
+	min-height: 0;
+}
+
+.lc-ctx-row {
+	display: flex;
+	flex-direction: column;
+	gap: 5px;
+}
+
+.lc-ctx-row-head {
+	display: flex;
+	justify-content: space-between;
+	gap: 12px;
+	align-items: baseline;
+}
+
+.lc-ctx-label {
+	font-weight: 600;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+
+.lc-ctx-tokens {
+	opacity: 0.7;
+	white-space: nowrap;
+	font-size: 12px;
+}
+
+.lc-ctx-bar {
+	height: 8px;
+	background: var(--tv-bg, #111);
+	border: 1px solid var(--tv-border, #2a2a2a);
+	border-radius: 999px;
+	overflow: hidden;
+}
+
+.lc-ctx-bar-fill {
+	height: 100%;
+	background: var(--tv-accent, #77aaff);
+	border-radius: inherit;
+}
