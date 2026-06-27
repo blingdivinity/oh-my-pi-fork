@@ -3,6 +3,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { AgentsPanel } from "./components/agents/AgentsPanel";
 import { ContextPanel } from "./components/control/ContextPanel";
 import { ControlOverlays } from "./components/control/ControlOverlays";
+import { ExtensionsPanel } from "./components/control/ExtensionsPanel";
 import { ExtPanelHost } from "./components/control/ExtPanelHost";
 import { GoalPanel } from "./components/control/GoalPanel";
 import { HotkeysOverlay } from "./components/control/HotkeysOverlay";
@@ -57,6 +58,7 @@ function LocalSession({ client }: { client: LocalClient }): ReactNode {
 	const [contextOpen, setContextOpen] = useState(false);
 	const [treeOpen, setTreeOpen] = useState(false);
 	const [omfg, setOmfg] = useState<{ complaint: string } | null>(null);
+	const [extOpen, setExtOpen] = useState(false);
 	const [loopMode, setLoopMode] = useState(false);
 	const lastPromptRef = useRef<string | null>(null);
 	const prevWorkingRef = useRef(false);
@@ -209,6 +211,7 @@ function LocalSession({ client }: { client: LocalClient }): ReactNode {
 				onOpenTree={() => setTreeOpen(true)}
 				onOpenAgents={() => setRailOpen(true)}
 				onOpenOmfg={complaint => setOmfg({ complaint })}
+				onOpenExtensions={() => setExtOpen(true)}
 				onToggleLoop={() => setLoopMode(m => !m)}
 				onPromptSent={t => {
 					lastPromptRef.current = t;
@@ -232,6 +235,7 @@ function LocalSession({ client }: { client: LocalClient }): ReactNode {
 			{sessionsOpen && <SessionPicker client={client} onClose={() => setSessionsOpen(false)} />}
 			{treeOpen && <TreeOverlay client={client} onClose={() => setTreeOpen(false)} />}
 			{omfg && <OmfgModal client={client} complaint={omfg.complaint} onClose={() => setOmfg(null)} />}
+			{extOpen && <ExtensionsPanel client={client} onClose={() => setExtOpen(false)} />}
 			{goalOpen && <GoalPanel client={client} snapshot={snap} onClose={() => setGoalOpen(false)} />}
 			{contextOpen && <ContextPanel client={client} onClose={() => setContextOpen(false)} />}
 			<Banners

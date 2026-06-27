@@ -25,6 +25,7 @@ import type {
 	WebCapabilities,
 	WebContextBreakdown,
 	WebControlFrame,
+	WebExtension,
 	WebExtPanel,
 	WebExtUIRequest,
 	WebExtUIResponse,
@@ -239,6 +240,9 @@ export class LocalClient {
 	}
 	getContextBreakdown(): Promise<WebContextBreakdown | null> {
 		return this.#ctl(reqId => ({ t: "ctl", op: "get-context", reqId })) as Promise<WebContextBreakdown | null>;
+	}
+	getExtensions(): Promise<WebExtension[]> {
+		return this.#ctl(reqId => ({ t: "ctl", op: "get-extensions", reqId })) as Promise<WebExtension[]>;
 	}
 	exportHtml(): Promise<{ filename: string; html: string } | null> {
 		return this.#ctl(reqId => ({ t: "ctl", op: "export-html", reqId })) as Promise<{

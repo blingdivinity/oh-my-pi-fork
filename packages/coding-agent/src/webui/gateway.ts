@@ -20,6 +20,7 @@ import type {
 	WebCapabilities,
 	WebControlEvent,
 	WebControlFrame,
+	WebExtension,
 	WebSessionInfo,
 	WebToolApprovalDecision,
 	WebToolApprovalRequest,
@@ -32,6 +33,7 @@ import { buildSkillPromptMessage } from "../extensibility/skills";
 import { resolveLocalUrlToPath } from "../internal-urls";
 import type { MCPManager } from "../mcp";
 import { MCP_CONNECTION_STATUS_EVENT_CHANNEL } from "../mcp/startup-events";
+import { loadAllExtensions } from "../modes/components/extensions/state-manager";
 import {
 	buildOmfgRuleForPath,
 	extractGeneratedRuleJson,
@@ -416,6 +418,8 @@ export class SessionGateway {
 				case "get-mcp":
 					this.#sendMcp(peer);
 					return ack(true);
+				case "get-extensions":
+					return ack(true, await this.#listExtensions());
 				case "get-settings":
 					this.#sendSettings(peer);
 					return ack(true);
@@ -792,6 +796,20 @@ export class SessionGateway {
 		};
 		if (target) target.send(frame);
 		else this.#broadcastControl(frame);
+	}
+
+	async #listExtensions(): Promise<WebExtension[]> {
+		const exts = await loadAllExtensions(this.#session.sessionManager.getCwd());
+		return exts.map(e => ({
+			id: e.id,
+			kind: e.kind,
+			name: e.displayName,
+			description: e.description,
+			trigger: e.trigger,
+			provider: e.source.providerName,
+			level: e.source.level,
+			state: e.state,
+		}));
 	}
 
 	async #listSessions(): Promise<WebSessionInfo[]> {

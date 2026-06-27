@@ -84,6 +84,18 @@ export interface WebMcpServerStatus {
 	scope?: string;
 }
 
+/** An installed extension/capability surfaced to the web Extension Control Center. */
+export interface WebExtension {
+	id: string;
+	kind: string;
+	name: string;
+	description?: string;
+	trigger?: string;
+	provider: string;
+	level: "user" | "project" | "native";
+	state: "active" | "disabled" | "shadowed";
+}
+
 /** An option for an enum/submenu setting. */
 export interface WebSettingOption {
 	value: string;
@@ -271,6 +283,7 @@ export type WebControlFrame =
 	| { t: "ctl"; op: "get-models"; reqId: number }
 	| { t: "ctl"; op: "get-commands"; reqId: number }
 	| { t: "ctl"; op: "get-mcp"; reqId: number }
+	| { t: "ctl"; op: "get-extensions"; reqId: number }
 	| { t: "ctl"; op: "get-settings"; reqId: number }
 	| { t: "ctl"; op: "set-setting"; reqId: number; path: string; value: boolean | string }
 	| { t: "ctl"; op: "tool-approval"; reqId: number; approvalId: string; decision: WebToolApprovalDecision }

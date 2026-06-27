@@ -93,7 +93,7 @@ Web plumbing: gateway `packages/coding-agent/src/webui/gateway.ts`; client
 | `/marketplace` | both | ✅ | runs (text) |
 | `/plugins` | both | ✅ | `list`/`enable`/`disable` run |
 | `/reload-plugins` | both | ✅ | runs |
-| `/extensions` | TUI-only | 🟡 | `/marketplace` + `/reload-plugins` manage plugins as text; the Control Center dashboard is a deferred panel |
+| `/extensions` | TUI-only | ✅ | Extension Control Center panel: read-only inventory (42 capabilities grouped by kind, provider + state) via `loadAllExtensions`; enable/disable runs as text via `/plugins` |
 | `/agents` | TUI-only | ✅ | opens the agents rail (`AgentsPanel`) — the web Agent Control Center |
 
 ### Collab, sharing, misc
@@ -111,7 +111,7 @@ Web plumbing: gateway `packages/coding-agent/src/webui/gateway.ts`; client
 | `/hotkeys` | TUI-only | ✅ | keyboard + command reference overlay (Esc closes) |
 | `/settings` | TUI-only | ✅ | settings panel (read+write) over `get-settings`/`set-setting`, persists to the shared store |
 
-**Tally (updated):** ✅ ~50 · 🟡 ~5 · ➖ ~6 · ❌ 0. Every TUI-only interactive flow
+**Tally (updated):** ✅ ~51 · 🟡 ~4 · ➖ ~6 · ❌ 0. Every TUI-only interactive flow
 now has a real web path: `/plan-review` (plan-artifact read), `/btw` + `/omfg`
 (server-side `runEphemeralTurn` + the shared `omfg-rule` helpers, with `/omfg`'s
 full generate→validate→project/global→amend→save modal), and `/tan` (the
@@ -181,9 +181,7 @@ persists through `Settings.set` (verified live: dark theme → `amethyst` round-
 
 ## Remaining (🟡 polish — every command has a working web path)
 
-1. `/extensions` Control Center dashboard (plugin management already runs as text via
-   `/marketplace` + `/reload-plugins`; the rich dashboard is a nice-to-have panel).
-2. `/force` tool selector, `/session`/`/rename` inline-edit affordances, `/stats`
+1. `/force` tool selector, `/session`/`/rename` inline-edit affordances, `/stats`
    deep-link — small UX upgrades over the working text behavior.
-3. The `/btw`/`/omfg`/`/handoff` LLM side-calls return real content with a real model;
+2. The `/btw`/`/omfg`/`/handoff` LLM side-calls return real content with a real model;
    they 401 (and report gracefully) only under the mock test harness.

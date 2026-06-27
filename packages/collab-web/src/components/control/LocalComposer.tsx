@@ -49,6 +49,8 @@ interface LocalComposerProps {
 	onPromptSent?: (text: string) => void;
 	/** Open the omfg rule-forge modal for /omfg (with optional prefilled complaint). */
 	onOpenOmfg?: (complaint: string) => void;
+	/** Open the extensions panel for /extensions (alias /status). */
+	onOpenExtensions?: () => void;
 }
 
 export function LocalComposer({
@@ -66,6 +68,7 @@ export function LocalComposer({
 	onToggleLoop,
 	onPromptSent,
 	onOpenOmfg,
+	onOpenExtensions,
 }: LocalComposerProps): ReactNode {
 	const [text, setText] = useState("");
 	const [activeSlash, setActiveSlash] = useState(0);
@@ -109,6 +112,10 @@ export function LocalComposer({
 		}
 		if (onOpenOmfg && cmd === "omfg") {
 			onOpenOmfg("");
+			return true;
+		}
+		if (onOpenExtensions && (cmd === "extensions" || cmd === "status")) {
+			onOpenExtensions();
 			return true;
 		}
 		if (onExport && cmd === "export") {
