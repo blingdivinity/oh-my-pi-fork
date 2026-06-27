@@ -260,3 +260,30 @@
 	text-overflow: ellipsis;
 	white-space: nowrap;
 }
+
+.lc-hotkeys {
+	width: min(620px, 94vw);
+	max-height: 80vh;
+	overflow-y: auto;
+}
+.lc-hotkeys h3 {
+	margin: 12px 0 6px;
+}
+.lc-hotkeys-grid {
+	display: grid;
+	grid-template-columns: max-content 1fr;
+	gap: 4px 12px;
+	align-items: baseline;
+}
+.lc-hotkey {
+	display: contents;
+}
+.lc-hotkey-keys {
+	font-family: var(--tv-mono, monospace);
+	font-size: 12px;
+	white-space: nowrap;
+	opacity: 0.9;
+}
+.lc-hotkey-desc {
+	opacity: 0.75;
+}

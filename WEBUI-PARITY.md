@@ -108,7 +108,7 @@ Web plumbing: gateway `packages/coding-agent/src/webui/gateway.ts`; client
 | `/changelog` | both | ✅ | runs |
 | `/stats` | text | 🟡 | launches local stats dashboard — web could link out |
 | `/debug` | TUI-only | ❌ | debug tools selector — overlay |
-| `/hotkeys` | TUI-only | ❌ | show shortcuts — web help overlay |
+| `/hotkeys` | TUI-only | ✅ | keyboard + command reference overlay (Esc closes) |
 | `/settings` | TUI-only | ✅ | settings panel (read+write) over `get-settings`/`set-setting`, persists to the shared store |
 
 **Tally:** ✅ ~24 · 🟡 ~12 · ⛔/❌ ~20 · ➖ ~6. The "both" commands already run
@@ -174,7 +174,7 @@ runtime option source (follow-up).
 ## Next up (priority order)
 
 1. Session overlays: `/resume`, `/tree`, `/branch`/`/fork`, `/new`/`/drop`.
-2. Richer surfaces: `/context` breakdown, `/todo` editor, `/dump`/`/export` browser copy/download, `/hotkeys` help.
+2. Richer surfaces: `/context` breakdown, `/todo` editor, `/dump`/`/export` browser copy/download.
 3. Goal-mode mutation control ops (`/goal set/pause/resume/drop/budget`).
 4. `/loop` (client-side loop), `/btw`, `/tan`, `/guided-goal`, `/omfg` flows.
 5. Theme runtime options over the wire (settings panel gap).

@@ -11,9 +11,17 @@ interface LocalComposerProps {
 	onOpenModelPicker?: () => void;
 	/** Open the settings panel for /settings. */
 	onOpenSettings?: () => void;
+	/** Open the hotkeys reference for /hotkeys. */
+	onOpenHotkeys?: () => void;
 }
 
-export function LocalComposer({ client, snapshot, onOpenModelPicker, onOpenSettings }: LocalComposerProps): ReactNode {
+export function LocalComposer({
+	client,
+	snapshot,
+	onOpenModelPicker,
+	onOpenSettings,
+	onOpenHotkeys,
+}: LocalComposerProps): ReactNode {
 	const [text, setText] = useState("");
 	const [activeSlash, setActiveSlash] = useState(0);
 	const readOnly = snapshot.readOnly;
@@ -25,6 +33,10 @@ export function LocalComposer({ client, snapshot, onOpenModelPicker, onOpenSetti
 		}
 		if (onOpenSettings && cmd === "settings") {
 			onOpenSettings();
+			return true;
+		}
+		if (onOpenHotkeys && cmd === "hotkeys") {
+			onOpenHotkeys();
 			return true;
 		}
 		return false;
