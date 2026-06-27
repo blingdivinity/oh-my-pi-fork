@@ -14,6 +14,7 @@ import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import { resolveWebSpaDir } from "@oh-my-pi/pi-coding-agent/webui/embedded-spa";
 import { SessionGateway } from "@oh-my-pi/pi-coding-agent/webui/gateway";
 import { startWebServer } from "@oh-my-pi/pi-coding-agent/webui/server";
 import { Snowflake, TempDir } from "@oh-my-pi/pi-utils";
@@ -56,7 +57,12 @@ export async function startMockWebServer(options: { port?: number; reply?: strin
 	const gateway = new SessionGateway({ session });
 	gateway.start();
 	const token = crypto.randomUUID();
-	const server = startWebServer(gateway, { token, port: options.port ?? 0, host: "127.0.0.1", spaDir: spaDir() });
+	const server = startWebServer(gateway, {
+		token,
+		port: options.port ?? 0,
+		host: "127.0.0.1",
+		spaDir: await resolveWebSpaDir(),
+	});
 
 	return {
 		url: `${server.url}#token=${token}`,

@@ -20,6 +20,7 @@ import type { MCPManager } from "../mcp";
 import { initializeExtensions } from "../modes/runtime-init";
 import type { AgentSession } from "../session/agent-session";
 import type { EventBus } from "../utils/event-bus";
+import { resolveWebSpaDir } from "./embedded-spa";
 import { SessionGateway } from "./gateway";
 import type { GatewayInbound, GatewayOutbound, GatewayPeer } from "./types";
 
@@ -263,11 +264,12 @@ export async function runWebMode(session: AgentSession, options: RunWebModeOptio
 
 	gateway.start();
 	const token = crypto.randomUUID();
+	const spaDir = options.spaDir ?? (await resolveWebSpaDir());
 	const running = startWebServer(gateway, {
 		token,
 		port: options.port,
 		host: options.host,
-		spaDir: options.spaDir,
+		spaDir,
 	});
 	const link = `${running.url}#token=${token}`;
 	process.stdout.write(`omp web UI: ${link}\n`);
