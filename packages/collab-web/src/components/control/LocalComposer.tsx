@@ -13,8 +13,9 @@ export function LocalComposer({ client, snapshot }: LocalComposerProps): ReactNo
 	const readOnly = snapshot.readOnly;
 
 	const slashMatches = useMemo(() => {
-		if (!text.startsWith("/")) return [];
-		const token = text.split(/\s+/, 1)[0]?.slice(1).toLowerCase() ?? "";
+		// Only while still typing the command name (no space/args yet).
+		if (!text.startsWith("/") || text.includes(" ")) return [];
+		const token = text.slice(1).toLowerCase();
 		return snapshot.commands.filter(c => c.name.toLowerCase().startsWith(token)).slice(0, 8);
 	}, [text, snapshot.commands]);
 
@@ -107,6 +108,13 @@ export function LocalComposer({ client, snapshot }: LocalComposerProps): ReactNo
 						}
 						if (e.key === "Enter" && !e.shiftKey) {
 							e.preventDefault();
+							// Palette open: Enter selects the highlighted command (fills it);
+							// a second Enter runs it. Otherwise submit.
+							if (slashMatches.length > 0) {
+								const match = slashMatches[activeSlash];
+								if (match) applySlash(match.name);
+								return;
+							}
 							submit();
 						}
 					}}

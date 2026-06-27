@@ -55,6 +55,25 @@ function LocalSession({ client }: { client: LocalClient }): ReactNode {
 	useEffect(() => {
 		document.title = `${title} · omp`;
 	}, [title]);
+	// TUI keybinding parity: shift+tab cycle thinking, ctrl+p cycle model,
+	// Esc abort while streaming. Captured globally so they work from the composer.
+	const working = snap.working;
+	useEffect(() => {
+		const onKey = (e: KeyboardEvent): void => {
+			if (e.key === "Tab" && e.shiftKey && !e.ctrlKey && !e.metaKey && !e.altKey) {
+				e.preventDefault();
+				void client.cycleThinking();
+			} else if ((e.key === "p" || e.key === "P") && e.ctrlKey && !e.metaKey && !e.altKey) {
+				e.preventDefault();
+				void client.cycleModel();
+			} else if (e.key === "Escape" && working) {
+				e.preventDefault();
+				client.sendAbort();
+			}
+		};
+		window.addEventListener("keydown", onKey);
+		return () => window.removeEventListener("keydown", onKey);
+	}, [client, working]);
 
 	return (
 		<div className="sh-app">

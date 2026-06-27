@@ -342,6 +342,7 @@ export class LocalClient {
 				break;
 			case "command-output":
 				this.#commandOutput = [...this.#commandOutput, frame.text].slice(-MAX_COMMAND_OUTPUT);
+				this.#pushNotice("info", frame.text);
 				break;
 			case "tool-approval-request":
 				this.#approvalQueue = [...this.#approvalQueue, frame.request];

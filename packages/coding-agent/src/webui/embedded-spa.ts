@@ -11,6 +11,7 @@
  *  2. dev tree → serve `collab-web/dist`, building it on demand if missing
  */
 
+import type { Dirent } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -88,10 +89,26 @@ async function buildCollabWebSpa(distDir: string): Promise<void> {
 	}
 }
 
+async function newestMtime(dir: string): Promise<number> {
+	let newest = 0;
+	let entries: Dirent[];
+	try {
+		entries = await fs.readdir(dir, { withFileTypes: true });
+	} catch {
+		return 0;
+	}
+	for (const entry of entries) {
+		const full = path.join(dir, entry.name);
+		const mtime = entry.isDirectory() ? await newestMtime(full) : (await fs.stat(full)).mtimeMs;
+		if (mtime > newest) newest = mtime;
+	}
+	return newest;
+}
+
 /**
  * Resolve a directory containing the built SPA (index.html + assets) ready to
  * serve. Extracts the embedded archive when present/prebuilt; otherwise serves
- * the dev dist, building it on first use if absent.
+ * the dev dist, rebuilding it when missing or stale (source newer than dist).
  */
 export async function resolveWebSpaDir(): Promise<string> {
 	if (EMBEDDED_SPA_ARCHIVE) return extractEmbeddedSpa(EMBEDDED_SPA_ARCHIVE);
@@ -101,7 +118,12 @@ export async function resolveWebSpaDir(): Promise<string> {
 		);
 	}
 	const dist = collabWebDistDir();
-	if (!(await Bun.file(path.join(dist, "index.html")).exists())) {
+	const indexPath = path.join(dist, "index.html");
+	let distMtime = 0;
+	try {
+		distMtime = (await fs.stat(indexPath)).mtimeMs;
+	} catch {}
+	if (distMtime === 0 || (await newestMtime(path.join(dist, "..", "src"))) > distMtime) {
 		await buildCollabWebSpa(dist);
 	}
 	return dist;

@@ -36,6 +36,7 @@ import { SKILL_PROMPT_MESSAGE_TYPE, USER_INTERRUPT_LABEL } from "../session/mess
 import type { SessionEntry as StoredSessionEntry } from "../session/session-entries";
 import { executeAcpBuiltinSlashCommand } from "../slash-commands/acp-builtins";
 import { buildAvailableSlashCommands } from "../slash-commands/available-commands";
+import { lookupBuiltinSlashCommand } from "../slash-commands/builtin-registry";
 import type { SlashCommandRuntime } from "../slash-commands/types";
 import { TASK_SUBAGENT_LIFECYCLE_CHANNEL, TASK_SUBAGENT_PROGRESS_CHANNEL } from "../task";
 import { parseConfiguredThinkingLevel } from "../thinking";
@@ -210,7 +211,7 @@ export class SessionGateway {
 				this.#onHello(peer, frame.name);
 				return;
 			case "prompt":
-				if (this.#guardWrite(peer)) void this.#dispatchPrompt(frame.text, frame.images, "steer", peer);
+				if (this.#guardWrite(peer)) void this.#runPrompt(frame.text, frame.images, "steer", peer);
 				return;
 			case "abort":
 				if (this.#guardWrite(peer)) void this.#session.abort({ reason: USER_INTERRUPT_LABEL });
@@ -307,7 +308,7 @@ export class SessionGateway {
 			switch (frame.op) {
 				case "prompt":
 					this.#requireWrite(peer);
-					void this.#dispatchPrompt(frame.text, frame.images, frame.streamingBehavior, peer);
+					void this.#runPrompt(frame.text, frame.images, frame.streamingBehavior, peer);
 					return ack(true);
 				case "steer":
 					this.#requireWrite(peer);
@@ -323,7 +324,7 @@ export class SessionGateway {
 					return ack(true);
 				case "slash":
 					this.#requireWrite(peer);
-					await this.#dispatchPrompt(frame.command, undefined, undefined, peer);
+					await this.#runSlash(frame.command, peer);
 					return ack(true);
 				case "set-model": {
 					this.#requireWrite(peer);
@@ -409,16 +410,24 @@ export class SessionGateway {
 		};
 	}
 
-	async #dispatchPrompt(
+	async #runPrompt(
 		text: string,
 		images: ImageContent[] | undefined,
 		streamingBehavior: "steer" | "followUp" | undefined,
 		peer: GatewayPeer,
 	): Promise<void> {
-		if (text.startsWith("/skill:") && this.#session.skillsSettings?.enableSkillCommands) {
-			const spaceIndex = text.indexOf(" ");
-			const skillName = (spaceIndex === -1 ? text.slice(1) : text.slice(1, spaceIndex)).slice("skill:".length);
-			const args = spaceIndex === -1 ? "" : text.slice(spaceIndex + 1).trim();
+		// A slash typed/sent as a prompt still runs as a command.
+		if (text.startsWith("/")) return this.#runSlash(text, peer);
+		void this.#session.prompt(text, { images, streamingBehavior });
+	}
+
+	async #runSlash(command: string, peer: GatewayPeer): Promise<void> {
+		const name = command.replace(/^\/+/, "").split(/[\s:]/, 1)[0] ?? "";
+		// Skill command: /skill:<name> [args]
+		if (command.startsWith("/skill:") && this.#session.skillsSettings?.enableSkillCommands) {
+			const spaceIndex = command.indexOf(" ");
+			const skillName = (spaceIndex === -1 ? command.slice(1) : command.slice(1, spaceIndex)).slice("skill:".length);
+			const args = spaceIndex === -1 ? "" : command.slice(spaceIndex + 1).trim();
 			const skill = this.#session.skills.find(candidate => candidate.name === skillName);
 			if (skill) {
 				const built = await buildSkillPromptMessage(skill, args);
@@ -432,12 +441,21 @@ export class SessionGateway {
 				return;
 			}
 		}
-		const builtin = await executeAcpBuiltinSlashCommand(text, this.#slashRuntime(peer));
-		if (builtin !== false) {
-			if ("prompt" in builtin) void this.#session.prompt(builtin.prompt, { images });
+		const result = await executeAcpBuiltinSlashCommand(command, this.#slashRuntime(peer));
+		if (result !== false) {
+			if ("prompt" in result) void this.#session.prompt(result.prompt);
 			return;
 		}
-		void this.#session.prompt(text, { images, streamingBehavior });
+		// Not handled by the text dispatcher. A KNOWN builtin here is TUI-only (no
+		// text handle) — surface that rather than send "/cmd" to the model.
+		if (lookupBuiltinSlashCommand(name)) {
+			peer.send({ t: "command-output", text: `/${name} is interactive-only and not yet available in the web UI.` });
+			return;
+		}
+		// Everything else (extension/custom/file commands, or an unknown slash) goes
+		// to session.prompt: it expands recognized commands and forwards the rest to
+		// the model — matching the TUI/RPC behavior.
+		void this.#session.prompt(command);
 	}
 
 	#handleAgentCmd(cmd: "chat" | "kill" | "revive", agentId: string, text: string | undefined): void {
