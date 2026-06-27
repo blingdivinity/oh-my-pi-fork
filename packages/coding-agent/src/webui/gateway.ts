@@ -373,6 +373,7 @@ export class SessionGateway {
 				case "branch": {
 					this.#requireWrite(peer);
 					const result = await this.#session.branch(frame.entryId);
+					for (const target of this.#peers) this.#sendWelcome(target);
 					return ack(true, result);
 				}
 				case "bash": {

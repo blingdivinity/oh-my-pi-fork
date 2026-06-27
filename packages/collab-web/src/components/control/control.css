@@ -287,3 +287,18 @@
 .lc-hotkey-desc {
 	opacity: 0.75;
 }
+
+.tr-branch {
+	margin-top: 4px;
+	font-size: 11px;
+	opacity: 0.5;
+	background: none;
+	border: none;
+	color: inherit;
+	cursor: pointer;
+	padding: 0;
+}
+.tr-branch:hover {
+	opacity: 1;
+	text-decoration: underline;
+}

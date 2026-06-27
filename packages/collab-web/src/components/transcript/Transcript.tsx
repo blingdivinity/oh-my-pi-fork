@@ -12,6 +12,9 @@ import "./transcript.css";
 /** When true (set by the local app via ctrl+t) thinking blocks are hidden. */
 export const ThinkingHideContext = createContext(false);
 
+/** Branch-from-message callback for user rows (set by the local app). */
+export const BranchContext = createContext<((entryId: string) => void) | null>(null);
+
 export interface TranscriptProps {
 	entries: readonly SessionEntry[];
 	stream: AssistantMessage | null;
@@ -170,6 +173,7 @@ function entryRowEqual(prev: EntryRowProps, next: EntryRowProps): boolean {
 }
 
 const EntryRow = memo(function EntryRow({ entry, results, active, host }: EntryRowProps): ReactNode {
+	const onBranch = useContext(BranchContext);
 	switch (entry.type) {
 		case "message": {
 			const msg = entry.message;
@@ -178,6 +182,16 @@ const EntryRow = memo(function EntryRow({ entry, results, active, host }: EntryR
 					return (
 						<Row kind="user" gutter="host" title={entry.timestamp}>
 							<MsgContent content={msg.content} />
+							{onBranch && (
+								<button
+									type="button"
+									className="tr-branch"
+									title="Branch a new session from here"
+									onClick={() => onBranch(entry.id)}
+								>
+									⎇ branch
+								</button>
+							)}
 						</Row>
 					);
 				case "assistant":

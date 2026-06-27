@@ -11,7 +11,7 @@ import { SettingsPanel } from "./components/control/SettingsPanel";
 import { Banners } from "./components/shell/Banners";
 import { HeaderBar } from "./components/shell/HeaderBar";
 import { Toasts } from "./components/shell/Toasts";
-import { ThinkingHideContext, Transcript } from "./components/transcript/Transcript";
+import { BranchContext, ThinkingHideContext, Transcript } from "./components/transcript/Transcript";
 import { LocalClient } from "./lib/local-client";
 import { localWsUrl, type OmpWebConfig, useLocalSnapshot } from "./lib/use-local";
 import { ToolExpandContext, type ToolRenderHost } from "./tool-render";
@@ -116,14 +116,16 @@ function LocalSession({ client }: { client: LocalClient }): ReactNode {
 					<div className="sh-transcript">
 						<ToolExpandContext.Provider value={expandTools}>
 							<ThinkingHideContext.Provider value={hideThinking}>
-								<Transcript
-									entries={snap.entries}
-									stream={snap.stream}
-									streamDone={snap.streamDone}
-									activeTools={snap.activeTools}
-									working={snap.working}
-									host={toolHost}
-								/>
+								<BranchContext.Provider value={entryId => void client.branch(entryId)}>
+									<Transcript
+										entries={snap.entries}
+										stream={snap.stream}
+										streamDone={snap.streamDone}
+										activeTools={snap.activeTools}
+										working={snap.working}
+										host={toolHost}
+									/>
+								</BranchContext.Provider>
 							</ThinkingHideContext.Provider>
 						</ToolExpandContext.Provider>
 					</div>

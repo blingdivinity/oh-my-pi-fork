@@ -39,7 +39,7 @@ Web plumbing: gateway `packages/coding-agent/src/webui/gateway.ts`; client
 | `/drop` | TUI-only | ❌ | delete current + start new — control op + confirm |
 | `/resume` | TUI-only | ✅ | session picker (list-sessions + switch-session); switch re-snapshots the transcript |
 | `/tree` | TUI-only | ❌ | session-tree nav overlay (branches) |
-| `/branch` | TUI-only | ❌ | branch from a past message — needs transcript message picker |
+| `/branch` | TUI-only | ✅ | "⎇ branch" button on each user message → branch(entryId) + re-snapshot |
 | `/fork` | TUI-only | ✅ | session.fork() (history copied) + re-snapshot |
 | `/handoff` | TUI-only | ❌ | handoff context to new session |
 | `/session` | both | 🟡 | `info`/`delete` run as text; fine |
