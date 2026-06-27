@@ -146,6 +146,16 @@ function LocalSession({ client }: { client: LocalClient }): ReactNode {
 					<pre>{snap.commandOutput.join("\n")}</pre>
 				</details>
 			)}
+			{(snap.state?.planMode || snap.state?.goalMode) && (
+				<div className="lc-modebar">
+					{snap.state?.planMode && <span className="lc-mode lc-mode--plan">plan mode</span>}
+					{snap.state?.goalMode && (
+						<span className="lc-mode lc-mode--goal" title={snap.state.goalMode.objective}>
+							goal · {snap.state.goalMode.status}: {snap.state.goalMode.objective}
+						</span>
+					)}
+				</div>
+			)}
 			<LocalComposer
 				client={client}
 				snapshot={snap}

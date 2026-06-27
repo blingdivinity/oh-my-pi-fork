@@ -464,6 +464,24 @@ export class SessionGateway {
 			if ("prompt" in result) void this.#session.prompt(result.prompt);
 			return;
 		}
+		// Web equivalents for a couple of otherwise TUI-only commands.
+		if (name === "retry") {
+			const ok = await this.#session.retry();
+			peer.send({ t: "command-output", text: ok ? "Retrying the last turn…" : "Nothing to retry." });
+			return;
+		}
+		if (name === "plan") {
+			const on = this.#session.getPlanModeState()?.enabled === true;
+			this.#session.setPlanModeState(
+				on ? undefined : { enabled: true, planFilePath: "local://PLAN.md", workflow: "parallel" },
+			);
+			this.#scheduleStateBroadcast();
+			peer.send({
+				t: "command-output",
+				text: on ? "Plan mode disabled." : "Plan mode enabled — draft local://PLAN.md before executing.",
+			});
+			return;
+		}
 		// Not handled by the text dispatcher. A KNOWN builtin here is TUI-only (no
 		// text handle) — surface that rather than send "/cmd" to the model.
 		if (lookupBuiltinSlashCommand(name)) {
@@ -590,6 +608,7 @@ export class SessionGateway {
 	#buildState(): CollabSessionState {
 		const session = this.#session;
 		const usage = session.getContextUsage();
+		const goal = session.getGoalModeState?.();
 		return {
 			isStreaming: session.isStreaming,
 			isAborting: session.isAborting,
@@ -602,6 +621,8 @@ export class SessionGateway {
 				? { tokens: usage.tokens, contextWindow: usage.contextWindow, percent: usage.percent }
 				: undefined,
 			participants: this.#participants(),
+			planMode: session.getPlanModeState?.()?.enabled === true,
+			goalMode: goal ? { status: goal.goal.status, objective: goal.goal.objective } : null,
 		};
 	}
 

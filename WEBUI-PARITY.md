@@ -58,15 +58,15 @@ Web plumbing: gateway `packages/coding-agent/src/webui/gateway.ts`; client
 ### Modes & autonomy
 | cmd | kind | web | notes / plan |
 |---|---|---|---|
-| `/plan` | TUI-only | ❌ | toggle plan mode — control op + indicator (alt+shift+p) |
+| `/plan` | TUI-only | ✅ | toggles plan mode (gateway sets PlanModeState, ACP-style) + mode bar |
 | `/plan-review` | TUI-only | ❌ | reopen latest plan review — overlay |
-| `/goal` | TUI-only | ❌ | `set/show/pause/resume/drop/budget` — control ops + goal banner |
+| `/goal` | TUI-only | 🟡 | goal status+objective shown in the mode bar; mutation (set/pause/resume) deferred (TUI controller has no clean API) |
 | `/guided-goal` | TUI-only | ❌ | goal interview — multi-step dialog; defer |
-| `/loop` | TUI-only | ❌ | toggle loop mode — control op + indicator |
-| `/btw` | TUI-only | ❌ | ephemeral side question — control op (prompt variant) |
-| `/tan` | TUI-only | ❌ | background tangential agent — control op |
+| `/loop` | TUI-only | ❌ | loop driven by the TUI run loop — needs a client-side loop; deferred |
+| `/btw` | TUI-only | ❌ | ephemeral side question — deferred (branch flow) |
+| `/tan` | TUI-only | ❌ | background tangential agent — deferred |
 | `/omfg` | TUI-only | ❌ | forge TTSR rule from complaint — dialog |
-| `/retry` | TUI-only | ❌ | retry last failed turn — control op (alt+r) |
+| `/retry` | TUI-only | ✅ | routed to session.retry() (also alt+r) |
 | `/force` | both | 🟡 | runs; needs tool arg (no selector yet) |
 
 ### Context & transcript
@@ -123,17 +123,17 @@ commands that today only echo text.
 |---|---|---|---|
 | `app.interrupt` | escape | ✅ | abort while streaming |
 | `app.thinking.cycle` | shift+tab | ✅ | cycle thinking |
-| `app.thinking.toggle` | ctrl+t | ❌ | toggle thinking on/off |
+| `app.thinking.toggle` | ctrl+t | ✅ | hides/shows thinking blocks |
 | `app.model.cycleForward` | ctrl+p | ✅ | next model |
-| `app.model.cycleBackward` | shift+ctrl+p | ❌ | prev model (needs gateway backward cycle) |
-| `app.model.select` | alt+m | ❌ | open model menu (see `/model`) |
-| `app.model.selectTemporary` | alt+p | ❌ | temporary model |
-| `app.tools.expand` | ctrl+o | ❌ | expand tool output |
-| `app.message.followUp` | ctrl+q / ctrl+enter | ❌ | send as follow-up (streamingBehavior) |
-| `app.retry` | alt+r | ❌ | retry last failed turn |
+| `app.model.cycleBackward` | shift+ctrl+p | ✅ | prev model |
+| `app.model.select` | alt+m | ✅ | opens the model picker |
+| `app.model.selectTemporary` | alt+p | ✅ | opens the model picker |
+| `app.tools.expand` | ctrl+o | ✅ | expand all tool output |
+| `app.message.followUp` | ctrl+q / ctrl+enter | ✅ | send as follow-up |
+| `app.retry` | alt+r | ✅ | retry last failed turn |
 | `app.message.dequeue` | alt+up | ❌ | dequeue queued message |
 | `app.agents.hub` | alt+a | 🟡 | agent drawer exists |
-| `app.plan.toggle` | alt+shift+p | ❌ | toggle plan mode |
+| `app.plan.toggle` | alt+shift+p | 🟡 | `/plan` toggles it; alt+shift+p chord not yet bound |
 | `app.history.search` | ctrl+r | ❌ | search input history |
 | `app.editor.external` | ctrl+g | ➖ | external editor (browser) |
 | `app.clipboard.*` | various | ➖/❌ | browser-native copy/paste mostly |
@@ -173,8 +173,8 @@ runtime option source (follow-up).
 
 ## Next up (priority order)
 
-1. Remaining shortcuts: ctrl+t, shift+ctrl+p, ctrl+o, alt+r, alt+up, follow-up.
-2. Mode toggles as control ops: `/plan`, `/loop`, `/goal`, `/retry`, `/btw`, `/tan`.
-3. Session overlays: `/resume`, `/tree`, `/branch`/`/fork`, `/new`/`/drop`.
-4. Richer surfaces: `/context` breakdown, `/todo` editor, `/dump`/`/export` browser copy/download, `/hotkeys` help.
+1. Session overlays: `/resume`, `/tree`, `/branch`/`/fork`, `/new`/`/drop`.
+2. Richer surfaces: `/context` breakdown, `/todo` editor, `/dump`/`/export` browser copy/download, `/hotkeys` help.
+3. Goal-mode mutation control ops (`/goal set/pause/resume/drop/budget`).
+4. `/loop` (client-side loop), `/btw`, `/tan`, `/guided-goal`, `/omfg` flows.
 5. Theme runtime options over the wire (settings panel gap).

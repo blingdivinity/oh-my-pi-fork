@@ -233,6 +233,10 @@ export interface SessionState {
 	contextUsage?: ContextUsage;
 	participants: Participant[];
 	isAborting?: boolean;
+	/** Plan mode active (agent drafts a plan before executing). */
+	planMode?: boolean;
+	/** Goal-mode objective + status, or null when inactive. */
+	goalMode?: { status: string; objective: string } | null;
 }
 
 export interface AgentSnapshot {

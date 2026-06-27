@@ -241,3 +241,22 @@
 .lc-setting-control input[type="text"] {
 	max-width: 240px;
 }
+
+.lc-modebar {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 6px;
+	padding: 4px 8px;
+}
+.lc-mode {
+	font-size: 12px;
+	padding: 1px 8px;
+	border-radius: 10px;
+	background: var(--tv-accent-soft, #2a3a55);
+}
+.lc-mode--goal {
+	max-width: 70ch;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
