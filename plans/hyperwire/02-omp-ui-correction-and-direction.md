@@ -24,9 +24,26 @@ files. Verified present, exactly as the plans described:
 | Wire identity gap | **Confirmed as the plans said**: `AgentEvent` carries no `agentId`; only `agent-cmd`/`fetch-transcript` frames do. `AgentSnapshot` has `parentId`. |
 
 Conclusion: the plan documents were verified carefully — against omp-ui. Doc 01's
-explorer sweeps ran on `main`. **All future verification and implementation must target
-`origin/omp-ui`.** (The planning branch currently bases on `main`; implementation
-branches should cut from `omp-ui`.)
+explorer sweeps ran on `main`.
+
+### Addendum (owner clarification, 2026-07-02): what omp-ui actually is
+
+- `omp-ui` = **upstream oh-my-pi at ~v16.1.23** (2026-06-26) **+ ~75 parity commits by
+  the owner** (2026-06-27) polishing the web UI toward TUI parity. The wire/webui/
+  collab/collab-web stack is **upstream infrastructure** (entered upstream ~v15.11.8),
+  actively developed upstream — not the owner's prototype. The owner's layer is the
+  parity work on top (slash-command parity, panels/modals, plus some durable backend
+  session-API contracts, e.g. "Batch-1 backend contract — todos in state, goal ops,
+  context breakdown").
+- This fork's `main` (15.11.5) is a stale snapshot from **before the webui existed** —
+  irrelevant as a base. `omp-ui` itself is behind current upstream and needs a refresh
+  before anything builds on it.
+- The owner is **not sure the parity direction is right for Hyperwire**. Assessment in
+  §3a below: it isn't the foundation, but parts of it are durable inputs.
+- Base strategy: refresh from latest upstream; treat wire/webui/gateway/tool-render as
+  **upstream library surface** (widen via upstreamable patches or additive wrapping,
+  never a hard fork); treat the parity commits as a separate concern (candidate for
+  upstreaming, not a Hyperwire dependency).
 
 ### What survives from doc 01 after re-verification
 
@@ -72,6 +89,30 @@ branches should cut from `omp-ui`.)
 3. **VCS work is core.** Commit-per-edit + multi-agent concurrency in the working tree
    are not a Phase-4 afterthought; they need first-class design (see §5).
 4. **Patterns vs code: undecided — under discussion** (see §4).
+
+## 3a. Is the omp-ui parity direction right for Hyperwire? (owner's open doubt)
+
+Short answer: **the parity webui is not the foundation, but it de-risked the foundation.**
+
+- The parity work's product shape is a *mirror of one TUI session in a browser*. Mission
+  control is a different product: forest-first, multi-session, attention-routed, with
+  conversation as one pane among many. Evolving the mirror into the cockpit drags along
+  parity obligations (every TUI slash flow) that a cockpit doesn't want, and couples
+  Hyperwire to a UI surface upstream actively churns.
+- What the parity exercise *proved and produced* that Hyperwire should keep:
+  1. The **wire/gateway substrate works** — typed frames, approvals, transcripts,
+     steering, agent-cmd over WS. Hyperwire consumes this, widened with origin ids.
+  2. The **backend session-API contracts** added during parity (todos-in-state, goal
+     ops, context breakdown, shared session APIs for /plan-review etc.) are exactly the
+     control surface a cockpit binds to — durable regardless of which UI renders it.
+  3. **tool-render/** per-tool renderers are reusable presentation components.
+  4. The **parity matrix** is a map of which TUI capabilities exist as remote-drivable
+     APIs vs TUI-only code paths — the exact gap list a cockpit hits later.
+- Recommended relationship: Hyperwire cockpit is a **new app** (Tauri shell + its own
+  React frontend) speaking a widened wire protocol, importing tool renderers and
+  session-API contracts as libraries. The parity webui stays what it is — an upstream
+  feature the owner improved — and its improvements become upstream PRs, not
+  Hyperwire carry-weight.
 
 ## 3. What mission-control-first does to the roadmap
 
