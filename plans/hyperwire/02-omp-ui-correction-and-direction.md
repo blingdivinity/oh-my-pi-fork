@@ -28,22 +28,28 @@ explorer sweeps ran on `main`.
 
 ### Addendum (owner clarification, 2026-07-02): what omp-ui actually is
 
-- `omp-ui` = **upstream oh-my-pi at ~v16.1.23** (2026-06-26) **+ ~75 parity commits by
-  the owner** (2026-06-27) polishing the web UI toward TUI parity. The wire/webui/
-  collab/collab-web stack is **upstream infrastructure** (entered upstream ~v15.11.8),
-  actively developed upstream — not the owner's prototype. The owner's layer is the
-  parity work on top (slash-command parity, panels/modals, plus some durable backend
-  session-API contracts, e.g. "Batch-1 backend contract — todos in state, goal ops,
-  context breakdown").
-- This fork's `main` (15.11.5) is a stale snapshot from **before the webui existed** —
-  irrelevant as a base. `omp-ui` itself is behind current upstream and needs a refresh
-  before anything builds on it.
+- `omp-ui` = **upstream oh-my-pi at ~v16.1.23** (2026-06-26) **+ 32 commits by the
+  owner** (2026-06-27). Precise ownership map (verified by authorship):
+  - **Upstream's** (actively developed): `packages/wire` (protocol), `src/collab/`
+    (E2E relay host/guest/crypto), `packages/collab-web` (guest SPA + `tool-render/`).
+    Upstream churned these by +1193/−210 lines in the 6 days after omp-ui's base.
+  - **The owner's** (every commit authored by them): the entire `src/webui/`
+    (SessionGateway, in-process web server, `omp --mode web`), collab-web's
+    `LocalClient`/local profile, and all TUI-parity features + the backend session-API
+    contracts added for them (todos-in-state, goal ops, context breakdown, shared
+    session APIs). **Upstream at 16.3.0 has no local web UI mode at all.**
+- Fork `main` has been synced to **upstream v16.3.0** (2026-07-02). Bringing omp-ui up
+  to date is easy: a trial `git merge-tree` of omp-ui into 16.3.0 conflicts in only
+  **3 files**, all build/packaging (`coding-agent/package.json`, `build-binary.ts`,
+  `ci-release-build-binaries.ts`); `wire/index.ts`, `agent.ts`, `main.ts`, `cli/args.ts`
+  auto-merge.
 - The owner is **not sure the parity direction is right for Hyperwire**. Assessment in
   §3a below: it isn't the foundation, but parts of it are durable inputs.
-- Base strategy: refresh from latest upstream; treat wire/webui/gateway/tool-render as
-  **upstream library surface** (widen via upstreamable patches or additive wrapping,
-  never a hard fork); treat the parity commits as a separate concern (candidate for
-  upstreaming, not a Hyperwire dependency).
+- Base strategy: build on synced `main` (16.3.0). Treat **wire/collab/collab-web** as
+  upstream library surface (widen via upstreamable patches or additive wrapping, never
+  a hard fork). The **webui/gateway is the owner's own asset** — free to reshape into
+  Hyperwire's control surface without upstream coupling; only its dependency on wire
+  frames is upstream-coupled.
 
 ### What survives from doc 01 after re-verification
 
