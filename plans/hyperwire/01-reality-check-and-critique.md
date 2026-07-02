@@ -1,5 +1,15 @@
 # Hyperwire — Codebase Reality Check & Plan Critique
 
+> ⚠️ **SUPERSEDED IN PART — read `02-omp-ui-correction-and-direction.md` first.**
+> This document was produced by exploring the **wrong base branch** (`main` =
+> upstream v15.11.5). The plans were verified against **`origin/omp-ui`**, where the
+> "phantom" cockpit stack, arktype, `canSpawnAtDepth`, the global provider semaphores,
+> the `advisor` kind, and `session-migrations.ts` all exist exactly as the plans claim.
+> Section 1 below is therefore mostly an artifact of the wrong base; the doc is kept
+> because Sections 2–3 (unused assets, design tensions) largely survive re-verification.
+> `02-…` records what survives, what's retracted, and the updated direction after the
+> owner's decisions (mission control, Tauri day one, VCS core).
+
 > Produced by a fresh, independent exploration of this checkout (fork of oh-my-pi at v15.11.5,
 > branch `claude/hyperwire-design-planning-k2bu05`). The three prior plan documents
 > (transformation plan, Houyhnhnm pass, dynamic-substrate mining) were treated as untrusted
