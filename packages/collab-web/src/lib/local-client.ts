@@ -583,6 +583,9 @@ export class LocalClient {
 			activeTools: this.#activeTools,
 			working: this.#working,
 			readOnly: this.#readOnly,
+			// Relay-guest `ask` dialogs (`ui-request` host frames) have no local
+			// surface; the local UI uses the richer ext-ui-request path instead.
+			uiRequest: null,
 			notices: this.#notices,
 			connected: this.#connected,
 			capabilities: this.#capabilities,

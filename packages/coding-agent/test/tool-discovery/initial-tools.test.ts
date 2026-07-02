@@ -8,6 +8,7 @@ import {
 	createTools,
 	DEFAULT_ESSENTIAL_TOOL_NAMES,
 	filterInitialToolsForDiscoveryAll,
+	GithubTool,
 	IrcTool,
 	JobTool,
 	SshTool,
@@ -47,6 +48,7 @@ async function getToolMetadata(): Promise<Map<string, { loadMode?: string; summa
 	const metadata = new Map(tools.map(tool => [tool.name, { loadMode: tool.loadMode, summary: tool.summary }]));
 	for (const tool of [
 		new AskTool({ ...toolSession, hasUI: true }),
+		new GithubTool(toolSession),
 		new SshTool(toolSession, [], new Map(), ""),
 		new JobTool(toolSession),
 		new IrcTool(toolSession),
@@ -148,7 +150,7 @@ describe("filterInitialToolsForDiscoveryAll", () => {
 		read: "essential",
 		edit: "essential",
 		todo: "discoverable",
-		search: "discoverable",
+		grep: "discoverable",
 	};
 	const base = {
 		loadModeOf: (name: string): BuiltinToolLoadMode | undefined => loadModes[name],

@@ -8,6 +8,7 @@ import { prompt, Snowflake } from "@oh-my-pi/pi-utils";
 import { type } from "arktype";
 import { resolveAgentModelPatterns } from "../config/model-resolver";
 import type { LocalProtocolOptions } from "../internal-urls";
+import { registerArtifactsDir } from "../internal-urls/registry-helpers";
 import { MCPManager } from "../mcp/manager";
 import subagentUserPromptTemplate from "../prompts/system/subagent-user-prompt.md" with { type: "text" };
 import { MAIN_AGENT_ID } from "../registry/agent-registry";
@@ -23,7 +24,8 @@ import {
 	runIsolatedSubprocess,
 } from "../task/isolation-runner";
 import { AgentOutputManager } from "../task/output-manager";
-import type { AgentDefinition, AgentProgress, SingleResult } from "../task/types";
+import { resolveSpawnPolicy } from "../task/spawn-policy";
+import { type AgentDefinition, type AgentProgress, canSpawnAtDepth, type SingleResult } from "../task/types";
 import { type NestedRepoPatch, parseIsolationMode } from "../task/worktree";
 import type { ToolSession } from "../tools";
 import { ToolError } from "../tools/tool-errors";
@@ -35,10 +37,13 @@ import "../tools/review";
 /** Synthetic bridge name reserved for the `agent()` helper across both runtimes. */
 export const EVAL_AGENT_BRIDGE_NAME = "__agent__";
 
-/** Hard recursion limit for eval-driven subagents. */
+/**
+ * Hard recursion ceiling for eval-driven subagents. The user setting
+ * `task.maxRecursionDepth` is honored on top of this — whichever is tighter
+ * wins, so a maintainer-friendly cap can't get raised by a user setting.
+ */
 export const EVAL_AGENT_MAX_DEPTH = 3;
 
-const DEFAULT_AGENT_TYPE = "task";
 const DEFAULT_AGENT_LABEL = "EvalAgent";
 
 const agentArgsSchema = type({
@@ -130,22 +135,26 @@ function parseAgentArgs(args: unknown): EvalAgentArgs {
 
 function assertDepthAllowed(session: ToolSession): void {
 	const taskDepth = session.taskDepth ?? 0;
-	if (taskDepth >= EVAL_AGENT_MAX_DEPTH) {
+	// Honor the user's `task.maxRecursionDepth` (mirroring the task tool's gate
+	// in tools/index.ts) but never above the hard ceiling. `< 0` means
+	// "Unlimited" in the same schema `canSpawnAtDepth` reads, so it falls back
+	// to the hard ceiling instead of going past it.
+	const settingMax = session.settings.get("task.maxRecursionDepth") ?? 2;
+	const effectiveMax = settingMax < 0 ? EVAL_AGENT_MAX_DEPTH : Math.min(settingMax, EVAL_AGENT_MAX_DEPTH);
+	if (!canSpawnAtDepth(effectiveMax, taskDepth)) {
 		throw new ToolError(
-			`agent() cannot spawn another agent at task depth ${taskDepth}; maximum depth is ${EVAL_AGENT_MAX_DEPTH}.`,
+			`agent() cannot spawn another agent at task depth ${taskDepth}; maximum depth is ${effectiveMax} (task.maxRecursionDepth=${settingMax}, hard ceiling=${EVAL_AGENT_MAX_DEPTH}).`,
 		);
 	}
 }
 
 function assertSpawnAllowed(session: ToolSession, agentName: string): void {
-	const parentSpawns = session.getSessionSpawns() ?? "*";
-	if (parentSpawns === "*") return;
-	if (parentSpawns === "") {
-		throw new ToolError(`Cannot spawn '${agentName}'. Allowed: none (spawns disabled for this agent)`);
+	const spawnPolicy = resolveSpawnPolicy(session.getSessionSpawns());
+	if (!spawnPolicy.enabled) {
+		throw new ToolError(`Cannot spawn '${agentName}'. Allowed: ${spawnPolicy.allowedErrorText}`);
 	}
-	const allowedSpawns = parentSpawns.split(",").map(spawn => spawn.trim());
-	if (!allowedSpawns.includes(agentName)) {
-		throw new ToolError(`Cannot spawn '${agentName}'. Allowed: ${parentSpawns}`);
+	if (spawnPolicy.allowedAgents !== null && !spawnPolicy.allowedAgents.includes(agentName)) {
+		throw new ToolError(`Cannot spawn '${agentName}'. Allowed: ${spawnPolicy.allowedErrorText}`);
 	}
 }
 
@@ -189,6 +198,7 @@ function getOutputManager(session: ToolSession): AgentOutputManager {
 interface ArtifactPaths {
 	sessionFile: string | null;
 	artifactsDir: string;
+	unregisterArtifactsDir?: () => void;
 	/**
 	 * True when `artifactsDir` was created off the session path (no session
 	 * file). Caller is then free to `rm -rf` it once all isolated patch
@@ -203,7 +213,8 @@ async function getArtifacts(session: ToolSession): Promise<ArtifactPaths> {
 	const tempArtifactsDir = sessionArtifactsDir === null;
 	const artifactsDir = sessionArtifactsDir ?? path.join(os.tmpdir(), `omp-eval-agent-${Snowflake.next()}`);
 	await fs.mkdir(artifactsDir, { recursive: true });
-	return { sessionFile, artifactsDir, tempArtifactsDir };
+	const unregisterArtifactsDir = tempArtifactsDir ? registerArtifactsDir(artifactsDir) : undefined;
+	return { sessionFile, artifactsDir, unregisterArtifactsDir, tempArtifactsDir };
 }
 
 /**
@@ -227,6 +238,10 @@ async function persistNestedPatches(
 		written.push(out);
 	}
 	return written;
+}
+
+function plainIsolationSummary(summary: string): string {
+	return summary.replace(/<\/?system-notification>/g, "").trim();
 }
 
 function emitProgressStatus(emitStatus: ((event: JsStatusEvent) => void) | undefined, progress: AgentProgress): void {
@@ -276,7 +291,7 @@ function buildSubagentFailureMessage(agentName: string, result: SingleResult): s
  */
 export async function runEvalAgent(args: unknown, options: EvalAgentBridgeOptions): Promise<EvalAgentResult> {
 	const parsed = parseAgentArgs(args);
-	const agentName = parsed.agent ?? DEFAULT_AGENT_TYPE;
+	const agentName = parsed.agent ?? resolveSpawnPolicy(options.session.getSessionSpawns()).defaultAgent;
 	const structured = Object.hasOwn(parsed, "schema");
 
 	assertNotPlanMode(options.session);
@@ -324,7 +339,7 @@ export async function runEvalAgent(args: unknown, options: EvalAgentBridgeOption
 	};
 	const parentArtifactManager = options.session.getArtifactManager?.() ?? undefined;
 	const mcpManager = options.session.mcpManager ?? MCPManager.instance();
-	const { sessionFile, artifactsDir, tempArtifactsDir } = await getArtifacts(options.session);
+	const { sessionFile, artifactsDir, unregisterArtifactsDir, tempArtifactsDir } = await getArtifacts(options.session);
 	const outputManager = getOutputManager(options.session);
 	const id = await outputManager.allocate(outputIdBase(parsed.label, agentName));
 	const assignment = parsed.prompt.trim();
@@ -363,7 +378,7 @@ export async function runEvalAgent(args: unknown, options: EvalAgentBridgeOption
 		modelOverride,
 		parentActiveModelPattern,
 		thinkingLevel: effectiveAgent.thinkingLevel,
-		outputSchema: structured ? parsed.schema : undefined,
+		...(structured ? { outputSchema: parsed.schema, outputSchemaOverridesAgent: true } : {}),
 		sessionFile,
 		persistArtifacts: Boolean(sessionFile),
 		artifactsDir,
@@ -398,8 +413,10 @@ export async function runEvalAgent(args: unknown, options: EvalAgentBridgeOption
 		parentMnemopiSessionState: options.session.getMnemopiSessionState?.(),
 		parentTelemetry: options.session.getTelemetry?.(),
 		parentAgentId: options.session.getAgentId?.() ?? MAIN_AGENT_ID,
-		// Live source of truth for `serviceTierSubagent: inherit` (null = explicit none).
-		parentServiceTier: options.session.getServiceTier ? (options.session.getServiceTier() ?? null) : undefined,
+		// Live source of truth for `tier.subagent: inherit` (null = explicit none).
+		parentServiceTier: options.session.getServiceTierByFamily
+			? (options.session.getServiceTierByFamily() ?? null)
+			: undefined,
 		// Deliberately omit parentEvalSessionId: the parent's Python kernel is
 		// blocked on this bridge call, so sharing the eval session would deadlock
 		// (subagent queues behind the parent's in-flight execution, parent waits
@@ -495,7 +512,7 @@ export async function runEvalAgent(args: unknown, options: EvalAgentBridgeOption
 					);
 				}
 
-				mergeSummary += await applyEligibleNestedPatches({
+				const nestedSummary = await applyEligibleNestedPatches({
 					result,
 					repoRoot: isolationContext.repoRoot,
 					mergeMode,
@@ -503,6 +520,20 @@ export async function runEvalAgent(args: unknown, options: EvalAgentBridgeOption
 					mergedBranchForNestedPatches: outcome.mergedBranchForNestedPatches,
 					commitMessage: buildCommitMessage(),
 				});
+				mergeSummary += nestedSummary;
+				if (structured && nestedSummary.trim()) {
+					const recoveryParts: string[] = [];
+					if (result.nestedPatches?.length) {
+						const nestedPaths = await persistNestedPatches(artifactsDir, result.id, result.nestedPatches);
+						recoveryParts.push(
+							`Captured nested repository patches (${result.nestedPatches.length}) preserved at: ${nestedPaths.join(", ")}.`,
+						);
+					}
+					const recoveryHint = recoveryParts.length > 0 ? ` ${recoveryParts.join(" ")}` : "";
+					throw new ToolError(
+						`agent() isolated nested patch apply failed for ${result.id}: ${plainIsolationSummary(nestedSummary)}${recoveryHint}`,
+					);
+				}
 			} else if (result.branchName) {
 				mergeSummary = `\n\nIsolation: changes captured on branch \`${result.branchName}\` (apply=false). Not merged.`;
 			} else if (result.patchPath) {
@@ -527,6 +558,7 @@ export async function runEvalAgent(args: unknown, options: EvalAgentBridgeOption
 		const shouldCleanupTempArtifacts = tempArtifactsDir && !parsed.handle && (!isIsolated || changesApplied === true);
 		if (shouldCleanupTempArtifacts) {
 			await fs.rm(artifactsDir, { recursive: true, force: true });
+			unregisterArtifactsDir?.();
 		}
 
 		options.session.recordEvalSubagentUsage?.(result.usage?.output ?? 0);

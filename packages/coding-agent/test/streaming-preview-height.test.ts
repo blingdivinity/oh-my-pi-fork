@@ -9,6 +9,7 @@ import { ToolExecutionComponent } from "@oh-my-pi/pi-coding-agent/modes/componen
 import { theme as activeTheme, initTheme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
 import { previewWindowRows } from "@oh-my-pi/pi-coding-agent/tools/render-utils";
 import { TUI, visibleWidth } from "@oh-my-pi/pi-tui";
+import { removeWithRetries } from "@oh-my-pi/pi-utils";
 import { VirtualTerminal } from "../../tui/test/virtual-terminal";
 
 // The streaming edit preview is a fixed-height tail window ("cursor"): the last
@@ -69,7 +70,7 @@ describe("streaming edit preview height (stable, full tail window)", () => {
 
 	afterEach(async () => {
 		resetSettingsForTest();
-		await fs.rm(tmpDir, { recursive: true, force: true });
+		await removeWithRetries(tmpDir);
 	});
 
 	// Char-by-char partials of the new function body.
@@ -400,6 +401,14 @@ describe("streaming tool call preview height (bounded across renderers)", () => 
 		}
 	}
 
+	function getRenderedLines(lines: readonly string[]): string[] {
+		return lines
+			.map(line => Bun.stripANSI(line).trim())
+			.filter(line => line.startsWith("│") && line.endsWith("│"))
+			.map(line => line.slice(1, -1).trim())
+			.filter(line => line !== "" && !line.includes("earlier lines"));
+	}
+
 	test("framed inline tool previews span the full tool width", () => {
 		const width = 80;
 		const { lines } = renderPending("bash", { command: "echo hi" });
@@ -432,11 +441,11 @@ describe("streaming tool call preview height (bounded across renderers)", () => 
 		for (const testCase of cases) {
 			const { lines, text } = renderPending(testCase.name, testCase.args);
 			expect(lines.length, `${testCase.name} preview should stay bounded`).toBeLessThan(window + 10);
-			for (const needle of [firstVisible, lastVisible]) {
-				expect(text, `${testCase.name} preview should keep ${needle}`).toContain(needle);
-			}
-			expect(text, `${testCase.name} preview should elide line-0`).not.toContain("line-0");
-			expect(text, `${testCase.name} preview should elide ${lastHidden}`).not.toContain(lastHidden);
+			const renderedLines = getRenderedLines(lines);
+			expect(renderedLines, `${testCase.name} preview should keep ${firstVisible}`).toContain(firstVisible);
+			expect(renderedLines, `${testCase.name} preview should keep ${lastVisible}`).toContain(lastVisible);
+			expect(renderedLines, `${testCase.name} preview should elide line-0`).not.toContain("line-0");
+			expect(renderedLines, `${testCase.name} preview should elide ${lastHidden}`).not.toContain(lastHidden);
 			expect(text, `${testCase.name} preview should advertise the elided head`).toContain(
 				`… ${hidden} earlier lines`,
 			);
@@ -459,10 +468,11 @@ describe("streaming tool call preview height (bounded across renderers)", () => 
 		});
 
 		expect(lines.length, "eval code preview should stay bounded").toBeLessThan(window + 10);
-		expect(text).toContain(`const line-${total - 1} = 1;`);
-		expect(text).toContain(`const line-${hidden} = 1;`);
-		expect(text).not.toContain("const line-0 = 1;");
-		expect(text).not.toContain(`const line-${hidden - 1} = 1;`);
+		const renderedLines = getRenderedLines(lines);
+		expect(renderedLines).toContain(`const line-${total - 1} = 1;`);
+		expect(renderedLines).toContain(`const line-${hidden} = 1;`);
+		expect(renderedLines).not.toContain("const line-0 = 1;");
+		expect(renderedLines).not.toContain(`const line-${hidden - 1} = 1;`);
 		expect(text).toContain(`… ${hidden} earlier lines`);
 	}, 30_000);
 });

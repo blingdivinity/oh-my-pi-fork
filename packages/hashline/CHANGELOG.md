@@ -1,11 +1,36 @@
 # Changelog
 
 ## [Unreleased]
+
+## [16.3.0] - 2026-07-02
+
+### Changed
+
+- Significantly improved performance on large files by optimizing stale-anchor remap validation.
+
+### Fixed
+
+- Fixed an issue where snapshot tag collisions could cause line-anchored edits to be incorrectly applied to unrelated content, improving recovery and edit-preview safety.
+- Fixed tracking of edit anchors when earlier in-session insertions or deletions shift unchanged target lines.
+- Fixed hashline edit guidance and parsing errors for Markdown list rows.
+
+## [16.2.8] - 2026-06-30
+
+### Fixed
+
+- Fixed hashline writes preserving UTF-8 BOM bytes when the host text decoder hides the leading `U+FEFF`. ([#3867](https://github.com/can1357/oh-my-pi/issues/3867))
+
+## [16.2.6] - 2026-06-29
+
+### Fixed
+
+- Fixed a parser error ("payload line has no preceding hunk header") caused by stray dots before the trailing colon in hunk headers, improving compatibility with GLM 5.2 outputs.
+
+## [16.2.0] - 2026-06-27
+
 ### Added
 
-- Added `REM` section op to delete files
-- Added `MV` section op to rename or move files, including snapshot history migration
-- Added whole-file `REM` and `MV DEST` section ops so a hashline patch can delete or rename/move files (optionally after line edits) without leaving the edit tool. `MV` relocates read/snapshot history to the destination path.
+- Added `REM` (remove) and `MV` (move/rename) section operations to hashline patches, allowing files to be deleted or relocated (with snapshot history migration) directly within the edit tool.
 
 ## [16.1.23] - 2026-06-26
 

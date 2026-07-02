@@ -42,7 +42,7 @@ import {
 } from "@agentclientprotocol/sdk";
 import type { AgentToolResult } from "@oh-my-pi/pi-agent-core";
 import type { AssistantMessage, Model } from "@oh-my-pi/pi-ai";
-import { isEnoent, logger, VERSION } from "@oh-my-pi/pi-utils";
+import { getBlobsDir, isEnoent, logger, VERSION } from "@oh-my-pi/pi-utils";
 import { disableProvider, enableProvider, reset as resetCapabilities } from "../../capability";
 import { Settings } from "../../config/settings";
 import { clearPluginRootsAndCaches, resolveActiveProjectRegistryPath } from "../../discovery/helpers";
@@ -53,7 +53,7 @@ import {
 } from "../../extensibility/extensions";
 import { runExtensionCompact } from "../../extensibility/extensions/compact-handler";
 import { getSessionSlashCommands } from "../../extensibility/extensions/get-commands-handler";
-import { buildSkillPromptMessage } from "../../extensibility/skills";
+import { buildSkillPromptMessage, parseSkillInvocation } from "../../extensibility/skills";
 import { loadSlashCommands } from "../../extensibility/slash-commands";
 import { resolveLocalUrlToPath } from "../../internal-urls";
 import { MCPManager } from "../../mcp/manager";
@@ -62,6 +62,7 @@ import { loadAllExtensions } from "../../modes/components/extensions/state-manag
 import { theme } from "../../modes/theme/theme";
 import { type PlanApprovalDetails, resolveApprovedPlan } from "../../plan-mode/approved-plan";
 import type { AgentSession, AgentSessionEvent } from "../../session/agent-session";
+import { BlobStore, resolveImageDataSync } from "../../session/blob-store";
 import { isSilentAbort, SKILL_PROMPT_MESSAGE_TYPE, USER_INTERRUPT_LABEL } from "../../session/messages";
 import type { UsageStatistics } from "../../session/session-entries";
 import type { SessionInfo as StoredSessionInfo } from "../../session/session-listing";
@@ -445,6 +446,7 @@ export class AcpAgent implements Agent {
 	#cleanupRegistered = false;
 	#clientCapabilities: ClientCapabilities | undefined;
 	#cancelCleanupTimeoutMs = ACP_CANCEL_CLEANUP_TIMEOUT_MS;
+	#blobs = new BlobStore(getBlobsDir());
 
 	constructor(connection: AgentSideConnection, createSession: CreateAcpSession, initialSession?: AgentSession) {
 		this.#connection = connection;
@@ -829,21 +831,18 @@ export class AcpAgent implements Agent {
 	}
 
 	async #tryRunSkillCommand(record: ManagedSessionRecord, text: string): Promise<boolean> {
-		if (!text.startsWith("/skill:")) {
-			return false;
-		}
 		if (!record.session.skillsSettings?.enableSkillCommands) {
 			return false;
 		}
-		const spaceIndex = text.indexOf(" ");
-		const commandName = spaceIndex === -1 ? text.slice(1) : text.slice(1, spaceIndex);
-		const args = spaceIndex === -1 ? "" : text.slice(spaceIndex + 1).trim();
-		const skillName = commandName.slice("skill:".length);
-		const skill = record.session.skills.find(candidate => candidate.name === skillName);
+		const parsed = parseSkillInvocation(text);
+		if (!parsed) {
+			return false;
+		}
+		const skill = record.session.skills.find(candidate => candidate.name === parsed.name);
 		if (!skill) {
 			return false;
 		}
-		const built = await buildSkillPromptMessage(skill, args);
+		const built = await buildSkillPromptMessage(skill, parsed.args, "user");
 		await record.session.promptCustomMessage({
 			customType: SKILL_PROMPT_MESSAGE_TYPE,
 			content: built.message,
@@ -1187,11 +1186,21 @@ export class AcpAgent implements Agent {
 		}
 
 		this.#prepareLiveAssistantMessage(record, event);
+		const imageDataCache = new Map<string, string>();
+		const resolveImageDataForAcp = (data: string, mimeType: string | undefined): string => {
+			const key = `${mimeType ?? ""}\u0000${data}`;
+			const cached = imageDataCache.get(key);
+			if (cached !== undefined) return cached;
+			const resolved = resolveImageDataSync(this.#blobs, data);
+			imageDataCache.set(key, resolved);
+			return resolved;
+		};
 		for (const notification of mapAgentSessionEventToAcpSessionUpdates(event, record.session.sessionId, {
 			getMessageId: message => this.#getLiveMessageId(record, message),
 			getMessageProgress: message => this.#getLiveMessageProgress(record, message),
 			getToolArgs: toolCallId => record.toolArgsById.get(toolCallId),
 			cwd: record.session.sessionManager.getCwd(),
+			resolveImageData: resolveImageDataForAcp,
 		})) {
 			await this.#connection.sessionUpdate(notification);
 		}
@@ -2002,7 +2011,7 @@ export class AcpAgent implements Agent {
 				}
 			}
 		}
-		if (notifications.length === 0 && message.errorMessage && !isSilentAbort(message.errorMessage)) {
+		if (notifications.length === 0 && message.errorMessage && !isSilentAbort(message)) {
 			notifications.push({
 				sessionId,
 				update: {
@@ -2052,6 +2061,7 @@ export class AcpAgent implements Agent {
 		const notifications = mapAgentSessionEventToAcpSessionUpdates(endEvent, sessionId, {
 			cwd,
 			getToolArgs: toolCallId => (toolCallId === message.toolCallId ? options.toolArgs : undefined),
+			resolveImageData: (data, _mimeType) => resolveImageDataSync(this.#blobs, data),
 		});
 		if (options.includeStart === false) {
 			return notifications;

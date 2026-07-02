@@ -2,7 +2,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import * as url from "node:url";
-import { isEnoent } from "@oh-my-pi/pi-utils";
+import { isEnoent, isEnotdir, stripWindowsExtendedLengthPathPrefix } from "@oh-my-pi/pi-utils";
 import type { Skill } from "../extensibility/skills";
 import { InternalUrlRouter, type LocalProtocolOptions } from "../internal-urls";
 import { ToolError } from "./tool-errors";
@@ -26,7 +26,11 @@ const INTERNAL_URL_SELECTOR_PART_RE = new RegExp(
 );
 // Schemes whose host grammar is identifier-shaped, so any trailing
 // `:<selector-chunk>` is unambiguously a read-tool selector. `mcp://` is
-// excluded because mcp resource URIs may legitimately contain colons.
+// excluded because mcp resource URIs may legitimately contain colons. `ssh://`
+// is included despite an optional `:port`; `splitInternalUrlSel` skips the peel
+// for an `ssh://host:port` that has no `/path`, so the port colon is never
+// mistaken for a selector (a real ssh selector trails the `/path`, e.g.
+// `ssh://h/f:1-5`).
 const INTERNAL_SCHEMES_WITH_SELECTORS: Record<string, true> = {
 	agent: true,
 	artifact: true,
@@ -37,6 +41,7 @@ const INTERNAL_SCHEMES_WITH_SELECTORS: Record<string, true> = {
 	pr: true,
 	rule: true,
 	skill: true,
+	ssh: true,
 	vault: true,
 };
 // Schemes whose resource URIs are server-defined and may legitimately end
@@ -55,6 +60,7 @@ const TOP_LEVEL_INTERNAL_URL_PREFIXES = [
 	"rule://",
 	"local://",
 	"mcp://",
+	"ssh://",
 	"vault://",
 ] as const;
 
@@ -141,7 +147,9 @@ export function expandTilde(filePath: string, home?: string): string {
 }
 
 export function expandPath(filePath: string): string {
-	const normalized = stripFileUrl(normalizeUnicodeSpaces(normalizeAtPrefix(filePath)));
+	const normalized = stripWindowsExtendedLengthPathPrefix(
+		stripFileUrl(normalizeUnicodeSpaces(normalizeAtPrefix(filePath))),
+	);
 	return expandTilde(normalized);
 }
 
@@ -337,6 +345,13 @@ export function splitInternalUrlSel(rawPath: string): { path: string; sel?: stri
 	if (!INTERNAL_SCHEMES_WITH_SELECTORS[scheme]) return { path: rawPath };
 
 	const schemeEnd = schemeMatch[0].length;
+	// ssh:// authority carries an optional `:port`; with no `/path` after the
+	// authority, a trailing `:NNNN` is the port, not a read selector
+	// (e.g. ssh://host:2222). Other schemes' authority-trailing selectors
+	// (artifact://5:1-50) still peel, so this guard is ssh-specific.
+	if (scheme === "ssh" && rawPath.indexOf("/", schemeEnd) === -1) {
+		return { path: rawPath };
+	}
 	let path = rawPath;
 	const chunks: string[] = [];
 	while (true) {
@@ -350,6 +365,27 @@ export function splitInternalUrlSel(rawPath: string): { path: string; sel?: stri
 	}
 	if (chunks.length === 0) return { path: rawPath };
 	return { path, sel: chunks.join(":") };
+}
+
+/**
+ * Peel a read-tool selector off an internal-URL write target so `write` resolves
+ * the same file `read` does (e.g. `ssh://h/f:raw` -> `ssh://h/f`). Only the
+ * whole-file display modes `raw`/`conflicts` are accepted (they do not change
+ * which bytes are written); any other selector-shaped tail `splitInternalUrlSel`
+ * peels — a line range, a compound like `raw:1-20`, or a malformed `:-N` — throws,
+ * because `write` addresses a whole file, not a partial range, and silently
+ * stripping it would write to a path the caller never named. Non-URL paths and
+ * URLs without a selector pass through unchanged.
+ */
+export function peelWriteUrlSelector(rawPath: string): string {
+	const { path, sel } = splitInternalUrlSel(rawPath);
+	if (sel === undefined) return rawPath;
+	// Case-insensitive to match read's selector grammar (parseSel + the /i regexes above).
+	if (/^(?:raw|conflicts)$/i.test(sel)) return path;
+	throw new ToolError(
+		`write does not accept the trailing selector ":${sel}" — it writes a whole file. ` +
+			`Remove ":${sel}", or if the filename truly ends with it, percent-encode the ":" as %3A.`,
+	);
 }
 
 function assertNotInternalUrl(expanded: string, original: string): void {
@@ -373,6 +409,40 @@ export function isInternalUrlPath(filePath: string): boolean {
 		if (expandedAndNormalized.startsWith(prefix)) return true;
 	}
 	return false;
+}
+
+/**
+ * True when a tool path argument references the `ssh://` scheme anywhere.
+ *
+ * Substring (not anchored) on purpose: it feeds the read/search/write approval
+ * tier, which runs synchronously on the raw args. `search` only flattens a
+ * delimited `paths: "a,ssh://h/x"` into separate entries *after* approval, so an
+ * anchored check would let an embedded `ssh://` slip through at the read tier.
+ * Matching the literal `ssh://` substring also tracks exactly what routes to the
+ * SSH handler; over-matching only over-prompts (fail-closed).
+ */
+export function pathTargetsSsh(path: string): boolean {
+	return /ssh:\/\//i.test(path);
+}
+
+/**
+ * True when a path is specifically an `ssh://` URL (anchored scheme match).
+ * Unlike {@link pathTargetsSsh} (substring, for the pre-expansion approval
+ * scan), this is the exact per-entry check used to reject `ssh://` *before* a
+ * side-effecting `InternalUrlRouter.resolve` in tools that need a local file.
+ */
+export function isSshUrl(path: string): boolean {
+	return /^ssh:\/\//i.test(path.trim());
+}
+
+/**
+ * True when the read tool's URL parser (`parseReadUrlTarget` in fetch.ts) would
+ * recognize this path as a readable external URL: a strict `http(s)://`, a
+ * collapsed `http(s):/host` (Node path normalization folds `//` → `/`), or a
+ * scheme-less `www.` spelling. Keep in sync with `parseReadUrlTarget`.
+ */
+export function isReadableUrlPath(value: string): boolean {
+	return /^https?:\/\/?/i.test(value) || /^www\./i.test(value);
 }
 
 /**
@@ -966,6 +1036,14 @@ export function resolveReadPath(filePath: string, cwd: string): string {
 // Tool-scope resolution (search/ast tools)
 // =============================================================================
 
+/** Local file materialized from a readable external URL for shared tool-scope resolution. */
+export interface ResolvedExternalSearchUrl {
+	/** Absolute or cwd-relative file path to search. */
+	sourcePath: string;
+	/** True when the materialized file must not mint editable anchors. */
+	immutable?: boolean;
+}
+
 export interface ToolScopeOptions {
 	rawPaths: string[];
 	cwd: string;
@@ -989,6 +1067,8 @@ export interface ToolScopeOptions {
 	localProtocolOptions?: LocalProtocolOptions;
 	/** Calling session's loaded skills — lets skill:// resolve without process-global state. */
 	skills?: readonly Skill[];
+	/** Materialize readable external URLs to local text files before scope derivation. */
+	resolveExternalUrl?: (rawPath: string) => Promise<ResolvedExternalSearchUrl | undefined>;
 }
 
 export interface ToolScopeResolution {
@@ -1020,22 +1100,52 @@ export async function resolveToolSearchScope(opts: ToolScopeOptions): Promise<To
 	if (rawPaths.some(rawPath => rawPath.length === 0)) {
 		throw new ToolError("`paths` must contain non-empty paths or globs");
 	}
-	// External (http/https/ftp/file) URLs are not searchable; route the caller
-	// to `read` instead of letting the path-resolver surface a confusing
-	// "Path not found" for a slash-stripped URL.
-	const externalUrl = rawPaths.find(rawPath => /^(?:https?|ftp|file|ws|wss):\/\//i.test(rawPath));
-	if (externalUrl) {
-		throw new ToolError(
-			`Cannot ${internalUrlAction} external URL: ${externalUrl}. Use \`read\` to fetch web content, then search the returned text.`,
-		);
-	}
+	// Strict external-URL schemes. `file://` is intentionally absent: it has
+	// local-path semantics (expandPath strips it downstream), so it flows through
+	// the ordinary filesystem pipeline instead of the external-URL resolver.
+	const strictExternalUrlRe = /^(?:https?|ftp|ws|wss):\/\//i;
 	const internalRouter = InternalUrlRouter.instance();
 	const resolvedPathInputs: string[] = [];
 	const immutableSourcePaths = new Set<string>();
 	for (const rawPath of rawPaths) {
+		let externalUrl = strictExternalUrlRe.test(rawPath);
+		if (!externalUrl && isReadableUrlPath(rawPath) && !hasGlobPathChars(rawPath)) {
+			// Fuzzy spelling the read parser accepts (`www.host/…`, collapsed
+			// `https:/host/…`). An existing local path wins over URL
+			// interpretation so a directory literally named `www.foo` stays
+			// searchable; only a definitive ENOENT/ENOTDIR flips to URL handling
+			// (any other stat error means the path exists — let the local
+			// pipeline surface it).
+			try {
+				await fs.promises.stat(resolveToCwd(rawPath, cwd));
+			} catch (err) {
+				externalUrl = isEnoent(err) || isEnotdir(err);
+			}
+		}
+		if (externalUrl) {
+			const resolved = opts.resolveExternalUrl ? await opts.resolveExternalUrl(rawPath) : undefined;
+			if (resolved) {
+				resolvedPathInputs.push(resolved.sourcePath);
+				if (opts.trackImmutableSources && resolved.immutable) {
+					immutableSourcePaths.add(path.resolve(resolved.sourcePath));
+				}
+				continue;
+			}
+			// Resolver missing or declined (e.g. ftp/ws/wss): fail explicitly
+			// instead of letting the local-path fallthrough surface a confusing
+			// "Path not found" for a URL-shaped input.
+			throw new ToolError(
+				`Cannot ${internalUrlAction} external URL: ${rawPath}. Use \`read\` to fetch web content, then search the returned text.`,
+			);
+		}
 		if (!internalRouter.canHandle(rawPath)) {
 			resolvedPathInputs.push(rawPath);
 			continue;
+		}
+		if (isSshUrl(rawPath)) {
+			throw new ToolError(
+				`Cannot ${internalUrlAction} a remote ssh:// path (no local file): ${rawPath}. Use \`read ${rawPath}\` to view it, or the \`search\` tool to grep remote files.`,
+			);
 		}
 		if (hasGlobPathChars(rawPath)) {
 			throw new ToolError(`Glob patterns are not supported for internal URLs: ${rawPath}`);

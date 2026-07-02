@@ -6,15 +6,20 @@
  * discovery lives in pi-catalog's provider-models.
  */
 import { type ApiKey, type FetchImpl, withAuth } from "@oh-my-pi/pi-ai";
-import type { Api, Model } from "@oh-my-pi/pi-ai/types";
+import type { Api, Model, RemoteCompactionConfig } from "@oh-my-pi/pi-ai/types";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import {
 	getBundledModelReferenceIndex,
 	resolveModelReference,
 	stripBracketedModelIdAffixes,
 } from "@oh-my-pi/pi-catalog/identity";
-import { fetchLmStudioNativeModelMetadata } from "@oh-my-pi/pi-catalog/provider-models/openai-compat";
-import type { ModelSpec } from "@oh-my-pi/pi-catalog/types";
+import {
+	fetchLiteLLMRichModels,
+	fetchLmStudioNativeModelMetadata,
+	OPENAI_COMPAT_DISCOVERY_DEFAULT_CONTEXT_WINDOW,
+	OPENAI_COMPAT_DISCOVERY_DEFAULT_MAX_TOKENS,
+} from "@oh-my-pi/pi-catalog/provider-models/openai-compat";
+import type { ModelSpec, OpenAICompat } from "@oh-my-pi/pi-catalog/types";
 import { isRecord } from "@oh-my-pi/pi-utils";
 import type { ProviderDiscovery } from "./models-config-schema";
 
@@ -27,7 +32,33 @@ import type { ProviderDiscovery } from "./models-config-schema";
 // mid-stream when models hit the cap on legitimate large tool calls (see
 // issue #1528: `write` payloads >~5KB on deepseek-v4-pro surfaced as
 // "socket connection was closed unexpectedly").
-export const DISCOVERY_DEFAULT_MAX_TOKENS = 32_768;
+export const DISCOVERY_DEFAULT_CONTEXT_WINDOW = OPENAI_COMPAT_DISCOVERY_DEFAULT_CONTEXT_WINDOW;
+export const DISCOVERY_DEFAULT_MAX_TOKENS = OPENAI_COMPAT_DISCOVERY_DEFAULT_MAX_TOKENS;
+
+/**
+ * Run `fn` with an abort signal that fires after `timeoutMs`, clearing the
+ * backing timer the instant the operation settles.
+ *
+ * Unlike the built-in abort-signal timeout API, the timer never outlives the
+ * request: on the success path it is cancelled before `fn` resolves, so the
+ * signal is never aborted and no pending callback lingers on the heap. A leaked
+ * abort-signal timeout (e.g. discovery against a mocked fetch that resolves
+ * instantly) fires seconds later and sets its abort `reason` — which crashed
+ * Bun's concurrent GC while it marked the signal's wrapped reason during an
+ * unrelated allocation (`JSAbortSignal::visitAdditionalChildren`).
+ */
+async function withTimeoutSignal<T>(timeoutMs: number, fn: (signal: AbortSignal) => Promise<T>): Promise<T> {
+	const controller = new AbortController();
+	const timer = setTimeout(
+		() => controller.abort(new DOMException("The operation timed out.", "TimeoutError")),
+		timeoutMs,
+	);
+	try {
+		return await fn(controller.signal);
+	} finally {
+		clearTimeout(timer);
+	}
+}
 
 const DEFAULT_OLLAMA_BASE_URL = "http://127.0.0.1:11434";
 const OLLAMA_HOST_DEFAULT_PORT = "11434";
@@ -89,6 +120,7 @@ export interface DiscoveryProviderConfig {
 	baseUrl?: string;
 	headers?: Record<string, string>;
 	compat?: ModelSpec<Api>["compat"];
+	remoteCompaction?: RemoteCompactionConfig<Api>;
 	discovery: ProviderDiscovery;
 	optional?: boolean;
 }
@@ -115,11 +147,27 @@ type OllamaDiscoveredModelMetadata = {
 type LlamaCppDiscoveredServerMetadata = {
 	contextWindow?: number;
 	input?: ("text" | "image")[];
+	maxTokens?: "contextWindow";
+};
+
+type LlamaCppDiscoveredModelRuntimeMetadata = {
+	contextWindow: number;
+	maxTokens: number;
 };
 
 type LlamaCppModelListEntry = {
 	id: string;
-	contextWindow?: number;
+	runtimeContextWindow?: number;
+	/**
+	 * `--ctx-size` extracted from the entry's `status.args` (rendered CLI arg
+	 * vector) or `status.preset` INI. Populated for llama-server router-mode
+	 * presets so unloaded models surface the user's configured window instead
+	 * of falling through to the 128K default — the router-level `/props`
+	 * reports a dummy `n_ctx: 0` and `meta.n_ctx` is only merged in after a
+	 * child instance loads (issue #4190).
+	 */
+	configuredContextWindow?: number;
+	trainingContextWindow?: number;
 };
 
 function toPositiveNumberOrUndefined(value: unknown): number | undefined {
@@ -135,7 +183,59 @@ function toPositiveNumberOrUndefined(value: unknown): number | undefined {
 	return undefined;
 }
 
+function isLlamaCppUnlimitedSentinel(value: unknown): boolean {
+	if (typeof value === "number") {
+		return value === -1;
+	}
+	if (typeof value === "string" && value.trim()) {
+		return Number(value) === -1;
+	}
+	return false;
+}
+
+/**
+ * llama.cpp `/props.default_generation_settings.params.{max_tokens,n_predict}`
+ * are per-request defaults the server applies when a client omits the field —
+ * clients can still raise them per call. Positive values therefore are NOT
+ * hard model caps; only the `-1` unlimited sentinel reliably tells us the
+ * server bounds generation by the runtime context window. Anything else
+ * leaves the discovery default in place.
+ */
+function extractLlamaCppMaxTokens(payload: Record<string, unknown>): "contextWindow" | undefined {
+	const generationSettings = payload.default_generation_settings;
+	const params = isRecord(generationSettings) ? generationSettings.params : undefined;
+	const candidates = [
+		isRecord(params) ? params.max_tokens : undefined,
+		isRecord(params) ? params.n_predict : undefined,
+		isRecord(generationSettings) ? generationSettings.max_tokens : undefined,
+		isRecord(generationSettings) ? generationSettings.n_predict : undefined,
+		payload.max_tokens,
+		payload.n_predict,
+	];
+	return candidates.some(isLlamaCppUnlimitedSentinel) ? "contextWindow" : undefined;
+}
+
+function resolveLlamaCppMaxTokens(contextWindow: number, maxTokens: "contextWindow" | undefined): number {
+	return maxTokens === "contextWindow"
+		? contextWindow
+		: Math.min(contextWindow, maxTokens ?? DISCOVERY_DEFAULT_MAX_TOKENS);
+}
+
+function extractOllamaRuntimeContextWindow(payload: Record<string, unknown>): number | undefined {
+	const parameters = payload.parameters;
+	if (typeof parameters !== "string") {
+		return undefined;
+	}
+	const match = parameters.match(/(?:^|\n)\s*num_ctx\s+(\d+)\s*(?:$|\n)/m);
+	return match ? toPositiveNumberOrUndefined(match[1]) : undefined;
+}
+
 function extractOllamaContextWindow(payload: Record<string, unknown>): number | undefined {
+	const runtimeContextWindow = extractOllamaRuntimeContextWindow(payload);
+	if (runtimeContextWindow !== undefined) {
+		return runtimeContextWindow;
+	}
+
 	const modelInfo = payload.model_info;
 	if (isRecord(modelInfo)) {
 		for (const [key, value] of Object.entries(modelInfo)) {
@@ -148,12 +248,7 @@ function extractOllamaContextWindow(payload: Record<string, unknown>): number | 
 		}
 	}
 
-	const parameters = payload.parameters;
-	if (typeof parameters !== "string") {
-		return undefined;
-	}
-	const match = parameters.match(/(?:^|\n)\s*num_ctx\s+(\d+)\s*(?:$|\n)/m);
-	return match ? toPositiveNumberOrUndefined(match[1]) : undefined;
+	return undefined;
 }
 
 function extractLlamaCppContextWindow(payload: Record<string, unknown>): number | undefined {
@@ -167,12 +262,17 @@ function extractLlamaCppContextWindow(payload: Record<string, unknown>): number 
 	return toPositiveNumberOrUndefined(payload.n_ctx);
 }
 
-function extractLlamaCppModelContextWindow(item: Record<string, unknown>): number | undefined {
+function extractLlamaCppModelContextWindows(
+	item: Record<string, unknown>,
+): Pick<LlamaCppModelListEntry, "runtimeContextWindow" | "trainingContextWindow"> {
 	const meta = item.meta;
 	if (!isRecord(meta)) {
-		return undefined;
+		return {};
 	}
-	return toPositiveNumberOrUndefined(meta.n_ctx) ?? toPositiveNumberOrUndefined(meta.n_ctx_train);
+	return {
+		runtimeContextWindow: toPositiveNumberOrUndefined(meta.n_ctx),
+		trainingContextWindow: toPositiveNumberOrUndefined(meta.n_ctx_train),
+	};
 }
 
 function parseLlamaCppModelList(payload: unknown): LlamaCppModelListEntry[] {
@@ -183,8 +283,58 @@ function parseLlamaCppModelList(payload: unknown): LlamaCppModelListEntry[] {
 		if (!isRecord(item) || typeof item.id !== "string" || !item.id) {
 			return [];
 		}
-		return [{ id: item.id, contextWindow: extractLlamaCppModelContextWindow(item) }];
+		return [
+			{
+				id: item.id,
+				...extractLlamaCppModelContextWindows(item),
+				configuredContextWindow: extractLlamaCppConfiguredContextWindow(item),
+			},
+		];
 	});
+}
+
+// llama-server's `to_args()` renders the long form `--ctx-size` (never `-c`),
+// but tolerate the short form and the embedded `--flag=value` shape so a
+// hand-rolled forwarder cannot silently downgrade the discovered window.
+const LLAMA_CPP_CTX_SIZE_FLAGS = new Set(["--ctx-size", "-c"]);
+
+function extractLlamaCppCtxSizeFromArgs(value: unknown): number | undefined {
+	if (!Array.isArray(value)) {
+		return undefined;
+	}
+	for (let i = 0; i < value.length; i++) {
+		const raw = value[i];
+		if (typeof raw !== "string") continue;
+		const eq = raw.indexOf("=");
+		const flag = eq >= 0 ? raw.slice(0, eq) : raw;
+		if (!LLAMA_CPP_CTX_SIZE_FLAGS.has(flag)) continue;
+		const rawValue = eq >= 0 ? raw.slice(eq + 1) : value[i + 1];
+		const parsed = toPositiveNumberOrUndefined(rawValue);
+		if (parsed !== undefined) return parsed;
+	}
+	return undefined;
+}
+
+// `common_preset::to_ini()` emits one option per line as `<long-arg-without-dashes> = <value>`,
+// so `ctx-size = 8192` is the exact wire form (issue #4190).
+function extractLlamaCppCtxSizeFromIni(value: unknown): number | undefined {
+	if (typeof value !== "string") {
+		return undefined;
+	}
+	const match = value.match(/(?:^|\n)\s*ctx-size\s*=\s*(-?\d+)\s*(?:$|\n)/);
+	return match ? toPositiveNumberOrUndefined(match[1]) : undefined;
+}
+
+function extractLlamaCppConfiguredContextWindow(item: Record<string, unknown>): number | undefined {
+	const status = item.status;
+	if (!isRecord(status)) {
+		return undefined;
+	}
+	const fromArgs = extractLlamaCppCtxSizeFromArgs(status.args);
+	if (fromArgs !== undefined) {
+		return fromArgs;
+	}
+	return extractLlamaCppCtxSizeFromIni(status.preset);
 }
 
 function extractLlamaCppInputCapabilities(payload: Record<string, unknown>): ("text" | "image")[] | undefined {
@@ -209,6 +359,8 @@ export function discoverModelsByProviderType(
 			return discoverOpenAIModelsList(providerConfig, ctx);
 		case "proxy":
 			return discoverProxyModels(providerConfig, ctx);
+		case "litellm":
+			return discoverLiteLLMModels(providerConfig, ctx);
 	}
 }
 
@@ -220,16 +372,18 @@ async function discoverOllamaModelMetadata(
 ): Promise<OllamaDiscoveredModelMetadata | null> {
 	const showUrl = `${endpoint}/api/show`;
 	try {
-		const response = await ctx.fetch(showUrl, {
-			method: "POST",
-			headers: { ...(headers ?? {}), "Content-Type": "application/json" },
-			body: JSON.stringify({ model: modelId }),
-			signal: AbortSignal.timeout(150),
+		const payload = await withTimeoutSignal(150, async signal => {
+			const response = await ctx.fetch(showUrl, {
+				method: "POST",
+				headers: { ...(headers ?? {}), "Content-Type": "application/json" },
+				body: JSON.stringify({ model: modelId }),
+				signal,
+			});
+			if (!response.ok) {
+				return null;
+			}
+			return (await response.json()) as unknown;
 		});
-		if (!response.ok) {
-			return null;
-		}
-		const payload = (await response.json()) as unknown;
 		if (!isRecord(payload)) {
 			return null;
 		}
@@ -271,14 +425,16 @@ export async function discoverOllamaModels(
 	const endpoint = normalizeOllamaBaseUrl(providerConfig.baseUrl);
 	const tagsUrl = `${endpoint}/api/tags`;
 	const headers = { ...(providerConfig.headers ?? {}) };
-	const response = await ctx.fetch(tagsUrl, {
-		headers,
-		signal: AbortSignal.timeout(250),
+	const payload = await withTimeoutSignal(250, async signal => {
+		const response = await ctx.fetch(tagsUrl, {
+			headers,
+			signal,
+		});
+		if (!response.ok) {
+			throw new Error(`HTTP ${response.status} from ${tagsUrl}`);
+		}
+		return (await response.json()) as { models?: Array<{ name?: string; model?: string }> };
 	});
-	if (!response.ok) {
-		throw new Error(`HTTP ${response.status} from ${tagsUrl}`);
-	}
-	const payload = (await response.json()) as { models?: Array<{ name?: string; model?: string }> };
 	const entries = (payload.models ?? []).flatMap(item => {
 		const id = item.model || item.name;
 		return id ? [{ id, name: item.name || id }] : [];
@@ -302,7 +458,7 @@ export async function discoverOllamaModels(
 			input: metadata?.input ?? ["text"],
 			imageInputDecoder: "stb",
 			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-			contextWindow: metadata?.contextWindow ?? 128000,
+			contextWindow: metadata?.contextWindow ?? DISCOVERY_DEFAULT_CONTEXT_WINDOW,
 			maxTokens: Math.min(metadata?.contextWindow ?? Number.POSITIVE_INFINITY, DISCOVERY_DEFAULT_MAX_TOKENS),
 			headers: providerConfig.headers,
 		} as ModelSpec<Api>);
@@ -316,19 +472,22 @@ async function discoverLlamaCppServerMetadata(
 ): Promise<LlamaCppDiscoveredServerMetadata | null> {
 	const propsUrl = `${toLlamaCppNativeBaseUrl(baseUrl)}/props`;
 	try {
-		const response = await ctx.fetch(propsUrl, {
-			headers,
-			signal: AbortSignal.timeout(150),
+		const payload = await withTimeoutSignal(150, async signal => {
+			const response = await ctx.fetch(propsUrl, {
+				headers,
+				signal,
+			});
+			if (!response.ok) {
+				return null;
+			}
+			return (await response.json()) as unknown;
 		});
-		if (!response.ok) {
-			return null;
-		}
-		const payload = (await response.json()) as unknown;
 		if (!isRecord(payload)) {
 			return null;
 		}
 		return {
 			contextWindow: extractLlamaCppContextWindow(payload),
+			maxTokens: extractLlamaCppMaxTokens(payload),
 			input: extractLlamaCppInputCapabilities(payload),
 		};
 	} catch {
@@ -346,30 +505,37 @@ export async function discoverLlamaCppModels(
 	const baseHeaders: Record<string, string> = { ...(providerConfig.headers ?? {}) };
 	let headers = baseHeaders;
 	const attempt = async (h: Record<string, string>) => {
-		const [response, metadata] = await Promise.all([
-			ctx.fetch(modelsUrl, {
-				headers: h,
-				signal: AbortSignal.timeout(250),
+		const [payload, metadata] = await Promise.all([
+			withTimeoutSignal(250, async signal => {
+				const response = await ctx.fetch(modelsUrl, {
+					headers: h,
+					signal,
+				});
+				if (!response.ok) {
+					throw new Error(`HTTP ${response.status} from ${modelsUrl}`);
+				}
+				headers = h;
+				return (await response.json()) as unknown;
 			}),
 			discoverLlamaCppServerMetadata(ctx, baseUrl, h),
 		]);
-		if (!response.ok) {
-			throw new Error(`HTTP ${response.status} from ${modelsUrl}`);
-		}
-		headers = h;
-		return [response, metadata] as const;
+		return [payload, metadata] as const;
 	};
 	const apiKey = await ctx.getBearerApiKeyResolver(providerConfig.provider);
-	const [response, serverMetadata] = apiKey
+	const [payload, serverMetadata] = apiKey
 		? await withAuth(apiKey, key => attempt({ ...baseHeaders, Authorization: `Bearer ${key}` }))
 		: await attempt(baseHeaders);
-	const payload = (await response.json()) as unknown;
 	const models = parseLlamaCppModelList(payload);
 	const discovered: Model<Api>[] = [];
 	for (const item of models) {
 		const { id } = item;
 		if (!id) continue;
-		const contextWindow = item.contextWindow ?? serverMetadata?.contextWindow ?? 128000;
+		const contextWindow =
+			item.runtimeContextWindow ??
+			item.configuredContextWindow ??
+			serverMetadata?.contextWindow ??
+			item.trainingContextWindow ??
+			DISCOVERY_DEFAULT_CONTEXT_WINDOW;
 		discovered.push(
 			buildModel({
 				id,
@@ -382,7 +548,7 @@ export async function discoverLlamaCppModels(
 				imageInputDecoder: "stb",
 				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 				contextWindow,
-				maxTokens: Math.min(contextWindow, DISCOVERY_DEFAULT_MAX_TOKENS),
+				maxTokens: resolveLlamaCppMaxTokens(contextWindow, serverMetadata?.maxTokens),
 				headers,
 				compat: {
 					supportsStore: false,
@@ -395,23 +561,46 @@ export async function discoverLlamaCppModels(
 	return discovered;
 }
 
-export async function discoverLlamaCppModelContextWindow(
+export async function discoverLlamaCppModelRuntimeMetadata(
 	model: Pick<Model<Api>, "provider" | "id" | "baseUrl" | "headers">,
 	ctx: DiscoveryContext,
-): Promise<number | undefined> {
+): Promise<LlamaCppDiscoveredModelRuntimeMetadata | undefined> {
 	const baseUrl = normalizeLlamaCppBaseUrl(model.baseUrl);
 	const modelsUrl = `${baseUrl}/models`;
 	const baseHeaders: Record<string, string> = { ...(model.headers ?? {}) };
 	const attempt = async (headers: Record<string, string>) => {
-		const response = await ctx.fetch(modelsUrl, {
-			headers,
-			signal: AbortSignal.timeout(250),
-		});
-		if (!response.ok) {
+		const [entries, serverMetadata] = await Promise.all([
+			withTimeoutSignal(250, async signal => {
+				const response = await ctx.fetch(modelsUrl, {
+					headers,
+					signal,
+				});
+				if (!response.ok) {
+					return undefined;
+				}
+				return parseLlamaCppModelList(await response.json());
+			}),
+			discoverLlamaCppServerMetadata(ctx, baseUrl, headers),
+		]);
+		if (!entries) {
 			return undefined;
 		}
-		const entries = parseLlamaCppModelList(await response.json());
-		return entries.find(entry => entry.id === model.id)?.contextWindow;
+		const entry = entries.find(entry => entry.id === model.id);
+		if (!entry) {
+			return undefined;
+		}
+		const contextWindow =
+			entry.runtimeContextWindow ??
+			entry.configuredContextWindow ??
+			serverMetadata?.contextWindow ??
+			entry.trainingContextWindow;
+		if (contextWindow === undefined) {
+			return undefined;
+		}
+		return {
+			contextWindow,
+			maxTokens: resolveLlamaCppMaxTokens(contextWindow, serverMetadata?.maxTokens),
+		};
 	};
 	try {
 		const apiKey = await ctx.getBearerApiKeyResolver(model.provider);
@@ -437,60 +626,143 @@ export async function discoverOpenAIModelsList(
 			providerConfig.discovery.type === "lm-studio"
 				? fetchLmStudioNativeModelMetadata(baseUrl, ctx.fetch, { headers: h })
 				: Promise.resolve(null);
-		const [res, nativeMetadata] = await Promise.all([
-			ctx.fetch(modelsUrl, {
-				headers: h,
-				signal: AbortSignal.timeout(10_000),
+		const [payload, nativeMetadata] = await Promise.all([
+			withTimeoutSignal(10_000, async signal => {
+				const res = await ctx.fetch(modelsUrl, {
+					headers: h,
+					signal,
+				});
+				if (!res.ok) {
+					throw new Error(`HTTP ${res.status} from ${modelsUrl}`);
+				}
+				headers = h;
+				return (await res.json()) as {
+					data?: Array<{ id?: string; max_model_len?: unknown; context_length?: unknown }>;
+				};
 			}),
 			nativeMetadataPromise,
 		]);
-		if (!res.ok) {
-			throw new Error(`HTTP ${res.status} from ${modelsUrl}`);
-		}
-		headers = h;
-		return [res, nativeMetadata] as const;
+		return [payload, nativeMetadata] as const;
 	};
 	const apiKey = await ctx.getBearerApiKeyResolver(providerConfig.provider);
-	const [response, nativeMetadata] = apiKey
+	const [payload, nativeMetadata] = apiKey
 		? await withAuth(apiKey, key => attempt({ ...baseHeaders, Authorization: `Bearer ${key}` }))
 		: await attempt(baseHeaders);
-	const payload = (await response.json()) as {
-		data?: Array<{ id?: string; max_model_len?: unknown; context_length?: unknown }>;
-	};
 	const models = payload.data ?? [];
+	const references = getBundledModelReferenceIndex();
 	const discovered: Model<Api>[] = [];
 	for (const item of models) {
 		const id = item.id;
 		if (!id) continue;
 		const nativeMetadataForModel = nativeMetadata?.get(id);
+		// Thin OpenAI-compatible proxies frequently omit `context_length`/
+		// `max_model_len` on `/v1/models`, leaving discovered models pinned at
+		// the 128K default even when the underlying model is e.g. a proxied
+		// Claude with a 1M window. Resolve the id against the bundled catalog
+		// (same pattern as `discoverProxyModels` and `discoverLiteLLMModels`) so
+		// intrinsic metadata — context/output limits, display name, modality,
+		// reasoning support — flows through when the provider is silent. Local
+		// runtime state and provider-reported values still win; proxy-specific
+		// headers/baseUrl/cost stay local.
+		const reference = resolveModelReference(id, references) as ModelSpec<Api> | undefined;
+		const referenceCompat = reference?.compat as OpenAICompat | undefined;
 		const contextWindow =
 			toPositiveNumberOrUndefined(item.max_model_len) ??
 			toPositiveNumberOrUndefined(item.context_length) ??
 			nativeMetadataForModel?.contextWindow ??
-			128000;
+			reference?.contextWindow ??
+			DISCOVERY_DEFAULT_CONTEXT_WINDOW;
 		discovered.push(
 			buildModel({
 				id,
-				name: id,
+				name: reference?.name ?? id,
 				api: providerConfig.api,
 				provider: providerConfig.provider,
 				baseUrl,
-				reasoning: false,
-				input: nativeMetadataForModel?.input ?? ["text"],
+				reasoning: reference?.reasoning ?? false,
+				thinking: reference?.thinking,
+				input: nativeMetadataForModel?.input ?? reference?.input ?? ["text"],
 				...(providerConfig.discovery.type === "lm-studio" ? { imageInputDecoder: "stb" as const } : {}),
+				// Proxy/gateway pricing is provider-specific and rarely matches
+				// upstream bundled catalogs, so keep costs local-unknown even
+				// when we successfully recover the upstream model identity.
 				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 				contextWindow,
-				maxTokens: Math.min(contextWindow, discoveryDefaultMaxTokens(providerConfig.api)),
+				// Cap the reference's output limit at the discovered context
+				// window so an ID collision with a larger bundled model can
+				// never request more tokens than the local runtime advertises.
+				maxTokens: Math.min(reference?.maxTokens ?? discoveryDefaultMaxTokens(providerConfig.api), contextWindow),
 				headers,
 				compat: {
 					supportsStore: false,
 					supportsDeveloperRole: false,
-					supportsReasoningEffort: false,
+					supportsReasoningEffort: referenceCompat?.supportsReasoningEffort ?? false,
+					...(referenceCompat?.reasoningEffortMap
+						? { reasoningEffortMap: referenceCompat.reasoningEffortMap }
+						: {}),
+					...(referenceCompat?.omitReasoningEffort !== undefined
+						? { omitReasoningEffort: referenceCompat.omitReasoningEffort }
+						: {}),
 				},
 			} as ModelSpec<Api>),
 		);
 	}
 	return discovered;
+}
+
+export async function discoverLiteLLMModels(
+	providerConfig: DiscoveryProviderConfig,
+	ctx: DiscoveryContext,
+): Promise<Model<Api>[]> {
+	const baseUrl = normalizeLiteLLMDiscoveryBaseUrl(providerConfig.baseUrl);
+	const references = getBundledModelReferenceIndex();
+	const resolveReference = (id: string) => resolveModelReference(id, references) as ModelSpec<Api> | undefined;
+	const baseHeaders: Record<string, string> = { ...(providerConfig.headers ?? {}) };
+	let headers = baseHeaders;
+	const attempt = async (h: Record<string, string>) => {
+		headers = h;
+		let authError: (Error & { status: number }) | undefined;
+		const authAwareFetch: FetchImpl = async (input, init) => {
+			const response = await ctx.fetch(input, init);
+			if (response.status === 401) {
+				authError = new Error(`HTTP ${response.status} from ${String(input)}`) as Error & { status: number };
+				authError.status = response.status;
+			}
+			return response;
+		};
+		const models = await withTimeoutSignal(10_000, signal =>
+			fetchLiteLLMRichModels({
+				api: providerConfig.api,
+				provider: providerConfig.provider,
+				baseUrl,
+				headers: h,
+				fetch: authAwareFetch,
+				referenceResolver: resolveReference,
+				signal,
+			}),
+		);
+		if (authError && models === null) {
+			throw authError;
+		}
+		return models;
+	};
+	const apiKey = await ctx.getBearerApiKeyResolver(providerConfig.provider);
+	let richModels: ModelSpec<Api>[] | null;
+	try {
+		richModels = apiKey
+			? await withAuth(apiKey, key => attempt({ ...baseHeaders, Authorization: `Bearer ${key}` }))
+			: await attempt(baseHeaders);
+	} catch (error) {
+		const status = typeof error === "object" && error !== null && "status" in error ? error.status : undefined;
+		if (status !== 401) {
+			throw error;
+		}
+		richModels = null;
+	}
+	if (!richModels || richModels.length === 0) {
+		return discoverOpenAIModelsList({ ...providerConfig, baseUrl }, ctx);
+	}
+	return richModels.map(spec => buildModel({ ...spec, headers }));
 }
 
 /**
@@ -517,24 +789,24 @@ export async function discoverProxyModels(
 
 	const baseHeaders: Record<string, string> = { ...(providerConfig.headers ?? {}) };
 	let headers = baseHeaders;
-	const attempt = async (h: Record<string, string>) => {
-		const res = await ctx.fetch(modelsUrl, {
-			headers: h,
-			signal: AbortSignal.timeout(10_000),
+	const attempt = async (h: Record<string, string>) =>
+		withTimeoutSignal(10_000, async signal => {
+			const res = await ctx.fetch(modelsUrl, {
+				headers: h,
+				signal,
+			});
+			if (!res.ok) {
+				throw new Error(`HTTP ${res.status} from ${modelsUrl}`);
+			}
+			headers = h;
+			return (await res.json()) as {
+				data?: Array<{ id?: string; name?: string; supported_endpoint_types?: string[]; context_length?: number }>;
+			};
 		});
-		if (!res.ok) {
-			throw new Error(`HTTP ${res.status} from ${modelsUrl}`);
-		}
-		headers = h;
-		return res;
-	};
 	const apiKey = await ctx.getBearerApiKeyResolver(providerConfig.provider);
-	const response = apiKey
+	const payload = apiKey
 		? await withAuth(apiKey, key => attempt({ ...baseHeaders, Authorization: `Bearer ${key}` }))
 		: await attempt(baseHeaders);
-	const payload = (await response.json()) as {
-		data?: Array<{ id?: string; name?: string; supported_endpoint_types?: string[]; context_length?: number }>;
-	};
 	const items = payload.data ?? [];
 	const discovered: Model<Api>[] = [];
 	for (const item of items) {
@@ -571,7 +843,10 @@ export async function discoverProxyModels(
 				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 				// Prefer the context_length the API reports for this model; fall
 				// back to the bundled reference, then a sane default.
-				contextWindow: toPositiveNumberOrUndefined(item.context_length) ?? reference?.contextWindow ?? 128000,
+				contextWindow:
+					toPositiveNumberOrUndefined(item.context_length) ??
+					reference?.contextWindow ??
+					DISCOVERY_DEFAULT_CONTEXT_WINDOW,
 				maxTokens: reference?.maxTokens ?? discoveryDefaultMaxTokens(api),
 				headers,
 				// OpenAI-compat fields are no-ops on anthropic models; the
@@ -616,7 +891,11 @@ function toLlamaCppNativeBaseUrl(baseUrl: string): string {
 	}
 }
 
-function normalizeOpenAIModelsListBaseUrl(baseUrl?: string): string {
+export function normalizeLiteLLMDiscoveryBaseUrl(baseUrl?: string): string {
+	return normalizeOpenAIModelsListBaseUrl(baseUrl ?? "http://localhost:4000/v1");
+}
+
+export function normalizeOpenAIModelsListBaseUrl(baseUrl?: string): string {
 	const defaultBaseUrl = "http://127.0.0.1:1234/v1";
 	const raw = baseUrl || defaultBaseUrl;
 	try {

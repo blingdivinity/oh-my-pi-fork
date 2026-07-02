@@ -2,18 +2,66 @@
 
 ## [Unreleased]
 
-### Added
-
-- Added support for rendering HTML `<code>` tags as theme-styled inline code blocks
-- Added support for rendering HTML `<hr>` tags as horizontal rules
-- Added support for rendering HTML `<blockquote>` tags with appropriate quote styling
+## [16.3.0] - 2026-07-02
 
 ### Fixed
 
-- Fixed HTML entity decoding within HTML-based inline code blocks
-- Fixed stray or unmatched HTML tags leaking into rendered output
-- Improved layout consistency by correctly handling HTML block-level tags in various contexts
-- Markdown renderer now handles inline `<code>…</code>` (rendered as themed inline code, identical to a backtick codespan, with HTML entities like `&amp;` decoded), block `<hr>` (rendered as a horizontal rule), and balanced single-line `<blockquote>…</blockquote>` (rendered with the quote border) instead of leaking the raw tags as literal text. Applies to the transcript renderer, table cells, list items, and the inline `renderInlineMarkdown` helper used for option labels; fenced code blocks keep such markup verbatim.
+- Fixed a potential event loop hang when processing oversized, unterminated terminal escape sequences (OSC/DCS/APC).
+- Fixed an issue where large Windows terminal session restores could get truncated mid-frame during ConPTY full-paint resume.
+
+## [16.2.13] - 2026-07-01
+
+### Fixed
+
+- Fixed fuzzy-search filtering for CJK and other non-ASCII queries by preserving Unicode letters and numbers during query normalization ([#4114](https://github.com/can1357/oh-my-pi/issues/4114)).
+
+## [16.2.12] - 2026-07-01
+
+### Fixed
+
+- Optimized streaming markdown rendering to reuse already-rendered prefix lines and only render new content deltas, improving performance and reducing redraw flicker.
+
+## [16.2.10] - 2026-06-30
+
+### Fixed
+
+- Fixed mid-prompt `/skill:<name>` autocomplete acceptance wiping the user's draft. The autocomplete now inserts the `/skill:<name> ` token at the cursor (replacing only the partial `/sk` slash token) and preserves prose typed before and after it, so a user can compose a prompt and reach for a skill without losing their train of thought ([#3913](https://github.com/can1357/oh-my-pi/issues/3913)).
+
+## [16.2.9] - 2026-06-30
+
+### Added
+
+- Added `Editor.submit()` to allow programmatic composer submission, enabling integration with speech input and other automated flows.
+
+## [16.2.7] - 2026-06-30
+
+### Fixed
+
+- Fixed an issue where a fast double-Escape keypress was swallowed and ignored, preventing double-escape gestures and subsequent Escape key handlers from firing.
+
+## [16.2.3] - 2026-06-28
+
+### Added
+
+- Added a desktop notification fallback for Linux terminals using D-Bus (via notify-send or gdbus), enabling completion and prompt notifications in VTE-family terminals (such as GNOME Terminal, Ptyxis, Tilix), Alacritty, and xterm. This is automatically skipped for terminals with native notification support (like VS Code and Warp) and can be disabled using the PI_NO_DESKTOP_NOTIFY=1 environment variable.
+
+### Fixed
+
+- Fixed slash skill autocomplete not opening when there is existing prompt text, ensuring mid-prompt slash lookups correctly display and insert skill commands.
+- Fixed modified Enter and keyboard shortcuts in fullscreen overlays for terminals using the xterm modifyOtherKeys fallback (such as iTerm2 when Kitty keyboard negotiation is unavailable).
+
+## [16.2.0] - 2026-06-27
+
+### Added
+
+- Added support for rendering HTML <code>, <hr>, and <blockquote> tags with proper theme styling, entity decoding, and layout consistency across Markdown transcripts, table cells, list items, and option labels.
+- Added first-class support for Warp terminal (TERM_PROGRAM=WarpTerminal), enabling true color, platform-specific Kitty graphics protocol negotiation for inline images, and safe defaults for OSC 8 hyperlinks and synchronized output.
+- Added SelectList.routeMouse() and shared SGR mouse input routing helpers to support fullscreen overlay hit-testing.
+
+### Fixed
+
+- Fixed issues where stray, unmatched, or raw HTML tags would leak into the rendered output.
+- Fixed render scheduling to yield behind queued terminal input, preventing delayed Escape key delivery during heavy streaming paints.
 
 ## [16.1.20] - 2026-06-25
 
@@ -550,7 +598,7 @@
 
 ### Changed
 
-- Changed native-scrollback safety defaults to treat unknown POSIX, SSH, and multiplexer-shaped terminals as ED3-risk for passive rendering; checkpoint replay now requires a positive at-tail viewport proof instead of assuming prompt submit makes host scrollback safe ([#1799](https://github.com/can1357/oh-my-pi/issues/1799)).
+- Changed native-scrollback safety defaults to treat unknown POSIX, SSH, and multiplexer-shaped terminals as ED3-risk for passive rendering; checkpoint replay now requires a positive at-tail viewport proof instead of assuming prompt submit makes host scrollback safe.
 - Changed synchronized-output defaults to a conservative opt-in profile: DEC 2026 paint wrappers stay disabled for remote/multiplexer/VTE/unknown terminals unless explicitly forced, while the autowrap guards remain active.
 
 ### Fixed

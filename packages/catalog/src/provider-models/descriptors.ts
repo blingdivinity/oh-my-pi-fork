@@ -50,7 +50,12 @@ import {
 	zenmuxModelManagerOptions,
 	zhipuCodingPlanModelManagerOptions,
 } from "./openai-compat";
-import { cursorModelManagerOptions, devinModelManagerOptions, zaiModelManagerOptions } from "./special";
+import {
+	cursorModelManagerOptions,
+	devinModelManagerOptions,
+	gitLabDuoWorkflowModelManagerOptions,
+	zaiModelManagerOptions,
+} from "./special";
 
 export const CATALOG_PROVIDERS = [
 	{
@@ -75,7 +80,9 @@ export const CATALOG_PROVIDERS = [
 	{
 		id: "anthropic",
 		defaultModel: "claude-opus-4-8",
+		envVars: ["ANTHROPIC_API_KEY"],
 		createModelManagerOptions: (config: ModelManagerConfig) => anthropicModelManagerOptions(config),
+		catalogDiscovery: { label: "Anthropic" },
 	},
 	{
 		id: "azure",
@@ -141,6 +148,13 @@ export const CATALOG_PROVIDERS = [
 		id: "gitlab-duo",
 		defaultModel: "duo-chat-opus-4-6",
 		envVars: ["GITLAB_TOKEN"],
+	},
+	{
+		id: "gitlab-duo-agent",
+		defaultModel: "claude_sonnet_4_6_vertex",
+		envVars: ["GITLAB_TOKEN"],
+		createModelManagerOptions: (config: ModelManagerConfig) => gitLabDuoWorkflowModelManagerOptions(config),
+		dynamicModelsAuthoritative: true,
 	},
 	{
 		id: "google",
@@ -401,7 +415,7 @@ export const CATALOG_PROVIDERS = [
 	},
 	{
 		id: "xiaomi",
-		defaultModel: "mimo-v2-flash",
+		defaultModel: "mimo-v2.5",
 		envVars: ["XIAOMI_API_KEY"],
 		createModelManagerOptions: (config: ModelManagerConfig) => xiaomiModelManagerOptions(config),
 		catalogDiscovery: { label: "Xiaomi" },

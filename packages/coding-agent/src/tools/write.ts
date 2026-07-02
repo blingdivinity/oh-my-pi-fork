@@ -3,7 +3,13 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 
 import { formatHashlineHeader, stripHashlinePrefixes } from "@oh-my-pi/hashline";
-import type { AgentTool, AgentToolContext, AgentToolResult, AgentToolUpdateCallback } from "@oh-my-pi/pi-agent-core";
+import type {
+	AgentTool,
+	AgentToolContext,
+	AgentToolResult,
+	AgentToolUpdateCallback,
+	ToolTier,
+} from "@oh-my-pi/pi-agent-core";
 import type { Component } from "@oh-my-pi/pi-tui";
 import { isEnoent, isRecord, prompt, untilAborted } from "@oh-my-pi/pi-utils";
 import { type } from "arktype";
@@ -41,11 +47,12 @@ import {
 } from "./conflict-detect";
 import { invalidateFsScanAfterWrite } from "./fs-cache-invalidation";
 import { type OutputMeta, outputMeta } from "./output-meta";
-import { formatPathRelativeToCwd, isInternalUrlPath } from "./path-utils";
+import { formatPathRelativeToCwd, isInternalUrlPath, pathTargetsSsh, peelWriteUrlSelector } from "./path-utils";
 import { enforcePlanModeWrite, resolvePlanPath, unwrapHashlineHeaderPath } from "./plan-mode-guard";
 import {
 	cachedRenderedString,
 	createRenderedStringCache,
+	Ellipsis,
 	formatDiagnostics,
 	formatErrorDetail,
 	formatExpandHint,
@@ -55,6 +62,8 @@ import {
 	type RenderedStringCache,
 	replaceTabs,
 	shortenPath,
+	TRUNCATE_LENGTHS,
+	truncateToWidth,
 } from "./render-utils";
 import {
 	deleteRowByKey,
@@ -157,6 +166,18 @@ function appendNoteToResult(result: AgentToolResult<WriteToolDetails>, note: str
 	} else {
 		result.content.push({ type: "text", text: note });
 	}
+}
+
+function emitWriteProgress(
+	onUpdate: AgentToolUpdateCallback<WriteToolDetails> | undefined,
+	content: string,
+	displayPath: string,
+	resolvedPath?: string,
+): void {
+	onUpdate?.({
+		content: [{ type: "text", text: `Writing ${content.length} bytes to ${shortenPath(displayPath)}...` }],
+		details: resolvedPath ? { resolvedPath } : {},
+	});
 }
 
 /**
@@ -263,14 +284,22 @@ function parseSqliteWriteTarget(subPath: string, queryString: string): { table: 
  */
 export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails> {
 	readonly name = "write";
-	readonly approval = (args: unknown) => {
+	readonly approval = (args: unknown): ToolTier => {
 		const rawPath = (args as Partial<WriteParams>).path;
-		if (typeof rawPath !== "string" || !isInternalUrlPath(rawPath)) return "write";
+		if (typeof rawPath !== "string") return "write";
+		// Unwrap a hashline `[path#TAG]` wrapper first (parity with execute) so a
+		// wrapped `[ssh://h/x#ABCD]` can't dodge scheme detection and the tier checks below.
+		const path = unwrapHashlineHeaderPath(rawPath);
+		// Remote SSH writes open an outbound connection and run a remote shell —
+		// gate them like the exec-tier `ssh` tool, ahead of the handler-write
+		// logic. Substring match also covers selector-suffixed targets.
+		if (pathTargetsSsh(path)) return "exec";
+		if (!isInternalUrlPath(path)) return "write";
 		// Internal URLs are usually session-local artifacts (read tier), but a
-		// scheme whose handler exposes a `write` hook mutates handler-owned
-		// user data (e.g. vault:// notes, host-owned mcp:// URIs) and must take
-		// the write tier so always-ask mode actually prompts.
-		const match = /^([a-z][a-z0-9+.-]*):\/\//i.exec(rawPath.trim());
+		// scheme whose handler exposes a `write` hook mutates handler-owned user
+		// data (e.g. vault:// notes) and must take the write tier so always-ask
+		// mode actually prompts.
+		const match = /^([a-z][a-z0-9+.-]*):\/\//i.exec(path.trim());
 		const handler = match ? InternalUrlRouter.instance().getHandler(match[1]!.toLowerCase()) : undefined;
 		return handler?.write ? "write" : "read";
 	};
@@ -767,7 +796,7 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 		_toolCallId: string,
 		{ path: rawPath, content }: WriteParams,
 		signal?: AbortSignal,
-		_onUpdate?: AgentToolUpdateCallback<WriteToolDetails>,
+		onUpdate?: AgentToolUpdateCallback<WriteToolDetails>,
 		context?: AgentToolContext,
 	): Promise<AgentToolResult<WriteToolDetails>> {
 		// Strip a hashline `[path#TAG]` wrapper up front so every downstream
@@ -778,7 +807,9 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 		// (which fails on a leading `[`) and the bridge router would send a
 		// `[local://scratch.md#ABCD]` write to the editor instead of the
 		// session-local sandbox.
-		const path = unwrapHashlineHeaderPath(rawPath);
+		// Peel a read-tool selector (`:raw`, `:1-20`, …) so the write target matches
+		// what `read` resolves for the same URL; line-range/malformed selectors throw.
+		const path = peelWriteUrlSelector(unwrapHashlineHeaderPath(rawPath));
 		return untilAborted(signal, async () => {
 			// Strip hashline display prefixes ([PATH#HASH] + LINE:) if the model copied them from read output
 			const { text: cleanContent, stripped } = stripWriteContent(this.session, content);
@@ -791,6 +822,7 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 					// Handler-owned writes (vault:// notes, host URIs) mutate user
 					// data outside the local sandbox — plan mode must reject them.
 					enforcePlanModeWrite(this.session, path, { op: "update" });
+					emitWriteProgress(onUpdate, cleanContent, path);
 					await handler.write(parsed, cleanContent, { cwd: this.session.cwd, signal });
 					let resultText = `Successfully wrote ${cleanContent.length} bytes to ${path}`;
 					if (stripped) {
@@ -810,6 +842,7 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 						`Conflict URI scope '/${conflictUri.scope}' is read-only — read \`conflict://${conflictUri.id}/${conflictUri.scope}\` to inspect that side. To write, drop the scope (\`conflict://${conflictUri.id}\`) and put the chosen content (or shorthand like \`@${conflictUri.scope}\`) in \`content\`.`,
 					);
 				}
+				emitWriteProgress(onUpdate, cleanContent, path);
 				const result =
 					conflictUri.id === "*"
 						? await this.#resolveAllConflicts(cleanContent, stripped, signal)
@@ -828,6 +861,14 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 					op: resolvedArchivePath.exists ? "update" : "create",
 				});
 
+				emitWriteProgress(
+					onUpdate,
+					cleanContent,
+					`${formatPathRelativeToCwd(resolvedArchivePath.absolutePath, this.session.cwd)}:${
+						resolvedArchivePath.archiveSubPath
+					}`,
+					resolvedArchivePath.absolutePath,
+				);
 				const archiveResult = await this.#writeArchiveEntry(cleanContent, resolvedArchivePath);
 				if (stripped) {
 					const firstText = archiveResult.content.find(
@@ -845,6 +886,7 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 			if (resolvedSqlitePath) {
 				enforcePlanModeWrite(this.session, resolvedSqlitePath.sqlitePath, { op: "update" });
 
+				emitWriteProgress(onUpdate, cleanContent, path, resolvedSqlitePath.absolutePath);
 				const sqliteResult = await this.#writeSqliteRow(path, cleanContent, resolvedSqlitePath);
 				if (stripped) {
 					const firstText = sqliteResult.content.find(
@@ -867,11 +909,13 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 				await assertEditableFile(absolutePath, path);
 			}
 
+			const displayPath = formatPathRelativeToCwd(absolutePath, this.session.cwd);
+			emitWriteProgress(onUpdate, cleanContent, displayPath, absolutePath);
+
 			// Try ACP bridge first for editor-visible filesystem paths. Internal
 			// artifacts such as local:// plans are owned by OMP, not the editor.
 			if (await routeWriteThroughBridge(this.session, path, absolutePath, cleanContent)) {
 				const madeExecutable = await maybeMarkExecutableForShebang(absolutePath, cleanContent);
-				const displayPath = formatPathRelativeToCwd(absolutePath, this.session.cwd);
 				const header = maybeWriteSnapshotHeader(this.session, absolutePath, cleanContent);
 				const writeLine = `Successfully wrote ${cleanContent.length} bytes to ${displayPath}`;
 				let resultText = header ? `${header}\n${writeLine}` : writeLine;
@@ -892,7 +936,6 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 			this.session.bumpFileMutationVersion?.(absolutePath);
 			const madeExecutable = await maybeMarkExecutableForShebang(absolutePath, cleanContent);
 
-			const displayPath = formatPathRelativeToCwd(absolutePath, this.session.cwd);
 			const header = maybeWriteSnapshotHeader(this.session, absolutePath, cleanContent);
 			const writeLine = `Successfully wrote ${cleanContent.length} bytes to ${displayPath}`;
 			let resultText = header ? `${header}\n${writeLine}` : writeLine;
@@ -1112,14 +1155,19 @@ export const writeToolRenderer = {
 			}));
 		}
 
+		const isPartial = options.isPartial === true;
+		const progressText = result.content?.find(c => c.type === "text")?.text ?? "";
 		const lineCount = countLines(fileContent);
 		const lineSuffix = formatLineCountSuffix(lineCount, uiTheme);
-		const execSuffix = result.details?.madeExecutable
-			? `${uiTheme.fg("dim", " · ")}${uiTheme.fg("success", "made executable!")}`
-			: "";
+		const execSuffix =
+			!isPartial && result.details?.madeExecutable
+				? `${uiTheme.fg("dim", " · ")}${uiTheme.fg("success", "made executable!")}`
+				: "";
 		const header = renderStatusLine(
 			{
-				iconOverride: uiTheme.styledSymbol("tool.write", "accent"),
+				icon: isPartial ? "running" : undefined,
+				iconOverride: isPartial ? undefined : uiTheme.styledSymbol("tool.write", "accent"),
+				spinnerFrame: options.spinnerFrame,
 				title: "Write",
 				description: `${langIcon} ${pathDisplay}${lineSuffix}${execSuffix}`,
 			},
@@ -1131,7 +1179,15 @@ export const writeToolRenderer = {
 		return framedBlock(uiTheme, width => {
 			const { expanded } = options;
 			let body = renderContentPreview(fileContent, expanded, lang, uiTheme, previewCache);
-			if (diagnostics) {
+			if (isPartial && progressText) {
+				const safeProgressText = truncateToWidth(
+					replaceTabs(progressText),
+					TRUNCATE_LENGTHS.LINE,
+					Ellipsis.Unicode,
+				);
+				body = `${uiTheme.fg("muted", safeProgressText)}${body ? `\n${body}` : ""}`;
+			}
+			if (!isPartial && diagnostics) {
 				const diagText = formatDiagnostics(diagnostics, expanded, uiTheme, fp =>
 					uiTheme.getLangIcon(getLanguageFromPath(fp)),
 				);
@@ -1146,7 +1202,7 @@ export const writeToolRenderer = {
 			return {
 				header,
 				sections: bodyLines.length > 0 ? [{ lines: bodyLines }] : [],
-				state: "success",
+				state: isPartial ? "pending" : "success",
 				borderColor: "borderMuted",
 				width,
 			};

@@ -1,5 +1,8 @@
 import type { Effort } from "./effort";
 
+// Re-exported from @oh-my-pi/pi-utils so the whole workspace shares one
+// `fetch`-compatible signature (tls-fetch's wrappers produce/accept it).
+export type { FetchImpl } from "@oh-my-pi/pi-utils";
 export type { KnownProvider } from "./provider-models/descriptors";
 
 export type KnownApi =
@@ -15,6 +18,7 @@ export type KnownApi =
 	| "google-vertex"
 	| "ollama-chat"
 	| "cursor-agent"
+	| "gitlab-duo-agent"
 	| "devin-agent";
 export type Api = KnownApi | (string & {});
 
@@ -88,15 +92,6 @@ export type Provider = string;
 /** Token budgets for each thinking level (token-based providers only) */
 export type ThinkingBudgets = { [key in Effort]?: number };
 
-/**
- * `fetch`-compatible function. Accepts any callable matching the standard
- * fetch signature; `preconnect` is optional because non-Bun runtimes (browsers,
- * test mocks) won't expose it.
- */
-export type FetchImpl = ((input: string | URL | Request, init?: RequestInit) => Promise<Response>) & {
-	preconnect?: typeof globalThis.fetch.preconnect;
-};
-
 export interface Usage {
 	/** Non-cached input tokens (matches the bucket the provider bills as new input). */
 	input: number;
@@ -152,8 +147,7 @@ export type OpenAIReasoningDisableMode =
 	| "openrouter-enabled-false"
 	| "zai-thinking-disabled"
 	| "qwen-enable-thinking-false"
-	| "qwen-template-false"
-	| "juice-zero-developer-message";
+	| "qwen-template-false";
 
 export type OpenAIStreamMarkupHealingPattern = "kimi" | "dsml" | "thinking";
 
@@ -331,13 +325,13 @@ export interface OpenAICompat {
 	/** Whether the Responses API accepts the `detail: "original"` image hint. Default: auto-detected (false for GitHub Copilot, which rejects it with a 400). */
 	supportsImageDetailOriginal?: boolean;
 	/**
-	 * Append a trailing `# Juice: 0 !important` developer item when the caller
-	 * did not request reasoning, suppressing default reasoning on models that
-	 * cannot disable it via request params (Responses APIs only; see
+	 * Append a trailing no-reasoning developer item when the caller did not
+	 * request reasoning, suppressing default reasoning on models that cannot
+	 * disable it via request params (Responses APIs only; see
 	 * https://community.openai.com/t/need-reasoning-false-option-for-gpt-5/1351588/7).
-	 * Default: auto-detected (GPT-5-family model names).
+	 * The prompt must not look like an execution or tool budget. Default: auto-detected (GPT-5-family model names).
 	 */
-	requiresJuiceZeroHack?: boolean;
+	requiresReasoningSuppressionPrompt?: boolean;
 	/** Whether streamed reasoning deltas for the same field may repeat the full cumulative text snapshot. Default: false. */
 	reasoningDeltasMayBeCumulative?: boolean;
 	/** Strip leaked DeepSeek chat-template special tokens from visible content deltas. Default: auto-detected. */
@@ -419,6 +413,11 @@ export interface AnthropicCompat {
 	 * Default: auto-detected from provider/baseUrl and `model.reasoning`.
 	 */
 	replayUnsignedThinking?: boolean;
+	/**
+	 * Whether the endpoint requires `thinking.type: "enabled"` whenever the
+	 * model reasons. Use for models that reject omitted or disabled thinking.
+	 */
+	requiresThinkingEnabled?: boolean;
 	/**
 	 * Prefix Anthropic built-in tool names (`web_search`, `code_execution`, ...)
 	 * when they are ordinary client tools. Some Anthropic-compatible gateways
@@ -558,7 +557,7 @@ export type ResolvedOpenAICompat = ResolvedOpenAISharedCompat &
 			| "thinkingKeep"
 			| "strictResponsesPairing"
 			| "supportsImageDetailOriginal"
-			| "requiresJuiceZeroHack"
+			| "requiresReasoningSuppressionPrompt"
 			| "enableGeminiThinkingLoopGuard"
 			| "whenThinking"
 		>
@@ -582,7 +581,7 @@ export interface ResolvedOpenAIResponsesCompat extends ResolvedOpenAISharedCompa
 	supportsLongPromptCacheRetention: boolean;
 	strictResponsesPairing: boolean;
 	supportsImageDetailOriginal: boolean;
-	requiresJuiceZeroHack: boolean;
+	requiresReasoningSuppressionPrompt: boolean;
 	supportsObfuscationOptOut: boolean;
 	streamIdleTimeoutMs?: number;
 }
@@ -652,6 +651,24 @@ export type CompatOf<TApi extends Api> = TApi extends "openrouter"
 					? ResolvedDevinCompat
 					: undefined;
 
+/** Provider-native compaction endpoint configuration for one model. */
+export interface RemoteCompactionConfig<TApi extends Api = Api> {
+	/** Enables provider-native compaction for providers not enabled by built-in policy. */
+	enabled?: boolean;
+	/** Adapter family used by the configured compaction endpoint. */
+	api?: TApi;
+	/** Absolute V1 compact endpoint URL; when omitted, the adapter derives it from the model base URL. */
+	endpoint?: string;
+	/** Enables Responses-stream V2 compaction for models verified to support `compaction_trigger`. */
+	v2StreamingEnabled?: boolean;
+	/** Absolute Responses-stream endpoint URL for V2 compaction; overrides `streamingEndpoint`. */
+	v2Endpoint?: string;
+	/** Absolute provider streaming endpoint URL used by V2 compaction when no dedicated endpoint is set. */
+	streamingEndpoint?: string;
+	/** Model id sent to the compaction endpoint when it differs from the active model id. */
+	model?: string;
+}
+
 // Model interface for the unified model system
 export interface Model<TApi extends Api = Api> {
 	id: string;
@@ -682,6 +699,8 @@ export interface Model<TApi extends Api = Api> {
 	 * reports that native tool calling is unsupported.
 	 */
 	supportsTools?: boolean;
+	/** GitLab Duo Workflow root namespace selected during catalog discovery. */
+	gitlabDuoWorkflowRootNamespaceId?: string;
 	cost: {
 		input: number; // $/million tokens
 		output: number; // $/million tokens
@@ -724,6 +743,10 @@ export interface Model<TApi extends Api = Api> {
 	preferWebsockets?: boolean;
 	/** Preferred model to switch to when context promotion is triggered (model id or provider/id). */
 	contextPromotionTarget?: string;
+	/** Preferred model to use only for compaction (model id or provider/id); the active session model is unchanged. */
+	compactionModel?: string;
+	/** Provider-native compaction endpoint configuration. */
+	remoteCompaction?: RemoteCompactionConfig<TApi>;
 	/** Provider-assigned priority value (lower = higher priority). */
 	priority?: number;
 	/** Canonical thinking capability metadata for this model. */

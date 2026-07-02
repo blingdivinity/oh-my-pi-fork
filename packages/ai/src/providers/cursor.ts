@@ -104,11 +104,12 @@ import {
 import { calculateCost } from "@oh-my-pi/pi-catalog/models";
 import {
 	$env,
-	extractHttpStatusFromError,
 	parseJsonWithRepair,
 	parseStreamingJson,
+	parseStreamingJsonThrottled,
 	sanitizeText,
 } from "@oh-my-pi/pi-utils";
+import * as AIError from "../error";
 import type {
 	Api,
 	AssistantMessage,
@@ -130,11 +131,17 @@ import type {
 	ToolResultMessage,
 } from "../types";
 import { normalizeSystemPrompts } from "../utils";
+import {
+	clearStreamingPartialJson,
+	kStreamingBlockIndex,
+	kStreamingBlockKind,
+	kStreamingLastParseLen,
+	kStreamingPartialJson,
+} from "../utils/block-symbols";
 import { deterministicUuid } from "../utils/deterministic-id";
 import { AssistantMessageEventStream } from "../utils/event-stream";
 import { connectProxiedSocket, getProxyForProvider, shouldBypassProxy } from "../utils/proxy";
 import { createRequestDebugSession, isRequestDebugEnabled, type RequestDebugResponseLog } from "../utils/request-debug";
-import { formatErrorMessageWithRetryAfter } from "../utils/retry-after";
 import { toolWireSchema } from "../utils/schema/wire";
 
 export const CURSOR_API_URL = "https://api2.cursor.sh";
@@ -194,11 +201,11 @@ function parseConnectEndStream(data: Uint8Array): Error | null {
 		if (error) {
 			const code = typeof error.code === "string" ? error.code : "unknown";
 			const message = typeof error.message === "string" ? error.message : "Unknown error";
-			return new Error(`Connect error ${code}: ${message}`);
+			return new AIError.ProviderResponseError(`Connect error ${code}: ${message}`, { kind: "envelope" });
 		}
 		return null;
 	} catch {
-		return new Error("Failed to parse Connect end stream");
+		return new AIError.ProviderResponseError("Failed to parse Connect end stream", { kind: "envelope" });
 	}
 }
 
@@ -315,7 +322,7 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 	const stream = new AssistantMessageEventStream();
 
 	(async () => {
-		const startTime = Date.now();
+		const startTime = performance.now();
 		let firstTokenTime: number | undefined;
 
 		const output: AssistantMessage = {
@@ -344,7 +351,7 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 		try {
 			const apiKey = options?.apiKey;
 			if (!apiKey) {
-				throw new Error("Cursor API key (access token) is required");
+				throw new AIError.MissingApiKeyError(undefined, "Cursor API key (access token) is required");
 			}
 
 			const conversationId = options?.conversationId ?? options?.sessionId ?? crypto.randomUUID();
@@ -399,8 +406,8 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 
 			let pendingBuffer = Buffer.alloc(0);
 			let endStreamError: Error | null = null;
-			let currentTextBlock: (TextContent & { index: number }) | null = null;
-			let currentThinkingBlock: (ThinkingContent & { index: number }) | null = null;
+			let currentTextBlock: (TextContent & { [kStreamingBlockIndex]: number }) | null = null;
+			let currentThinkingBlock: (ThinkingContent & { [kStreamingBlockIndex]: number }) | null = null;
 			let currentToolCall: ToolCallState | null = null;
 			const usageState: UsageState = { sawTokenDelta: false };
 
@@ -427,7 +434,7 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 					currentToolCall = t;
 				},
 				setFirstTokenTime: () => {
-					if (!firstTokenTime) firstTokenTime = Date.now();
+					if (!firstTokenTime) firstTokenTime = performance.now();
 				},
 			};
 
@@ -544,7 +551,12 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 					const msg = trailers["grpc-message"];
 					if (status && status !== "0") {
 						void closeDebugLog().finally(() => {
-							reject(new Error(`gRPC error ${status}: ${decodeURIComponent(String(msg || ""))}`));
+							reject(
+								new AIError.ProviderResponseError(
+									`gRPC error ${status}: ${decodeURIComponent(String(msg || ""))}`,
+									{ kind: "envelope" },
+								),
+							);
 						});
 					}
 				});
@@ -571,7 +583,7 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 					options.signal.addEventListener("abort", () => {
 						h2Request?.close();
 						void closeDebugLog().finally(() => {
-							reject(new Error("Request was aborted"));
+							reject(new AIError.AbortError());
 						});
 					});
 				}
@@ -581,9 +593,8 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 			endCurrentThinkingBlock(output, stream, state);
 			if (state.currentToolCall) {
 				const idx = output.content.indexOf(state.currentToolCall);
-				state.currentToolCall.arguments = parseStreamingJson(state.currentToolCall.partialJson);
-				delete (state.currentToolCall as any).partialJson;
-				delete (state.currentToolCall as any).index;
+				state.currentToolCall.arguments = parseStreamingJson(state.currentToolCall[kStreamingPartialJson]);
+				clearStreamingPartialJson(state.currentToolCall);
 				stream.push({
 					type: "toolcall_end",
 					contentIndex: idx,
@@ -594,7 +605,7 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 
 			calculateCost(model, output.usage);
 
-			output.duration = Date.now() - startTime;
+			output.duration = performance.now() - startTime;
 			if (firstTokenTime) output.ttft = firstTokenTime - startTime;
 			stream.push({
 				type: "done",
@@ -603,10 +614,12 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 			});
 			stream.end();
 		} catch (error) {
-			output.stopReason = options?.signal?.aborted ? "aborted" : "error";
-			output.errorStatus = extractHttpStatusFromError(error);
-			output.errorMessage = formatErrorMessageWithRetryAfter(error);
-			output.duration = Date.now() - startTime;
+			const result = await AIError.finalize(error, { api: model.api, signal: options?.signal });
+			output.stopReason = result.stopReason;
+			output.errorStatus = result.status;
+			output.errorId = result.id;
+			output.errorMessage = result.message;
+			output.duration = performance.now() - startTime;
 			if (firstTokenTime) output.ttft = firstTokenTime - startTime;
 			stream.push({ type: "error", reason: output.stopReason, error: output });
 			stream.end();
@@ -625,15 +638,20 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 	return stream;
 };
 
-export type ToolCallState = ToolCall & { index: number; partialJson?: string; kind: "mcp" | "todo" };
+export type ToolCallState = ToolCall & {
+	[kStreamingBlockIndex]: number;
+	[kStreamingPartialJson]?: string;
+	[kStreamingLastParseLen]?: number;
+	[kStreamingBlockKind]: "mcp" | "todo";
+};
 
 export interface BlockState {
-	currentTextBlock: (TextContent & { index: number }) | null;
-	currentThinkingBlock: (ThinkingContent & { index: number }) | null;
+	currentTextBlock: (TextContent & { [kStreamingBlockIndex]: number }) | null;
+	currentThinkingBlock: (ThinkingContent & { [kStreamingBlockIndex]: number }) | null;
 	currentToolCall: ToolCallState | null;
 	firstTokenTime: number | undefined;
-	setTextBlock: (b: (TextContent & { index: number }) | null) => void;
-	setThinkingBlock: (b: (ThinkingContent & { index: number }) | null) => void;
+	setTextBlock: (b: (TextContent & { [kStreamingBlockIndex]: number }) | null) => void;
+	setThinkingBlock: (b: (ThinkingContent & { [kStreamingBlockIndex]: number }) | null) => void;
 	setToolCall: (t: ToolCallState | null) => void;
 	setFirstTokenTime: () => void;
 }
@@ -771,7 +789,7 @@ async function handleShellStreamArgs(
 ): Promise<void> {
 	const normalizedWorkingDirectory = args.workingDirectory || process.cwd();
 	const normalizedArgs: ShellArgs = { ...args, workingDirectory: normalizedWorkingDirectory };
-	const startTs = Date.now();
+	const startTs = performance.now();
 	log("shellStream", "start", {
 		command: (args as any).command,
 		workingDirectory: normalizedWorkingDirectory,
@@ -909,7 +927,7 @@ async function handleShellStreamArgs(
 	sendExecClientMessage(h2Request, execMsg, "shellResult", sanitizedExecResult);
 	sendExecClientStreamClose(h2Request, execMsg);
 
-	log("shellStream", "done", { elapsed: Date.now() - startTs });
+	log("shellStream", "done", { elapsed: performance.now() - startTs });
 }
 
 function sendShellStreamExitFromResult(
@@ -1986,7 +2004,6 @@ function endCurrentTextBlock(output: AssistantMessage, stream: AssistantMessageE
 	const block = state.currentTextBlock;
 	if (!block) return;
 	const idx = output.content.indexOf(block);
-	delete (block as { index?: number }).index;
 	stream.push({
 		type: "text_end",
 		contentIndex: idx,
@@ -2004,7 +2021,6 @@ function endCurrentThinkingBlock(
 	const block = state.currentThinkingBlock;
 	if (!block) return;
 	const idx = output.content.indexOf(block);
-	delete (block as { index?: number }).index;
 	stream.push({
 		type: "thinking_end",
 		contentIndex: idx,
@@ -2030,10 +2046,10 @@ export function processInteractionUpdate(
 		state.setFirstTokenTime();
 		const delta = update.message.value.text || "";
 		if (!state.currentTextBlock) {
-			const block: TextContent & { index: number } = {
+			const block: TextContent & { [kStreamingBlockIndex]: number } = {
 				type: "text",
 				text: "",
-				index: output.content.length,
+				[kStreamingBlockIndex]: output.content.length,
 			};
 			output.content.push(block);
 			state.setTextBlock(block);
@@ -2046,10 +2062,10 @@ export function processInteractionUpdate(
 		state.setFirstTokenTime();
 		const delta = update.message.value.text || "";
 		if (!state.currentThinkingBlock) {
-			const block: ThinkingContent & { index: number } = {
+			const block: ThinkingContent & { [kStreamingBlockIndex]: number } = {
 				type: "thinking",
 				thinking: "",
-				index: output.content.length,
+				[kStreamingBlockIndex]: output.content.length,
 			};
 			output.content.push(block);
 			state.setThinkingBlock(block);
@@ -2073,9 +2089,9 @@ export function processInteractionUpdate(
 					id: args.toolCallId || crypto.randomUUID(),
 					name: args.name || args.toolName || "",
 					arguments: {},
-					index: output.content.length,
-					partialJson: "",
-					kind: "mcp",
+					[kStreamingBlockIndex]: output.content.length,
+					[kStreamingPartialJson]: "",
+					[kStreamingBlockKind]: "mcp",
 				};
 				output.content.push(block);
 				state.setToolCall(block);
@@ -2091,8 +2107,8 @@ export function processInteractionUpdate(
 					id: callId,
 					name: "todo",
 					arguments: todoArgs,
-					index: output.content.length,
-					kind: "todo",
+					[kStreamingBlockIndex]: output.content.length,
+					[kStreamingBlockKind]: "todo",
 				};
 				output.content.push(block);
 				state.setToolCall(block);
@@ -2100,41 +2116,53 @@ export function processInteractionUpdate(
 			}
 		}
 	} else if (updateCase === "toolCallDelta" || updateCase === "partialToolCall") {
-		if (state.currentToolCall?.kind === "mcp") {
+		if (state.currentToolCall?.[kStreamingBlockKind] === "mcp") {
 			// Cursor's `args_text_delta` is "aggregated args text so far" per agent.proto: each
 			// delta is a cumulative snapshot of the JSON-text args. Strip the prefix we already
 			// have to recover the new suffix; fall back to treating the value as an incremental
 			// fragment when it doesn't extend the buffer.
 			const snapshot: string = update.message.value.argsTextDelta || "";
-			const current = state.currentToolCall.partialJson ?? "";
+			const current = state.currentToolCall[kStreamingPartialJson] ?? "";
 			const chunk = snapshot.startsWith(current) ? snapshot.slice(current.length) : snapshot;
 			if (chunk.length === 0) {
 				return;
 			}
-			state.currentToolCall.partialJson = current + chunk;
-			state.currentToolCall.arguments = parseStreamingJson(state.currentToolCall.partialJson);
+			const nextBuffer = current + chunk;
+			state.currentToolCall[kStreamingPartialJson] = nextBuffer;
+			// Throttle mid-stream parses to keep total parse work O(N) instead of O(N²)
+			// in the argument-buffer length; the authoritative full parse runs in
+			// `toolCallCompleted` (mcp branch) and the fallback end-of-stream path.
+			const throttled = parseStreamingJsonThrottled(nextBuffer, state.currentToolCall[kStreamingLastParseLen] ?? 0);
+			if (throttled) {
+				state.currentToolCall.arguments = throttled.value;
+				state.currentToolCall[kStreamingLastParseLen] = throttled.parsedLen;
+			}
 			const idx = output.content.indexOf(state.currentToolCall);
 			stream.push({ type: "toolcall_delta", contentIndex: idx, delta: chunk, partial: output });
 		}
 	} else if (updateCase === "toolCallCompleted") {
 		if (state.currentToolCall) {
 			const toolCall = update.message.value.toolCall;
-			if (state.currentToolCall.kind === "mcp") {
+			if (state.currentToolCall[kStreamingBlockKind] === "mcp") {
+				// Authoritative full parse of the accumulated argument buffer; the delta
+				// path throttles mid-stream parses, so `arguments` may lag the buffer.
+				const partial = state.currentToolCall[kStreamingPartialJson];
+				if (partial !== undefined) {
+					state.currentToolCall.arguments = parseStreamingJson(partial);
+				}
 				const decodedArgs = decodeMcpArgsMap(toolCall?.mcpToolCall?.args?.args);
 				state.currentToolCall.arguments = mergeCursorMcpToolCallArgs(
 					state.currentToolCall.arguments as Record<string, unknown> | undefined,
 					decodedArgs,
 				);
-			} else if (state.currentToolCall.kind === "todo" && toolCall) {
+			} else if (state.currentToolCall[kStreamingBlockKind] === "todo" && toolCall) {
 				const todoArgs = buildTodoArgs(toolCall);
 				if (todoArgs) {
 					state.currentToolCall.arguments = todoArgs;
 				}
 			}
 			const idx = output.content.indexOf(state.currentToolCall);
-			delete (state.currentToolCall as any).partialJson;
-			delete (state.currentToolCall as any).index;
-			delete (state.currentToolCall as any).kind;
+			clearStreamingPartialJson(state.currentToolCall);
 			stream.push({ type: "toolcall_end", contentIndex: idx, toolCall: state.currentToolCall, partial: output });
 			state.setToolCall(null);
 		}
@@ -2181,7 +2209,7 @@ function storeCursorBlob(blobStore: Map<string, Uint8Array>, data: Uint8Array): 
 function readCursorBlob(blobStore: Map<string, Uint8Array>, blobId: Uint8Array): Uint8Array {
 	const data = blobStore.get(Buffer.from(blobId).toString("hex"));
 	if (!data) {
-		throw new Error("Cursor blob not found");
+		throw new AIError.ValidationError("Cursor blob not found");
 	}
 	return data;
 }

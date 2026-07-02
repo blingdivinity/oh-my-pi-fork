@@ -1,3 +1,4 @@
+import { renderDemotedThinking } from "../dialect/demotion";
 import type { Api, AssistantMessage, Message, Model, ToolCall, ToolResultMessage, UserMessage } from "../types";
 
 const enum ToolCallStatus {
@@ -125,18 +126,20 @@ function deduplicateToolCallIds(
 }
 
 /**
- * Drop assistant `toolCall` blocks whose `name` is empty or whitespace-only,
+ * Drop assistant `toolCall` blocks whose `id` or `name` is empty / whitespace-only,
  * the `toolResult` messages they point at, and any assistant turn that has no
  * replayable content left.
  *
- * Models occasionally emit `{ "name": "", "arguments": "{}" }` (observed:
- * GLM-5.2 + thinking on long turns, #3458). The agent loop rejects the call
- * at execution time with `Tool  not found`, but the malformed block and its
- * error tool-result stay in `currentContext.messages`, so every subsequent
- * request replays them. Every provider validates the function name —
- * Anthropic 400s on `tool_use.name` (alongside an orphan `tool_result`),
- * OpenAI Chat Completions 400s on `tool_calls[i].function.name` — wedging the
- * session in a 400 loop until manual `/clear`.
+ * Models occasionally emit malformed calls such as `{ "name": "", "arguments": "{}" }`
+ * (observed: GLM-5.2 + thinking on long turns, #3458) or a structurally valid
+ * `toolCall` whose provider/native passthrough id never materialized (`id: ""`).
+ * The agent loop rejects or skips these at execution time, but the malformed block
+ * and its error tool-result can stay in `currentContext.messages`, so every
+ * subsequent request replays them. Every provider validates the call shape —
+ * Anthropic 400s on `tool_use.name` / `tool_use.id` (alongside an orphan
+ * `tool_result`), OpenAI Chat Completions 400s on malformed
+ * `tool_calls[i].function.*` — wedging the session in a 400 loop until manual
+ * `/clear`.
  *
  * Run before any other transform so the rest of the pipeline never sees a
  * malformed call. Idempotent: a re-run on an already-sanitized list returns
@@ -146,13 +149,21 @@ function isMalformedToolCallName(name: string | undefined): boolean {
 	return !name || name.trim().length === 0;
 }
 
+function isMalformedToolCallId(id: string | undefined): boolean {
+	return !id || id.trim().length === 0;
+}
+
+function isMalformedToolCall(block: { id: string; name: string }): boolean {
+	return isMalformedToolCallId(block.id) || isMalformedToolCallName(block.name);
+}
+
 function sanitizeMalformedToolCalls(messages: Message[]): Message[] {
 	// Fast path: skip the rewrite entirely when nothing is malformed.
 	let hasMalformed = false;
 	outer: for (const msg of messages) {
 		if (msg.role !== "assistant") continue;
 		for (const block of msg.content) {
-			if (block.type === "toolCall" && isMalformedToolCallName(block.name)) {
+			if (block.type === "toolCall" && isMalformedToolCall(block)) {
 				hasMalformed = true;
 				break outer;
 			}
@@ -178,7 +189,7 @@ function sanitizeMalformedToolCalls(messages: Message[]): Message[] {
 			const filtered: AssistantMessage["content"] = [];
 			for (const block of msg.content) {
 				if (block.type === "toolCall") {
-					const malformed = isMalformedToolCallName(block.name);
+					const malformed = isMalformedToolCall(block);
 					const queue = dropQueues.get(block.id);
 					if (queue) queue.push(malformed);
 					else dropQueues.set(block.id, [malformed]);
@@ -226,52 +237,20 @@ function isAnthropicMessagesModel(model: Model): model is Model<"anthropic-messa
 }
 
 /**
- * Cross-API `openai-completions` targets that can replay a prior turn's
- * reasoning as a native, signature-stripped `thinking` block on the wire.
- * Anthropic's same-API path (`replayUnsignedThinking`) covers
- * `anthropic-messages` targets directly; this is the analogue for the
- * `openai-completions` branch of the cross-API path (#3433/#3434). 3p ↔ 3p
- * replays between an Anthropic-compatible source (Z.AI Anthropic, Kimi
- * Anthropic, …) and an OpenAI-compat reasoning target on the same vendor must
- * keep reasoning as structured `reasoning_content` instead of degrading it to
- * conversation text.
- *
- * `compat` MUST be the request-time RESOLVED compat that `convertMessages`
- * threads into `transformMessages`, not `model.compat`. OpenCode-hosted
- * reasoning models (`opencode-go`/`opencode-zen`) keep
- * `requiresReasoningContentForToolCalls` off on the base compat to dodge the
- * thinking-off `Extra inputs are not permitted` 400 (#1071) and reactivate it
- * on `compat.whenThinking` for thinking-engaged requests to dodge the
- * `thinking is enabled but reasoning_content is missing` 400 (#1484).
- * `resolveOpenAICompatPolicy` already swaps in `whenThinking` for thinking-on
- * requests, so basing this decision on the resolved compat keeps the predicate
- * and the encoder in lockstep; reading `model.compat` would re-open #1484 for
- * every cross-API switch into an OpenCode reasoning model.
- *
- * The downstream encoder MUST then surface the preserved block on the wire via
- * `reasoningContentField` — see `openai-completions.ts` for the matching
- * branch.
+ * Targets that have proven they read unsigned foreign thinking when replayed
+ * natively. This is a semantic-carry allowlist only: OpenAI-compatible
+ * `reasoning_content` schema requirements and llama.cpp cache-prefix replay are
+ * handled by their encoders and MUST NOT make foreign thinking look meaningful.
  */
-function openAICompletionsReplaysUnsignedThinking(model: Model, compat: Model["compat"]): boolean {
+function targetReadsForeignThinking(model: Model, compat: Model["compat"]): boolean {
+	if (compat === undefined) return false;
+	if (model.api === "anthropic-messages") {
+		return "replayUnsignedThinking" in compat && compat.replayUnsignedThinking === true;
+	}
 	if (model.api !== "openai-completions") return false;
-	if (compat === undefined || !("requiresReasoningContentForToolCalls" in compat)) return false;
+	if (!("thinkingFormat" in compat)) return false;
 	if (compat.requiresThinkingAsText) return false;
-	// Local llama.cpp-style servers (`replayReasoningContent`) need the replay
-	// for KV-cache prefix reuse — Qwen3 / DeepSeek-R1 / GLM chat templates
-	// reconstruct the prior turn's `<think>` block from `reasoning_content`
-	// (#3528). Checked BEFORE the `model.reasoning` gate: the runtime discovery
-	// paths for `llama.cpp` / `lm-studio` / `openai-models-list` hardcode
-	// `reasoning: false` even when the upstream actually emits reasoning, so
-	// gating on the spec flag here would let a cross-API switch into such a
-	// target demote the prior `thinking` block to text and lose the
-	// cache-stable prefix `replayReasoningContent` is meant to preserve.
-	if (compat.replayReasoningContent) return true;
-	if (!model.reasoning) return false;
-	// Hosts that REQUIRE `reasoning_content` on tool-call turns (DeepSeek
-	// reasoning, Kimi, OpenRouter reasoning, OpenCode thinking-on) already
-	// accept the replay; Z.AI-format hosts (Z.AI, Zhipu, Moonshot Kimi native,
-	// Xiaomi MiMo) advertise `reasoning_content` as a continuation hint.
-	return compat.requiresReasoningContentForToolCalls || compat.thinkingFormat === "zai";
+	return model.reasoning && compat.thinkingFormat === "zai";
 }
 
 const ANTHROPIC_TOOL_CALL_ID_PATTERN = /^[a-zA-Z0-9_-]{1,64}$/;
@@ -314,9 +293,10 @@ export function transformMessages<TApi extends Api>(
 	duplicateToolCallIdSuffixPrefix = "_dup",
 	targetCompat: Model<TApi>["compat"] = model.compat,
 ): Message[] {
-	// Drop assistant `toolCall` blocks with empty/whitespace `name` (and their
-	// matched `toolResult` messages) before anything else looks at the history.
-	// Replays of these would 400 every provider — see `sanitizeMalformedToolCalls`.
+	// Drop assistant `toolCall` blocks with empty/whitespace `id` or `name`
+	// (and their matched `toolResult` messages) before anything else looks at
+	// the history. Replays of these would 400 every provider — see
+	// `sanitizeMalformedToolCalls`.
 	messages = sanitizeMalformedToolCalls(messages);
 
 	// Build a map of original tool call IDs to normalized IDs
@@ -451,6 +431,18 @@ export function transformMessages<TApi extends Api>(
 						if (!sanitized.thinkingSignature && (!sanitized.thinking || sanitized.thinking.trim() === "")) {
 							return [];
 						}
+						// Same-model Anthropic replay to a signature-enforcing endpoint
+						// cannot natively replay unsigned thinking, but this is not a
+						// dialect transition. Do not demote it into the target model's
+						// textual thinking dialect; that fallback is reserved for real
+						// model/provider transitions where native replay is impossible.
+						if (
+							isSameModel &&
+							isOfficialAnthropicTarget &&
+							(!sanitized.thinkingSignature || sanitized.thinkingSignature.trim() === "")
+						) {
+							return [];
+						}
 						return sanitized;
 					}
 					// Cross-API target: same-model replay keeps signatures untouched
@@ -461,29 +453,29 @@ export function transformMessages<TApi extends Api>(
 					// thinking blocks before the cross-model paths.
 					if (!sanitized.thinking || sanitized.thinking.trim() === "") return [];
 					if (isSameModel) return sanitized;
-					// Cross-model + cross-API: preserve as a native, signature-stripped
-					// `thinking` block whenever the target encoder can re-emit it on the
-					// wire (today: `openai-completions` reasoning targets that accept
-					// `reasoning_content` as a continuation hint — Z.AI, Zhipu, DeepSeek
-					// reasoning, Kimi native, MiMo, OpenRouter reasoning, …). The source
-					// signature is always dropped because it is bound to the source
-					// wire-format (Anthropic crypto sig / OpenAI Responses encrypted
-					// blob) and would be rejected by the target. Without this branch
-					// every cross-API 3p ↔ 3p switch (Z.AI Anthropic → Z.AI OpenAI,
-					// Kimi Anthropic → Kimi OpenAI, etc.) demoted prior reasoning to
-					// conversation text and lost it as structured reasoning context
-					// (#3433/#3434).
-					if (openAICompletionsReplaysUnsignedThinking(model, targetCompat)) {
+					// Cross-model + cross-API: preserve native thinking only for
+					// targets proven to read unsigned foreign reasoning (Z.AI-format
+					// OpenAI-compatible targets, plus Anthropic-compatible
+					// `replayUnsignedThinking`). Tool-call schema requirements and
+					// llama.cpp cache-prefix replay are orthogonal encoder concerns;
+					// keeping inert foreign CoT native for those flags loses the
+					// canonical visible-text fallback without adding model context.
+					if (targetReadsForeignThinking(model, targetCompat)) {
 						return sanitized.thinkingSignature ? { ...sanitized, thinkingSignature: undefined } : sanitized;
 					}
 					// Other cross-API targets (openai-responses encrypted blobs, google
-					// signed thought parts, anthropic-target from a non-Anthropic source,
-					// or any reasoning-disabled target) can't usefully replay an unsigned
-					// thinking block. Demote to text so the reasoning survives at least
-					// as visible conversation context.
+					// thought parts, anthropic-target from a non-Anthropic source, or any
+					// reasoning-disabled target) can't replay an unsigned thinking block:
+					// the native reasoning slot either rejects a foreign signature or — as
+					// verified end-to-end against Gemini 3 — silently discards unsigned
+					// thought content (it is neither recalled nor influences generation).
+					// Demote to text so the reasoning survives as context, wrapped in the
+					// TARGET model's own canonical thinking-block dialect (e.g. a ```thinking
+					// fence for Gemini) so it reads as reasoning rather than bare prose the
+					// model might mimic.
 					return {
 						type: "text" as const,
-						text: sanitized.thinking,
+						text: renderDemotedThinking(model.id, sanitized.thinking),
 					};
 				}
 
@@ -501,6 +493,22 @@ export function transformMessages<TApi extends Api>(
 					return [];
 				}
 
+				if (block.type === "fallback") {
+					// Server-side-fallback boundary marker (Anthropic beta
+					// `server-side-fallback-2026-06-01`). Only the official
+					// Anthropic endpoint accepts this block on replay: every
+					// other target either rejects unknown content blocks with a
+					// 400 (anthropic-compatible endpoints like Umans/Z.AI/MiniMax,
+					// and older omp gateways whose schema pre-dates this feature)
+					// or throws in its converter (Bedrock). Even the official
+					// replay path only accepts the block when the current request
+					// itself opts into the beta — but we don't know that here, so
+					// keep it and let `convertAnthropicMessages` re-check the
+					// per-request opt-in before serializing.
+					if (isAnthropicTarget && model.compat.officialEndpoint) return block;
+					return [];
+				}
+
 				if (block.type === "text") {
 					if (isSameModel) return block;
 					return {
@@ -514,8 +522,7 @@ export function transformMessages<TApi extends Api>(
 					let normalizedToolCall: ToolCall = toolCall;
 
 					if (!isSameModel && toolCall.thoughtSignature) {
-						normalizedToolCall = { ...toolCall };
-						delete (normalizedToolCall as { thoughtSignature?: string }).thoughtSignature;
+						normalizedToolCall = { ...toolCall, thoughtSignature: undefined };
 					}
 
 					if (isAnthropicTarget) {

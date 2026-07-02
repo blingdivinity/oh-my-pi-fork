@@ -1,10 +1,15 @@
 import { describe, expect, it } from "bun:test";
+import * as fs from "node:fs/promises";
+import * as os from "node:os";
+import * as path from "node:path";
 import {
 	computeFileHash,
+	formatHashlineHeader,
 	HEADTAIL_DRIFT_WARNING,
 	InMemoryFilesystem,
 	InMemorySnapshotStore,
 	MismatchError,
+	NodeFilesystem,
 	Patch,
 	Patcher,
 } from "@oh-my-pi/hashline";
@@ -31,6 +36,26 @@ describe("Patcher snapshot tag integrity", () => {
 		expect(result.sections[0]?.fileHash).toMatch(/^[0-9A-F]{4}$/);
 		expect(result.sections[0]?.fileHash).not.toBe(tag);
 		expect(fs.get(PATH)).toBe("after\n");
+	});
+
+	it("restores a UTF-8 BOM hidden by Bun text decoding", async () => {
+		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "hashline-bom-"));
+		try {
+			const filePath = path.join(tempDir, "Program.cs");
+			const source = "using A;\n";
+			await Bun.write(filePath, new Uint8Array([0xef, 0xbb, 0xbf, ...new TextEncoder().encode(source)]));
+			const snapshots = new InMemorySnapshotStore();
+			const tag = snapshots.record(filePath, source);
+			const patch = Patch.parse([formatHashlineHeader(filePath, tag), "SWAP 1.=1:", "+using B;"].join("\n"));
+
+			await new Patcher({ fs: new NodeFilesystem(), snapshots }).apply(patch);
+
+			const bytes = await fs.readFile(filePath);
+			expect(Array.from(bytes.subarray(0, 3))).toEqual([0xef, 0xbb, 0xbf]);
+			expect(new TextDecoder().decode(bytes.subarray(3))).toBe("using B;\n");
+		} finally {
+			await fs.rm(tempDir, { recursive: true, force: true });
+		}
 	});
 
 	it("validates any anchor purely from the content hash, even with no recorded snapshot", async () => {
@@ -100,6 +125,79 @@ describe("Patcher snapshot tag integrity", () => {
 			expect(message).toMatch(/current file hashes to #[0-9A-F]{4}/);
 		}
 		expect(fs.get(PATH)).toBe("current\n");
+	});
+
+	// A 16-bit snapshot tag can collide across two different file states.
+	// When the model authored line-anchored edits against snapshot A but the
+	// live file is a colliding text B, `computeFileHash` alone cannot tell them
+	// apart. The patcher must NOT take the no-drift path against B: it either
+	// recovers against the stored A (3-way merge) or rejects as stale.
+	// Regression for issue #4075.
+	it("refuses to accept a colliding live text as the tagged snapshot", async () => {
+		// These two texts both hash to `1D84`.
+		const SNAPSHOT_TEXT = "line one 263\nline two 4471\n";
+		const LIVE_TEXT = "line one 410\nline two 6970\n";
+		expect(computeFileHash(SNAPSHOT_TEXT)).toBe(computeFileHash(LIVE_TEXT));
+
+		const fs = new InMemoryFilesystem([[PATH, LIVE_TEXT]]);
+		const snapshots = new InMemorySnapshotStore();
+		// Tag was minted from SNAPSHOT_TEXT; live is the colliding LIVE_TEXT.
+		const tag = snapshots.record(PATH, SNAPSHOT_TEXT, [1, 2]);
+
+		const patcher = new Patcher({ fs, snapshots });
+		try {
+			await patcher.apply(Patch.parse(`[${PATH}#${tag}]\nSWAP 2.=2:\n+edited from snapshot`));
+			throw new Error("expected MismatchError");
+		} catch (error) {
+			expect(error).toBeInstanceOf(MismatchError);
+			const message = (error as MismatchError).displayMessage;
+			// The tag IS a known snapshot, so we land on the drift branch.
+			expect(message).toMatch(/file changed between read and edit/);
+		}
+		// Live file untouched: line 2 must NOT have been overwritten with the
+		// model's edit anchored against the collider.
+		expect(fs.get(PATH)).toBe(LIVE_TEXT);
+	});
+
+	it("rejects an ambiguous colliding tag even when live text matches one retained collider", async () => {
+		const SNAPSHOT_TEXT = "line one 263\nline two 4471\n";
+		const LIVE_TEXT = "line one 410\nline two 6970\n";
+		expect(computeFileHash(SNAPSHOT_TEXT)).toBe(computeFileHash(LIVE_TEXT));
+
+		const snapshots = new InMemorySnapshotStore();
+		const tag = snapshots.record(PATH, SNAPSHOT_TEXT, [1, 2]);
+		snapshots.record(PATH, LIVE_TEXT, [1, 2]);
+
+		const fs = new InMemoryFilesystem([[PATH, LIVE_TEXT]]);
+		const patcher = new Patcher({ fs, snapshots });
+		try {
+			await patcher.apply(Patch.parse(`[${PATH}#${tag}]\nSWAP 2.=2:\n+edited from snapshot`));
+			throw new Error("expected MismatchError");
+		} catch (error) {
+			expect(error).toBeInstanceOf(MismatchError);
+		}
+		expect(fs.get(PATH)).toBe(LIVE_TEXT);
+	});
+
+	it("rejects an ambiguous colliding tag before stale recovery can target the wrong snapshot", async () => {
+		const SNAPSHOT_TEXT = "line one 263\nline two 4471\n";
+		const COLLIDING_TEXT = "line one 410\nline two 6970\n";
+		const LIVE_TEXT = "line one 410\nline two 6970\nlive-added\n";
+		expect(computeFileHash(SNAPSHOT_TEXT)).toBe(computeFileHash(COLLIDING_TEXT));
+
+		const snapshots = new InMemorySnapshotStore();
+		const tag = snapshots.record(PATH, SNAPSHOT_TEXT, [1, 2]);
+		snapshots.record(PATH, COLLIDING_TEXT, [1, 2]);
+
+		const fs = new InMemoryFilesystem([[PATH, LIVE_TEXT]]);
+		const patcher = new Patcher({ fs, snapshots });
+		try {
+			await patcher.apply(Patch.parse(`[${PATH}#${tag}]\nSWAP 2.=2:\n+edited from snapshot`));
+			throw new Error("expected MismatchError");
+		} catch (error) {
+			expect(error).toBeInstanceOf(MismatchError);
+		}
+		expect(fs.get(PATH)).toBe(LIVE_TEXT);
 	});
 });
 

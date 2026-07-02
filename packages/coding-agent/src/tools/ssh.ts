@@ -26,7 +26,7 @@ import { clampTimeout } from "./tool-timeouts";
 const sshSchema = type({
 	host: type("string").describe("ssh host"),
 	command: type("string").describe("remote command"),
-	"cwd?": type("string").describe("remote working directory"),
+	"cwd?": type("string").describe("remote working directory; omit unless required, never ~ or ~/..."),
 	"timeout?": type("number").describe("timeout in seconds"),
 });
 
@@ -88,6 +88,12 @@ function quotePowerShellPath(value: string): string {
 function quoteCmdPath(value: string): string {
 	const escaped = value.replace(/"/g, '""');
 	return `"${escaped}"`;
+}
+function assertValidSshCwd(cwd: string | undefined): void {
+	if (!cwd) return;
+	if (cwd === "~" || cwd.startsWith("~/")) {
+		throw new ToolError("SSH cwd must be an absolute remote path; omit cwd instead of using ~.");
+	}
 }
 
 function buildRemoteCommand(command: string, cwd: string | undefined, info: SSHHostInfo): string {
@@ -177,6 +183,7 @@ export class SshTool implements AgentTool<typeof sshSchema, SSHToolDetails> {
 		if (!hostConfig) {
 			throw new ToolError(`SSH host not loaded: ${host}`);
 		}
+		assertValidSshCwd(cwd);
 
 		const hostInfo = await ensureHostInfo(hostConfig);
 		const remoteCommand = buildRemoteCommand(command, cwd, hostInfo);
@@ -369,10 +376,14 @@ export const sshToolRenderer = {
 		});
 	},
 	mergeCallAndResult: true,
-	// Collapsed pending preview caps the command to a viewport-sized tail window
-	// that shifts while args stream. Expanded output is top-anchored enough for
-	// the transcript to commit its settled prefix.
-	provisionalPendingPreview: "collapsed",
+	// Pending call preview can re-anchor wholesale when the final result inserts
+	// the `Output` section, so no pending SSH rows may commit to native
+	// scrollback — even when expanded. The expanded pending shape was previously
+	// allowed to commit, which left two visible shapes in native scrollback once
+	// the result settled: a stale `⏳ SSH: [host]` header above the final frame,
+	// and the pending `╰──╯` footer reused in-place as the new `├── Output ──┤`
+	// separator with a fresh footer pushed below it.
+	provisionalPendingPreview: true,
 	// Partial-result chrome (pending icon and frame state) differs from the
 	// final SSH glyph/state, so the block stays commit-unstable while
 	// `options.isPartial` holds. Without this, a long-running SSH command's

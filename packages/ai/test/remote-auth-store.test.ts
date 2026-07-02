@@ -10,6 +10,7 @@ import {
 	startAuthBroker,
 } from "@oh-my-pi/pi-ai/auth-broker";
 import * as oauthUtils from "@oh-my-pi/pi-ai/registry/oauth";
+import { removeWithRetries } from "../../utils/src/temp";
 
 const ANTHROPIC_ENV = ["ANTHROPIC_API_KEY", "ANTHROPIC_OAUTH_TOKEN"] as const;
 const savedEnv: Partial<Record<(typeof ANTHROPIC_ENV)[number], string | undefined>> = {};
@@ -50,7 +51,7 @@ describe("RemoteAuthCredentialStore + AuthStorage integration", () => {
 		await handle?.close();
 		serverStorage?.close();
 		serverStore?.close();
-		await fs.rm(tempDir, { recursive: true, force: true });
+		await removeWithRetries(tempDir);
 		for (const key of ANTHROPIC_ENV) {
 			if (savedEnv[key] === undefined) delete process.env[key];
 			else process.env[key] = savedEnv[key];
@@ -205,6 +206,56 @@ describe("RemoteAuthCredentialStore + AuthStorage integration", () => {
 		const miss = await remoteStore.getUsageReport("openai-codex", credA);
 		expect(miss).toBeNull();
 		expect(fetchSpy).toHaveBeenCalledTimes(1);
+
+		remoteStore.close();
+	});
+
+	test("getUsageReport caches broker fetch failure for USAGE_CACHE_TTL_MS", async () => {
+		const brokerClient = new AuthBrokerClient({ url: handle!.url, token });
+		const remoteStore = new RemoteAuthCredentialStore({
+			client: brokerClient,
+			initialSnapshot: {
+				generation: 0,
+				generatedAt: 0,
+				serverNowMs: 0,
+				refresher: { enabled: false, intervalMs: 0, skewMs: 0, nextSweepInMs: Number.MAX_SAFE_INTEGER },
+				credentials: [],
+			},
+		});
+
+		const fetchSpy = vi.spyOn(brokerClient, "fetchUsage").mockRejectedValue(new Error("broker offline"));
+
+		const nowSpy = vi.spyOn(Date, "now");
+		nowSpy.mockReturnValue(1_000_000);
+
+		// First sequential failure caches null.
+		const first = await remoteStore.fetchUsageReports();
+		expect(first).toBeNull();
+		expect(fetchSpy).toHaveBeenCalledTimes(1);
+
+		// Second call within 15s TTL is served from the cached null — no new fetch.
+		nowSpy.mockReturnValue(1_000_000 + 14_999);
+		const second = await remoteStore.fetchUsageReports();
+		expect(second).toBeNull();
+		expect(fetchSpy).toHaveBeenCalledTimes(1);
+
+		// getUsageReport shares the same negative cache.
+		const cred = {
+			type: "oauth" as const,
+			access: "ax",
+			refresh: REMOTE_REFRESH_SENTINEL,
+			expires: Date.now() + 60_000,
+			email: "a@example.com",
+		};
+		const perCred = await remoteStore.getUsageReport("anthropic", cred);
+		expect(perCred).toBeNull();
+		expect(fetchSpy).toHaveBeenCalledTimes(1);
+
+		// After the documented 15s TTL expires, the client retries once and hits the broker again.
+		nowSpy.mockReturnValue(1_000_000 + 15_000 + 1);
+		const retried = await remoteStore.fetchUsageReports();
+		expect(retried).toBeNull();
+		expect(fetchSpy).toHaveBeenCalledTimes(2);
 
 		remoteStore.close();
 	});
