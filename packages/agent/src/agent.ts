@@ -320,11 +320,9 @@ export interface AgentPromptOptions {
 	toolChoice?: ToolChoice;
 }
 
-/** Buffered Cursor tool result with text position at tool-call start */
+/** Buffered Cursor exec-channel tool result waiting to be emitted after the assistant message. */
 interface CursorToolResultEntry {
 	toolResult: ToolResultMessage;
-	textLengthAtCall: number;
-	order: number;
 }
 
 export class Agent {
@@ -395,10 +393,8 @@ export class Agent {
 	#telemetry?: AgentLoopConfig["telemetry"];
 	#appendOnlyContext?: AppendOnlyContextManager;
 
-	/** Buffered Cursor tool results with text length at tool-call start (for correct ordering) */
+	/** Buffered Cursor tool results with text length at time of call (for correct ordering) */
 	#cursorToolResultBuffer: CursorToolResultEntry[] = [];
-	#cursorToolStartPositions = new Map<string, { textLength: number; order: number }>();
-	#cursorToolOrder = 0;
 
 	streamFn: StreamFn;
 	getApiKey?: (model: Model) => Promise<ApiKey | undefined> | ApiKey | undefined;
@@ -782,7 +778,6 @@ export class Agent {
 				this.appendMessage(event.message);
 				break;
 			case "tool_execution_start":
-				this.#recordCursorToolStart(event.toolCallId);
 				this.#state.pendingToolCalls.add(event.toolCallId);
 				break;
 			case "tool_execution_end":
@@ -1078,10 +1073,8 @@ export class Agent {
 		this.#state.streamMessage = null;
 		this.#state.error = undefined;
 
-		// Clear Cursor tool ordering state at start of each run.
+		// Clear Cursor tool result buffer at start of each run
 		this.#cursorToolResultBuffer = [];
-		this.#cursorToolStartPositions.clear();
-		this.#cursorToolOrder = 0;
 
 		const reasoning = this.#state.thinkingLevel;
 
@@ -1103,16 +1096,11 @@ export class Agent {
 								}
 							} catch {}
 						}
-						// Cursor executes native tools out-of-band while the assistant text is still
-						// streaming. Anchor the transcript insertion point at tool START, not result
-						// completion; result completion can race later text deltas and randomly move
-						// the result toward the final response.
-						const startPosition = this.#cursorTextLengthForResult(finalMessage);
-						this.#cursorToolResultBuffer.push({
-							toolResult: finalMessage,
-							textLengthAtCall: startPosition.textLength,
-							order: startPosition.order,
-						});
+						// Cursor executes tools server-side during streaming. We buffer
+						// each toolResult and emit them right after the assistant message
+						// closes (see `#emitCursorSplitAssistantMessage`), so replay
+						// receives (assistant with interleaved toolCall blocks) → results.
+						this.#cursorToolResultBuffer.push({ toolResult: finalMessage });
 						return finalMessage;
 					}
 				: undefined;
@@ -1185,6 +1173,7 @@ export class Agent {
 			onHarmonyLeak: this.#onHarmonyLeak,
 			onTurnEnd: (messages, signal, context) => this.#onTurnEnd?.(messages, signal, context),
 			getToolChoice,
+			getModel: () => this.#state.model ?? model,
 			getReasoning: () => this.#state.thinkingLevel,
 			getDisableReasoning: () => this.#state.disableReasoning,
 			getServiceTier: this.#serviceTierResolver,
@@ -1236,7 +1225,6 @@ export class Agent {
 						break;
 
 					case "tool_execution_start":
-						this.#recordCursorToolStart(event.toolCallId);
 						this.#state.pendingToolCalls.add(event.toolCallId);
 						break;
 
@@ -1354,151 +1342,33 @@ export class Agent {
 		}
 	}
 
-	/** Calculate total text length from an assistant message's content blocks. */
-	#getAssistantTextLength(message: AgentMessage | null): number {
-		if (message?.role !== "assistant" || !Array.isArray(message.content)) {
-			return 0;
-		}
-		let length = 0;
-		for (const block of message.content) {
-			if (block.type === "text") {
-				length += (block as TextContent).text.length;
-			}
-		}
-		return length;
-	}
-
-	#recordCursorToolStart(toolCallId: string): void {
-		if (!this.#cursorExecHandlers && !this.#cursorOnToolResult) return;
-		if (this.#cursorToolStartPositions.has(toolCallId)) return;
-		this.#cursorToolStartPositions.set(toolCallId, {
-			textLength: this.#getAssistantTextLength(this.#state.streamMessage),
-			order: this.#cursorToolOrder++,
-		});
-	}
-
-	#cursorTextLengthForResult(message: ToolResultMessage): { textLength: number; order: number } {
-		const position = this.#cursorToolStartPositions.get(message.toolCallId);
-		if (position) {
-			this.#cursorToolStartPositions.delete(message.toolCallId);
-			return position;
-		}
-		return {
-			textLength: this.#getAssistantTextLength(this.#state.streamMessage),
-			order: this.#cursorToolOrder++,
-		};
-	}
-
-	#createCursorAssistantTextSegment(
-		assistantMessage: AssistantMessage,
-		text: string,
-		includeUsage: boolean,
-	): AssistantMessage {
-		const content: AssistantMessage["content"] = includeUsage
-			? assistantMessage.content.filter(block => block.type !== "text")
-			: [];
-		if (text.length > 0 || content.length === 0) {
-			content.push({ type: "text", text });
-		}
-		return {
-			...assistantMessage,
-			content,
-			usage: includeUsage
-				? assistantMessage.usage
-				: {
-						input: 0,
-						output: 0,
-						cacheRead: 0,
-						cacheWrite: 0,
-						totalTokens: 0,
-						cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-					},
-		};
-	}
-
-	#emitMessageEnd(message: AgentMessage): void {
-		this.appendMessage(message);
-		this.#emit({ type: "message_end", message });
-	}
-
 	/**
-	 * Emit a Cursor assistant message split around out-of-band native tool results.
+	 * Emit a Cursor assistant message with buffered exec-channel toolResults.
 	 *
-	 * Cursor's native exec tools do not arrive as `toolCall` content blocks. They
-	 * are emitted through external `tool_execution_*` events while assistant text
-	 * continues streaming. We therefore anchor each result at the text length
-	 * recorded when its tool started, then replay text/result/text/result in that
-	 * order when the assistant message finalizes.
+	 * Since the Cursor provider now synthesizes `toolCall` content blocks at the
+	 * point each exec tool starts (issue #4348), the assistant message content
+	 * already interleaves text/thinking with toolCall blocks in execution order.
+	 * We emit the message as-is and let the buffered toolResults follow — the
+	 * transcript rebuild in `renderSessionContext` pairs them by `toolCallId`.
+	 *
+	 * Historical note: this used to split the assistant message at
+	 * `textLengthAtCall` to interpose toolResults between preamble and
+	 * continuation. That workaround existed because native cursor tools had no
+	 * toolCall blocks; it also copied `preambleText` into every text block on
+	 * multi-text turns, producing duplicated text on replay.
 	 */
 	#emitCursorSplitAssistantMessage(assistantMessage: AssistantMessage): void {
-		const buffer = this.#cursorToolResultBuffer
-			.splice(0)
-			.sort((a, b) => a.textLengthAtCall - b.textLengthAtCall || a.order - b.order);
-
-		if (buffer.length === 0) {
-			this.#state.streamMessage = null;
-			this.#emitMessageEnd(assistantMessage);
-			return;
-		}
-
-		let fullText = "";
-		for (const block of assistantMessage.content) {
-			if (block.type === "text") {
-				fullText += block.text;
-			}
-		}
-
-		if (fullText.length === 0) {
-			this.#state.streamMessage = null;
-			this.#emitMessageEnd(assistantMessage);
-			for (const { toolResult } of buffer) {
-				this.#emit({ type: "message_start", message: toolResult });
-				this.#emitMessageEnd(toolResult);
-			}
-			return;
-		}
+		const buffer = this.#cursorToolResultBuffer;
+		this.#cursorToolResultBuffer = [];
 
 		this.#state.streamMessage = null;
-		let cursor = 0;
-		let emittedAssistantUsage = false;
-		if (
-			buffer[0] &&
-			Math.max(0, Math.min(buffer[0].textLengthAtCall, fullText.length)) === 0 &&
-			assistantMessage.content.some(block => block.type !== "text")
-		) {
-			this.#emitMessageEnd(this.#createCursorAssistantTextSegment(assistantMessage, "", true));
-			emittedAssistantUsage = true;
-		}
+		this.appendMessage(assistantMessage);
+		this.#emit({ type: "message_end", message: assistantMessage });
 
-		for (const entry of buffer) {
-			const splitPoint = Math.max(0, Math.min(entry.textLengthAtCall, fullText.length));
-			if (splitPoint > cursor) {
-				const segment = this.#createCursorAssistantTextSegment(
-					assistantMessage,
-					fullText.slice(cursor, splitPoint),
-					!emittedAssistantUsage,
-				);
-				if (emittedAssistantUsage) {
-					this.#emit({ type: "message_start", message: segment });
-				}
-				this.#emitMessageEnd(segment);
-				emittedAssistantUsage = true;
-			}
-			this.#emit({ type: "message_start", message: entry.toolResult });
-			this.#emitMessageEnd(entry.toolResult);
-			cursor = splitPoint;
-		}
-
-		if (cursor < fullText.length) {
-			const segment = this.#createCursorAssistantTextSegment(
-				assistantMessage,
-				fullText.slice(cursor),
-				!emittedAssistantUsage,
-			);
-			if (emittedAssistantUsage) {
-				this.#emit({ type: "message_start", message: segment });
-			}
-			this.#emitMessageEnd(segment);
+		for (const { toolResult } of buffer) {
+			this.#emit({ type: "message_start", message: toolResult });
+			this.appendMessage(toolResult);
+			this.#emit({ type: "message_end", message: toolResult });
 		}
 	}
 }

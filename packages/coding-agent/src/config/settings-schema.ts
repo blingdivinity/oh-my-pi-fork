@@ -4337,6 +4337,16 @@ export const SETTINGS_SCHEMA = {
 			description: "Providers that web_search should never use, even as fallbacks",
 		},
 	},
+	"providers.webSearchGeminiModel": {
+		type: "string",
+		default: undefined,
+		ui: {
+			tab: "providers",
+			group: "Services",
+			label: "Gemini web_search model",
+			description: "Model ID for Gemini Google Search grounding. Defaults to gemini-2.5-flash.",
+		},
+	},
 	"providers.antigravityEndpoint": {
 		type: "enum",
 		values: ["auto", "production", "sandbox"] as const,
@@ -4489,6 +4499,17 @@ export const SETTINGS_SCHEMA = {
 				{ value: "assistant", label: "Assistant messages" },
 				{ value: "yield", label: "Final message only" },
 			],
+		},
+	},
+	"speech.enhanced": {
+		type: "boolean",
+		default: false,
+		ui: {
+			tab: "providers",
+			group: "Services",
+			label: "Enhanced Speech Rewriting",
+			description:
+				"Rewrite assistant output into natural spoken prose with the tiny/smol model before synthesis (describes code, drops links and markdown). Falls back to mechanical cleanup on failure",
 		},
 	},
 	"speech.voice": {

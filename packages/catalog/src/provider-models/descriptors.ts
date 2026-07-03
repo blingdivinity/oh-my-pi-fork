@@ -453,13 +453,15 @@ export const CATALOG_PROVIDERS = [
 		defaultModel: "anthropic/claude-opus-4.8",
 		envVars: ["ZENMUX_API_KEY"],
 		createModelManagerOptions: (config: ModelManagerConfig) => zenmuxModelManagerOptions(config),
-		catalogDiscovery: { label: "ZenMux" },
+		allowUnauthenticated: true,
+		catalogDiscovery: { label: "ZenMux", allowUnauthenticated: true },
 	},
 	{
 		id: "zhipu-coding-plan",
-		defaultModel: "glm-5.2",
+		defaultModel: "glm-5.1",
 		envVars: ["ZHIPU_API_KEY"],
 		createModelManagerOptions: (config: ModelManagerConfig) => zhipuCodingPlanModelManagerOptions(config),
+		dynamicModelsAuthoritative: true,
 		catalogDiscovery: { label: "Zhipu Coding Plan" },
 	},
 ] as const satisfies readonly ProviderCatalogEntry[];

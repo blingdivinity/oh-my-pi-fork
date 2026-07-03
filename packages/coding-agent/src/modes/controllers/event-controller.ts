@@ -27,6 +27,7 @@ import { isSilentAbort, readQueueChipText, resolveAbortLabel } from "../../sessi
 import { previewLine, TRUNCATE_LENGTHS } from "../../tools/render-utils";
 import type { ResolveToolDetails } from "../../tools/resolve";
 import { nextActionableTask } from "../../tools/todo";
+import { SpeechEnhancer } from "../../tts/speech-enhancer";
 import { vocalizer } from "../../tts/vocalizer";
 import { canonicalizeMessage } from "../../utils/thinking-display";
 import { interruptHint } from "../shared";
@@ -111,6 +112,21 @@ export class EventController {
 	#terminalProgressActive = false;
 
 	constructor(private ctx: InteractiveModeContext) {
+		// Enhanced speech (`speech.enhanced`) rewrites blocks through the
+		// tiny/smol role with this session's registry and credentials; the
+		// vocalizer falls back to mechanical cleanup when unset. Tolerates
+		// partial contexts (tests, minimal embeddings) by wiring null.
+		const session = ctx.session;
+		vocalizer.setEnhancer(
+			session?.modelRegistry && session.agent && session.settings
+				? new SpeechEnhancer({
+						settings: session.settings,
+						registry: session.modelRegistry,
+						sessionId: session.sessionId,
+						metadataResolver: provider => session.agent.metadataForProvider(provider),
+					})
+				: null,
+		);
 		this.#streamingReveal = new StreamingRevealController({
 			getSmoothStreaming: () => this.ctx.settings.get("display.smoothStreaming"),
 			getHideThinkingBlock: () => this.ctx.effectiveHideThinkingBlock,
@@ -286,9 +302,13 @@ export class EventController {
 			await this.ctx.init();
 		}
 
-		this.ctx.statusLine.invalidate();
-		this.ctx.ui.requestRender();
-
+		// Each handler explicitly requests a render (or leaves it out, when it
+		// changed nothing visible). A blanket pre-render fired on every event —
+		// including the ~hundreds of `message_update` deltas per streaming turn —
+		// doubled the paint rate: the pre-render's frame fires while the handler
+		// is awaiting, then the handler's own final requestRender schedules a
+		// second identical frame. Removing it lets the render cadence follow real
+		// state changes rather than event volume (issue #4353).
 		const run = this.#handlers[event.type] as (e: AgentSessionEvent) => Promise<void>;
 		await run(event);
 	}
