@@ -160,14 +160,16 @@ export interface ToolSession {
 	contextFiles?: ContextFileEntry[];
 	/** Pre-loaded workspace tree (forwarded to subagents to skip re-scanning) */
 	workspaceTree?: WorkspaceTree;
-	/** Pre-loaded skills */
+	/** Session skill snapshot when skill discovery is available. */
 	skills?: readonly Skill[];
 	/** Rediscover live session skills after a tool mutates their backing files. */
 	refreshSkills?: () => Promise<void>;
 	/** Pre-loaded prompt templates */
 	promptTemplates?: PromptTemplate[];
 	/** Pre-loaded rules (forwarded to subagents to skip re-discovery). */
-	rules?: Rule[];
+	rules?: readonly Rule[];
+	/** Rules addressable through rule:// for this session. */
+	internalUrlRules?: readonly Rule[];
 	/**
 	 * Pre-discovered extension source paths. Forwarded to subagents so they
 	 * skip the FS scan but still re-bind extensions to their own session-scoped
@@ -222,6 +224,8 @@ export interface ToolSession {
 	trackEvalExecution?<T>(execution: Promise<T>, abortController: AbortController): Promise<T>;
 	/** Get session ID */
 	getSessionId?: () => string | null;
+	/** Reject vibe work while this session is disposing or changing identity. */
+	assertVibeExecutionAllowed?: () => void;
 	/** Get Hindsight runtime state for this agent session. */
 	getHindsightSessionState?: () => HindsightSessionState | undefined;
 	/** Get Mnemopi runtime state for this agent session. */
@@ -261,21 +265,11 @@ export interface ToolSession {
 	/** Agent output manager for unique agent:// IDs across task invocations */
 	agentOutputManager?: AgentOutputManager;
 	/**
-	 * Async job manager scoped to this session.
-	 *
-	 * - Top-level session that constructed one: its own manager.
-	 * - Subagent (`parentTaskPrefix` set): the parent's manager, so background
-	 *   bash/task work and `onJobComplete` deliveries flow into the conversation
-	 *   that spawned it.
-	 * - Secondary in-process top-level session that found a singleton already
-	 *   installed (issue #1923): `undefined`. Tools refuse async work rather
-	 *   than silently route completions into the owning session's `yieldQueue`.
-	 *
-	 * Tools MUST use this instead of `AsyncJobManager.instance()` so a secondary
-	 * session never borrows the owning session's manager by accident.
+	 * Async job manager scoped to this session. Sessions own an isolated manager
+	 * unless a child explicitly inherits its parent's manager.
 	 */
 	asyncJobManager?: AsyncJobManager;
-	/** MCP manager visible to subagents without relying on the process-global singleton. */
+	/** MCP manager visible to this session and explicitly inherited by children. */
 	mcpManager?: MCPManager;
 	/** Local protocol root to propagate to nested subagents and eval-created agents. */
 	localProtocolOptions?: LocalProtocolOptions;

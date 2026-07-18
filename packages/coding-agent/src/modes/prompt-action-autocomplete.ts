@@ -8,6 +8,7 @@ import {
 } from "@oh-my-pi/pi-tui";
 import { formatKeyHints, type KeybindingsManager } from "../config/keybindings";
 import { isSettingsInitialized, settings } from "../config/settings";
+import type { ResolveContext } from "../internal-urls/types";
 import { applyEmojiCompletion, getEmojiSuggestions, isEmojiPrefix, tryEmojiInlineReplace } from "./emoji-autocomplete";
 import { getGithubRefContext, getGithubRefSuggestions } from "./github-ref-autocomplete";
 import {
@@ -40,6 +41,7 @@ interface PromptActionAutocompleteOptions {
 	moveCursorToMessageStart: () => void;
 	moveCursorToLineStart: () => void;
 	moveCursorToLineEnd: () => void;
+	getInternalUrlContext?: () => ResolveContext;
 }
 
 function fuzzyMatch(query: string, target: string): boolean {
@@ -130,12 +132,19 @@ export class PromptActionAutocompleteProvider implements AutocompleteProvider {
 	#baseProvider: CombinedAutocompleteProvider;
 	#actions: PromptActionDefinition[];
 	#basePath: string;
+	#getInternalUrlContext: (() => ResolveContext) | undefined;
 
-	constructor(commands: SlashCommand[], basePath: string, actions: PromptActionDefinition[]) {
+	constructor(
+		commands: SlashCommand[],
+		basePath: string,
+		actions: PromptActionDefinition[],
+		getInternalUrlContext?: () => ResolveContext,
+	) {
 		this.#commands = commands;
 		this.#baseProvider = new CombinedAutocompleteProvider(commands, basePath);
 		this.#basePath = basePath;
 		this.#actions = actions;
+		this.#getInternalUrlContext = getInternalUrlContext;
 	}
 
 	async getSuggestions(
@@ -161,7 +170,7 @@ export class PromptActionAutocompleteProvider implements AutocompleteProvider {
 				// No slash-argument completion for this input: fall through to
 				// internal-url completion only. `#` prompt-action tokens stay
 				// literal text inside slash command arguments.
-				return getInternalUrlSuggestions(textBeforeCursor, this.#basePath);
+				return getInternalUrlSuggestions(textBeforeCursor, this.#basePath, this.#getInternalUrlContext?.());
 			}
 		}
 
@@ -191,7 +200,11 @@ export class PromptActionAutocompleteProvider implements AutocompleteProvider {
 			}
 		}
 
-		const urlSuggestions = await getInternalUrlSuggestions(textBeforeCursor, this.#basePath);
+		const urlSuggestions = await getInternalUrlSuggestions(
+			textBeforeCursor,
+			this.#basePath,
+			this.#getInternalUrlContext?.(),
+		);
 		if (urlSuggestions) return urlSuggestions;
 
 		if (!isSettingsInitialized() || settings.get("emojiAutocomplete")) {
@@ -316,5 +329,10 @@ export function createPromptActionAutocompleteProvider(
 		},
 	];
 
-	return new PromptActionAutocompleteProvider(options.commands, options.basePath, actions);
+	return new PromptActionAutocompleteProvider(
+		options.commands,
+		options.basePath,
+		actions,
+		options.getInternalUrlContext,
+	);
 }

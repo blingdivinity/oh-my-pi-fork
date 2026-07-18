@@ -28,7 +28,7 @@ describe("createAgentSession cwd after /move", () => {
 		}
 	});
 
-	it("runs tools from the moved session directory", async () => {
+	it("updates tool execution and the system prompt to the moved session directory", async () => {
 		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `pi-sdk-move-cwd-${Snowflake.next()}-`));
 		tempDirs.push(tempDir);
 		const cwdA = path.join(tempDir, "cwd-a");
@@ -59,6 +59,11 @@ describe("createAgentSession cwd after /move", () => {
 
 		try {
 			await sessionManager.moveTo(cwdB);
+			await session.reloadResources(["instructions"]);
+
+			const systemPrompt = session.systemPrompt.join("\n");
+			expect(systemPrompt).toContain(cwdB);
+			expect(systemPrompt).not.toContain(cwdA);
 
 			const bashTool = session.getToolByName("bash");
 			if (!bashTool) throw new Error("Expected bash tool");

@@ -1,4 +1,4 @@
-import type { Component, OverlayHandle, TUI } from "@oh-my-pi/pi-tui";
+import type { Component, EditorTheme, OverlayHandle, TUI } from "@oh-my-pi/pi-tui";
 import { Container, Spacer, Text } from "@oh-my-pi/pi-tui";
 import type { CollabUiRequestDraft, CollabUiSelectItem } from "@oh-my-pi/pi-wire";
 import { KeybindingsManager } from "../../config/keybindings";
@@ -22,6 +22,7 @@ import type {
 } from "../../extensibility/extensions";
 import { getSessionSlashCommands } from "../../extensibility/extensions/get-commands-handler";
 import { AskDialogComponent, boundPromptTitle } from "../../modes/components/ask-dialog";
+import type { CustomEditor } from "../../modes/components/custom-editor";
 import { HookEditorComponent } from "../../modes/components/hook-editor";
 import { HookInputComponent } from "../../modes/components/hook-input";
 import { HookSelectorComponent, type HookSelectorSlider } from "../../modes/components/hook-selector";
@@ -51,6 +52,22 @@ interface CollabAskDialogWinner {
  *  "unavailable" collide with the transport sentinel. */
 type GuestUiResult = { kind: "answered"; value: string } | { kind: "cancelled" } | { kind: "unavailable" };
 
+interface StagedTerminalInputListener {
+	readonly handler: TerminalInputHandler;
+	active: boolean;
+	unsubscribe?: () => void;
+}
+
+interface StagedGenerationUi {
+	readonly terminalInputListeners: Set<StagedTerminalInputListener>;
+	readonly hookWidgetsAbove: Map<string, ExtensionUiComponent>;
+	readonly hookWidgetsBelow: Map<string, ExtensionUiComponent>;
+	readonly hookStatuses: Map<string, string>;
+	editorFactory: ((tui: TUI, theme: EditorTheme, keybindings: KeybindingsManager) => CustomEditor) | undefined;
+	workingMessage: string | undefined;
+	title: string | undefined;
+}
+
 function toWireSelectOptions(options: ExtensionUISelectItem[]): CollabUiSelectItem[] {
 	return options.map(option =>
 		typeof option === "string"
@@ -65,12 +82,80 @@ export class ExtensionUiController {
 	#extensionTerminalInputUnsubscribers = new Set<() => void>();
 	#hookWidgetsAbove = new Map<string, ExtensionUiComponent>();
 	#hookWidgetsBelow = new Map<string, ExtensionUiComponent>();
+	#hookStatuses = new Map<string, string>();
+	#activeEditorFactory: StagedGenerationUi["editorFactory"];
+	#activeWorkingMessage: string | undefined;
+	#activeTitle: string | undefined;
+	#stagedGeneration: StagedGenerationUi | undefined;
 	// Single-file dialog surface (`editorContainer` + focus) is shared by the
 	// selector / input / editor modals, so only one may be presented at a time;
 	// the rest queue. See `#presentDialog`.
 	#dialogActive = false;
-	#dialogQueue: Array<() => void> = [];
+	#dialogQueue: Array<{ start: () => void; cancel: () => void }> = [];
+	#activeDialogSettle: (() => void) | undefined;
+	#activeCustomDialogCloses = new Set<() => void>();
 	constructor(private ctx: InteractiveModeContext) {}
+
+	beginReloadGeneration(): void {
+		this.rollbackReloadGeneration();
+		this.#stagedGeneration = {
+			terminalInputListeners: new Set(),
+			hookWidgetsAbove: new Map(),
+			hookWidgetsBelow: new Map(),
+			hookStatuses: new Map(),
+			editorFactory: undefined,
+			workingMessage: undefined,
+			title: undefined,
+		};
+	}
+
+	commitReloadGeneration(): void {
+		const staged = this.#stagedGeneration;
+		if (!staged) return;
+		this.#stagedGeneration = undefined;
+		this.#dismissDialogs();
+		this.clearExtensionTerminalInputListeners();
+		this.#disposeWidgets(this.#hookWidgetsAbove);
+		this.#disposeWidgets(this.#hookWidgetsBelow);
+		this.#hookWidgetsAbove = staged.hookWidgetsAbove;
+		this.#hookWidgetsBelow = staged.hookWidgetsBelow;
+		for (const registration of staged.terminalInputListeners) {
+			if (!registration.active) continue;
+			registration.unsubscribe = this.#installExtensionTerminalInputListener(registration.handler);
+		}
+		for (const key of this.#hookStatuses.keys()) this.ctx.statusLine.setHookStatus(key, undefined);
+		this.#hookStatuses = staged.hookStatuses;
+		for (const [key, text] of this.#hookStatuses) this.ctx.statusLine.setHookStatus(key, text);
+		if (this.#activeEditorFactory !== staged.editorFactory) {
+			this.#activeEditorFactory = staged.editorFactory;
+			this.ctx.setEditorComponent(staged.editorFactory);
+		}
+		if (this.#activeWorkingMessage !== staged.workingMessage) {
+			this.#activeWorkingMessage = staged.workingMessage;
+			this.ctx.setWorkingMessage(staged.workingMessage);
+		}
+		if (this.#activeTitle !== staged.title) {
+			this.#activeTitle = staged.title;
+			if (staged.title === undefined) {
+				setSessionTerminalTitle(this.ctx.sessionManager.getSessionName(), this.ctx.sessionManager.getCwd());
+			} else {
+				setTerminalTitle(staged.title);
+			}
+		}
+		this.#rebuildHookWidgets();
+	}
+
+	rollbackReloadGeneration(): void {
+		const staged = this.#stagedGeneration;
+		if (!staged) return;
+		this.#stagedGeneration = undefined;
+		this.#disposeWidgets(staged.hookWidgetsAbove);
+		this.#disposeWidgets(staged.hookWidgetsBelow);
+		for (const registration of staged.terminalInputListeners) {
+			registration.active = false;
+			registration.unsubscribe?.();
+		}
+	}
 
 	/**
 	 * Initialize the hook system with TUI-based UI context.
@@ -86,9 +171,9 @@ export class ExtensionUiController {
 			notify: (message, type) => this.showHookNotify(message, type),
 			onTerminalInput: handler => this.addExtensionTerminalInputListener(handler),
 			setStatus: (key, text) => this.setHookStatus(key, text),
-			setWorkingMessage: message => this.ctx.setWorkingMessage(message),
+			setWorkingMessage: message => this.setExtensionWorkingMessage(message),
 			setWidget: (key, content, options) => this.setHookWidget(key, content, options),
-			setTitle: title => setTerminalTitle(title),
+			setTitle: title => this.setExtensionTitle(title),
 			custom: (factory, options) => this.showHookCustom(factory, options),
 			setEditorText: text => {
 				this.ctx.editor.setText(text);
@@ -116,7 +201,7 @@ export class ExtensionUiController {
 			},
 			setFooter: () => {},
 			setHeader: () => {},
-			setEditorComponent: factory => this.ctx.setEditorComponent(factory),
+			setEditorComponent: factory => this.setExtensionEditorComponent(factory),
 			getToolsExpanded: () => this.ctx.toolOutputExpanded,
 			setToolsExpanded: expanded => this.ctx.setToolsExpanded(expanded),
 		};
@@ -181,7 +266,10 @@ export class ExtensionUiController {
 			getContextUsage: () => this.ctx.session.getContextUsage(),
 			waitForIdle: () => this.ctx.session.agent.waitForIdle(),
 			reload: async () => {
-				await this.ctx.session.reload();
+				const result = await this.ctx.reloadPluginState();
+				if (result?.state === "failed") {
+					throw new Error(result.diagnostics.map(diagnostic => diagnostic.message).join("; "));
+				}
 				this.ctx.renderInitialMessages({ clearTerminalHistory: true });
 				await this.ctx.reloadTodos();
 				this.ctx.showStatus("Reloaded session");
@@ -269,25 +357,30 @@ export class ExtensionUiController {
 			this.showExtensionError(error.extensionPath, error.error);
 		});
 
-		// Emit session_start event
-		await extensionRunner.emit({
-			type: "session_start",
-		});
+		// Activate the generation and emit session_start exactly once.
+		await extensionRunner.activate();
 	}
 
 	setHookWidget(key: string, content: ExtensionWidgetContent, options?: ExtensionWidgetOptions): void {
 		const placement = options?.placement ?? "aboveEditor";
-		this.#removeHookWidget(this.#hookWidgetsAbove, key);
-		this.#removeHookWidget(this.#hookWidgetsBelow, key);
+		const above = this.#stagedGeneration?.hookWidgetsAbove ?? this.#hookWidgetsAbove;
+		const below = this.#stagedGeneration?.hookWidgetsBelow ?? this.#hookWidgetsBelow;
+		this.#removeHookWidget(above, key);
+		this.#removeHookWidget(below, key);
 
 		if (content === undefined) {
-			this.#rebuildHookWidgets();
+			if (!this.#stagedGeneration) this.#rebuildHookWidgets();
 			return;
 		}
 
-		const target = placement === "belowEditor" ? this.#hookWidgetsBelow : this.#hookWidgetsAbove;
+		const target = placement === "belowEditor" ? below : above;
 		target.set(key, this.#createHookWidget(content));
-		this.#rebuildHookWidgets();
+		if (!this.#stagedGeneration) this.#rebuildHookWidgets();
+	}
+
+	#disposeWidgets(widgets: Map<string, ExtensionUiComponent>): void {
+		for (const widget of widgets.values()) widget.dispose?.();
+		widgets.clear();
 	}
 
 	#removeHookWidget(widgets: Map<string, ExtensionUiComponent>, key: string): void {
@@ -296,6 +389,32 @@ export class ExtensionUiController {
 		widgets.delete(key);
 	}
 
+	setExtensionWorkingMessage(message?: string): void {
+		if (this.#stagedGeneration) {
+			this.#stagedGeneration.workingMessage = message;
+			return;
+		}
+		this.#activeWorkingMessage = message;
+		this.ctx.setWorkingMessage(message);
+	}
+
+	setExtensionTitle(title: string): void {
+		if (this.#stagedGeneration) {
+			this.#stagedGeneration.title = title;
+			return;
+		}
+		this.#activeTitle = title;
+		setTerminalTitle(title);
+	}
+
+	setExtensionEditorComponent(factory: StagedGenerationUi["editorFactory"]): void {
+		if (this.#stagedGeneration) {
+			this.#stagedGeneration.editorFactory = factory;
+			return;
+		}
+		this.#activeEditorFactory = factory;
+		this.ctx.setEditorComponent(factory);
+	}
 	#createHookWidget(content: ExtensionWidgetContent): ExtensionUiComponent {
 		if (Array.isArray(content)) {
 			const container = new Container();
@@ -522,6 +641,14 @@ export class ExtensionUiController {
 	 * Set hook status text in the footer.
 	 */
 	setHookStatus(key: string, text: string | undefined): void {
+		const statuses = this.#stagedGeneration?.hookStatuses;
+		if (statuses) {
+			if (text === undefined) statuses.delete(key);
+			else statuses.set(key, text);
+			return;
+		}
+		if (text === undefined) this.#hookStatuses.delete(key);
+		else this.#hookStatuses.set(key, text);
 		this.ctx.statusLine.setHookStatus(key, text);
 		this.ctx.ui.requestRender();
 	}
@@ -532,6 +659,7 @@ export class ExtensionUiController {
 		dialogOptions?: InteractiveSelectorDialogOptions,
 		extra?: { slider?: HookSelectorSlider },
 	): Promise<string | undefined> {
+		if (this.#stagedGeneration) return undefined;
 		const request: CollabUiRequestDraft = {
 			kind: "select",
 			title,
@@ -553,6 +681,7 @@ export class ExtensionUiController {
 		dialogOptions?: ExtensionUIDialogOptions,
 		editorOptions?: { promptStyle?: boolean },
 	): Promise<string | undefined> {
+		if (this.#stagedGeneration) return undefined;
 		const request: CollabUiRequestDraft = { kind: "editor", title, prefill };
 		return this.#raceCollabDialog(request, dialogOptions?.signal, signal =>
 			this.showHookEditor(title, prefill, { ...dialogOptions, signal }, editorOptions),
@@ -563,6 +692,7 @@ export class ExtensionUiController {
 		questions: ExtensionAskDialogQuestion[],
 		dialogOptions?: ExtensionUIDialogOptions,
 	): Promise<ExtensionAskDialogResult | undefined> {
+		if (this.#stagedGeneration) return undefined;
 		const host = this.ctx.collabHost;
 		if (!host) return this.#showLocalAskDialog(questions, dialogOptions);
 		const localAbort = new AbortController();
@@ -829,6 +959,7 @@ export class ExtensionUiController {
 		dialogOptions?: InteractiveSelectorDialogOptions,
 		extra?: { slider?: HookSelectorSlider },
 	): Promise<string | undefined> {
+		if (this.#stagedGeneration) return Promise.resolve(undefined);
 		return this.#presentDialog(dialogOptions?.signal, settle => {
 			const maxVisible = Math.max(4, Math.min(15, this.ctx.ui.terminal.rows - 12));
 			this.ctx.hookSelector = new HookSelectorComponent(
@@ -901,6 +1032,7 @@ export class ExtensionUiController {
 		placeholder?: string,
 		dialogOptions?: ExtensionUIDialogOptions,
 	): Promise<string | undefined> {
+		if (this.#stagedGeneration) return Promise.resolve(undefined);
 		return this.#presentDialog(dialogOptions?.signal, settle => {
 			this.ctx.hookInput = new HookInputComponent(
 				title,
@@ -942,6 +1074,7 @@ export class ExtensionUiController {
 		dialogOptions?: ExtensionUIDialogOptions,
 		editorOptions?: { promptStyle?: boolean },
 	): Promise<string | undefined> {
+		if (this.#stagedGeneration) return Promise.resolve(undefined);
 		return this.#presentDialog(dialogOptions?.signal, settle => {
 			this.ctx.hookEditor = new HookEditorComponent(
 				this.ctx.ui,
@@ -974,6 +1107,7 @@ export class ExtensionUiController {
 	 * Show a notification for hooks.
 	 */
 	showHookNotify(message: string, type?: "info" | "warning" | "error"): void {
+		if (this.#stagedGeneration) return;
 		if (type === "error") {
 			this.ctx.showError(message);
 		} else if (type === "warning") {
@@ -995,6 +1129,7 @@ export class ExtensionUiController {
 		) => (Component & { dispose?(): void }) | Promise<Component & { dispose?(): void }>,
 		options?: { overlay?: boolean },
 	): Promise<T> {
+		if (this.#stagedGeneration) return Promise.resolve(undefined as T);
 		const savedText = this.ctx.editor.getText();
 		const keybindings = KeybindingsManager.inMemory();
 
@@ -1002,10 +1137,12 @@ export class ExtensionUiController {
 		let component: (Component & { dispose?(): void }) | undefined;
 		let overlayHandle: OverlayHandle | undefined;
 		let closed = false;
+		let dismiss: (() => void) | undefined;
 
 		const close = (result: T) => {
 			if (closed) return;
 			closed = true;
+			if (dismiss) this.#activeCustomDialogCloses.delete(dismiss);
 			component?.dispose?.();
 			overlayHandle?.hide();
 			overlayHandle = undefined;
@@ -1018,6 +1155,8 @@ export class ExtensionUiController {
 			this.ctx.ui.requestRender();
 			resolve(result);
 		};
+		dismiss = () => close(undefined as T);
+		this.#activeCustomDialogCloses.add(dismiss);
 
 		Promise.try(() => factory(this.ctx.ui, theme, keybindings, close)).then(c => {
 			if (closed) {
@@ -1046,6 +1185,21 @@ export class ExtensionUiController {
 	 * Show an extension error in the UI.
 	 */
 	addExtensionTerminalInputListener(handler: TerminalInputHandler): () => void {
+		const staged = this.#stagedGeneration;
+		if (staged) {
+			const registration: StagedTerminalInputListener = { handler, active: true };
+			staged.terminalInputListeners.add(registration);
+			return () => {
+				if (!registration.active) return;
+				registration.active = false;
+				staged.terminalInputListeners.delete(registration);
+				registration.unsubscribe?.();
+			};
+		}
+		return this.#installExtensionTerminalInputListener(handler);
+	}
+
+	#installExtensionTerminalInputListener(handler: TerminalInputHandler): () => void {
 		const unsubscribe = this.ctx.ui.addInputListener(handler);
 		this.#extensionTerminalInputUnsubscribers.add(unsubscribe);
 		return () => {
@@ -1110,6 +1264,13 @@ export class ExtensionUiController {
 		}
 	}
 
+	#dismissDialogs(): void {
+		const queued = this.#dialogQueue.splice(0);
+		this.#activeDialogSettle?.();
+		for (const request of queued) request.cancel();
+		for (const close of [...this.#activeCustomDialogCloses]) close();
+	}
+
 	/**
 	 * Present a modal dialog on the shared editor surface, serializing against any
 	 * dialog already open. `present` builds the component, swaps it into
@@ -1140,6 +1301,7 @@ export class ExtensionUiController {
 			if (settled) return;
 			settled = true;
 			signal?.removeEventListener("abort", onAbort);
+			if (this.#activeDialogSettle === settle) this.#activeDialogSettle = undefined;
 			if (started) {
 				hide?.();
 				this.#dialogActive = false;
@@ -1156,11 +1318,13 @@ export class ExtensionUiController {
 			}
 			started = true;
 			this.#dialogActive = true;
+			this.#activeDialogSettle = () => settle(undefined);
 			try {
 				hide = present(settle);
 			} catch (error) {
 				settled = true;
 				signal?.removeEventListener("abort", onAbort);
+				if (this.#activeDialogSettle !== undefined) this.#activeDialogSettle = undefined;
 				this.#dialogActive = false;
 				reject(error);
 				this.#advanceDialogQueue();
@@ -1174,7 +1338,7 @@ export class ExtensionUiController {
 		signal?.addEventListener("abort", onAbort, { once: true });
 
 		if (this.#dialogActive) {
-			this.#dialogQueue.push(startPresentation);
+			this.#dialogQueue.push({ start: startPresentation, cancel: () => settle(undefined) });
 		} else {
 			startPresentation();
 		}
@@ -1182,6 +1346,6 @@ export class ExtensionUiController {
 	}
 
 	#advanceDialogQueue(): void {
-		this.#dialogQueue.shift()?.();
+		this.#dialogQueue.shift()?.start();
 	}
 }

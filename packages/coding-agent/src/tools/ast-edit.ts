@@ -281,10 +281,13 @@ export class AstEditTool implements AgentTool<typeof astEditSchema, AstEditToolD
 				rawPaths: params.paths,
 				cwd: this.session.cwd,
 				internalUrlAction: "rewrite",
+				trackImmutableSources: true,
 				settings: this.session.settings,
 				signal,
 				localProtocolOptions: this.session.localProtocolOptions,
 				skills: this.session.skills,
+				rules: this.session.internalUrlRules,
+				mcpManager: this.session.mcpManager,
 				resolveExternalUrl: async rawPath => {
 					if (!parseReadUrlTarget(rawPath)) return undefined;
 					throw new ToolError(
@@ -292,6 +295,13 @@ export class AstEditTool implements AgentTool<typeof astEditSchema, AstEditToolD
 					);
 				},
 			});
+			if (scope.immutableSourcePaths.size > 0) {
+				const immutableInputs = params.paths.filter(isInternalUrlPath);
+				const logicalInputs = immutableInputs.length > 0 ? immutableInputs.join(", ") : "the selected input";
+				throw new ToolError(
+					`Cannot rewrite immutable internal resource ${logicalInputs}; ast_edit only applies to mutable local files.`,
+				);
+			}
 			const { searchPath: resolvedSearchPath, scopePath, isDirectory, multiTargets, globFilter } = scope;
 
 			const result = await runAstEditOnce(multiTargets, resolvedSearchPath, globFilter, {

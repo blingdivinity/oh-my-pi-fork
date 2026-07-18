@@ -1,9 +1,11 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import type { Rule } from "../capability/rule";
 import type { Skill } from "../extensibility/skills";
 import { type LocalProtocolOptions, resolveLocalUrlToPath } from "../internal-urls";
 import { validateRelativePath } from "../internal-urls/skill-protocol";
 import type { InternalResource, ResolveContext } from "../internal-urls/types";
+import type { MCPManager } from "../mcp";
 import { normalizeLocalScheme } from "./path-utils";
 import { ToolError } from "./tool-errors";
 
@@ -24,6 +26,8 @@ interface InternalUrlResolver {
 
 export interface InternalUrlExpansionOptions {
 	skills: readonly Skill[];
+	rules?: readonly Rule[];
+	mcpManager?: MCPManager;
 	noEscape?: boolean;
 	internalRouter?: InternalUrlResolver;
 	localOptions?: LocalProtocolOptions;
@@ -196,14 +200,7 @@ function shellEscape(p: string): string {
 	return `'${p.replace(/'/g, "'\\''")}'`;
 }
 
-async function resolveInternalUrlToPath(
-	rawUrl: string,
-	skills: readonly Skill[],
-	internalRouter?: InternalUrlResolver,
-	localOptions?: LocalProtocolOptions,
-	ensureLocalParentDirs?: boolean,
-	cwd?: string,
-): Promise<string> {
+async function resolveInternalUrlToPath(rawUrl: string, options: InternalUrlExpansionOptions): Promise<string> {
 	const url = normalizeLocalScheme(rawUrl);
 	const scheme = extractScheme(url);
 	if (!scheme) {
@@ -211,23 +208,23 @@ async function resolveInternalUrlToPath(
 	}
 
 	if (scheme === "skill") {
-		return resolveSkillUrlToPath(url, skills);
+		return resolveSkillUrlToPath(url, options.skills);
 	}
 
 	if (scheme === "local") {
-		if (!localOptions) {
+		if (!options.localOptions) {
 			throw new ToolError(
 				"Cannot resolve local:// URL in bash command: local protocol options are unavailable for this session.",
 			);
 		}
-		const resolvedLocalPath = resolveLocalUrlToPath(url, localOptions);
-		if (ensureLocalParentDirs) {
+		const resolvedLocalPath = resolveLocalUrlToPath(url, options.localOptions);
+		if (options.ensureLocalParentDirs) {
 			await fs.mkdir(path.dirname(resolvedLocalPath), { recursive: true });
 		}
 		return resolvedLocalPath;
 	}
 
-	if (!internalRouter?.canHandle(url)) {
+	if (!options.internalRouter?.canHandle(url)) {
 		throw new ToolError(
 			`Cannot resolve ${scheme}:// URL in bash command: ${url}\n` +
 				"Internal URL router is unavailable for this protocol in the current session.",
@@ -236,7 +233,14 @@ async function resolveInternalUrlToPath(
 
 	let resource: InternalResource;
 	try {
-		resource = await internalRouter.resolve(url, { cwd, pathOnly: true });
+		resource = await options.internalRouter.resolve(url, {
+			cwd: options.cwd,
+			localProtocolOptions: options.localOptions,
+			skills: options.skills,
+			rules: options.rules,
+			mcpManager: options.mcpManager,
+			pathOnly: true,
+		});
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error);
 		throw new ToolError(`Failed to resolve ${scheme}:// URL in bash command: ${url}\n${message}`);
@@ -290,14 +294,7 @@ export async function expandInternalUrls(command: string, options: InternalUrlEx
 		const url = normalizeLocalScheme(rawUrl);
 		let resolvedPath: string;
 		try {
-			resolvedPath = await resolveInternalUrlToPath(
-				url,
-				options.skills,
-				options.internalRouter,
-				options.localOptions,
-				options.ensureLocalParentDirs,
-				options.cwd,
-			);
+			resolvedPath = await resolveInternalUrlToPath(url, options);
 		} catch {
 			continue;
 		}

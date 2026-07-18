@@ -3,8 +3,10 @@ import * as os from "node:os";
 import * as path from "node:path";
 import * as url from "node:url";
 import { isEnoent, isEnotdir, stripWindowsExtendedLengthPathPrefix } from "@oh-my-pi/pi-utils";
+import type { Rule } from "../capability/rule";
 import type { Skill } from "../extensibility/skills";
 import { InternalUrlRouter, type LocalProtocolOptions } from "../internal-urls";
+import type { MCPManager } from "../mcp";
 import { ToolError } from "./tool-errors";
 
 const UNICODE_SPACES = /[\u00A0\u2000-\u200A\u202F\u205F\u3000]/g;
@@ -1167,6 +1169,10 @@ export interface ToolScopeOptions {
 	localProtocolOptions?: LocalProtocolOptions;
 	/** Calling session's loaded skills — lets skill:// resolve without process-global state. */
 	skills?: readonly Skill[];
+	/** Calling session's loaded rules. */
+	rules?: readonly Rule[];
+	/** Calling session's MCP manager. */
+	mcpManager?: MCPManager;
 	/** Materialize readable external URLs to local text files before scope derivation. */
 	resolveExternalUrl?: (rawPath: string) => Promise<ResolvedExternalSearchUrl | undefined>;
 }
@@ -1256,6 +1262,8 @@ export async function resolveToolSearchScope(opts: ToolScopeOptions): Promise<To
 			signal: opts.signal,
 			localProtocolOptions: opts.localProtocolOptions,
 			skills: opts.skills,
+			rules: opts.rules,
+			mcpManager: opts.mcpManager,
 			// Tool-scope resolution only needs `sourcePath`; skip content
 			// materialization so large artifacts (or any handler that separates
 			// path from content) stay searchable without OOM risk.

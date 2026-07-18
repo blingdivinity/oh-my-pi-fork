@@ -768,6 +768,8 @@ async function resolveInternalSearchInputs(opts: {
 	archiveDisplayMap: ReadonlyMap<string, string>;
 	localProtocolOptions?: LocalProtocolOptions;
 	skills?: ResolveContext["skills"];
+	rules?: ResolveContext["rules"];
+	mcpManager?: ResolveContext["mcpManager"];
 }): Promise<InternalSearchInputResolution> {
 	const internalRouter = InternalUrlRouter.instance();
 	const paths = opts.resolvedPaths.slice();
@@ -782,6 +784,8 @@ async function resolveInternalSearchInputs(opts: {
 		signal: opts.signal,
 		localProtocolOptions: opts.localProtocolOptions,
 		skills: opts.skills,
+		rules: opts.rules,
+		mcpManager: opts.mcpManager,
 		skipDirectoryListing: true,
 		// Try path-only first so large artifacts (and any other handler that
 		// separates path from content) resolve without materializing bytes.
@@ -960,6 +964,8 @@ export class GrepTool implements AgentTool<typeof searchSchema, GrepToolDetails>
 					archiveDisplayMap,
 					localProtocolOptions: this.session.localProtocolOptions,
 					skills: this.session.skills,
+					rules: this.session.internalUrlRules,
+					mcpManager: this.session.mcpManager,
 				});
 				const searchablePaths = internalResolution.paths;
 				const { virtualResources, virtualPathSet, virtualInputIndexes } = internalResolution;
@@ -1006,6 +1012,8 @@ export class GrepTool implements AgentTool<typeof searchSchema, GrepToolDetails>
 						signal,
 						localProtocolOptions: this.session.localProtocolOptions,
 						skills: this.session.skills,
+						rules: this.session.internalUrlRules,
+						mcpManager: this.session.mcpManager,
 						resolveExternalUrl: materializeExternalUrlForSearch,
 					});
 					searchPath = scope.searchPath;

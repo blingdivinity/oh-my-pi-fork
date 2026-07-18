@@ -2,10 +2,9 @@
  * Internal URL routing system for internal protocols like agent://, memory://,
  * skill://, mcp://, local://, and xd://.
  *
- * One process-global `InternalUrlRouter` is shared across sessions. Handlers
- * are stateless; they pull whatever they need (active skills/rules, active
- * MCP/async managers, AgentRegistry-listed sessions) from the owning module
- * on each resolve call.
+ * The shared router contains stateless handlers. Session-bound resources such
+ * as skills, rules, MCP connections, and local roots arrive through each
+ * resolve call's `ResolveContext`; handlers never retain active-session state.
  */
 
 export * from "./agent-protocol";

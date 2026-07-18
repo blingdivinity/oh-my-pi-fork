@@ -17,7 +17,7 @@ import type { ContextFile } from "@oh-my-pi/pi-coding-agent/capability/context-f
 import { clearCache } from "@oh-my-pi/pi-coding-agent/capability/fs";
 import type { Instruction } from "@oh-my-pi/pi-coding-agent/capability/instruction";
 import type { Prompt } from "@oh-my-pi/pi-coding-agent/capability/prompt";
-import { type Rule, resetActiveRulesForTests, setActiveRules } from "@oh-my-pi/pi-coding-agent/capability/rule";
+import type { Rule } from "@oh-my-pi/pi-coding-agent/capability/rule";
 import { RuleProtocolHandler } from "@oh-my-pi/pi-coding-agent/internal-urls/rule-protocol";
 import { removeSyncWithRetries } from "@oh-my-pi/pi-utils";
 import "@oh-my-pi/pi-coding-agent/capability/context-file";
@@ -52,7 +52,6 @@ describe("github discovery — Copilot user-global surface", () => {
 
 	afterEach(() => {
 		clearCache();
-		resetActiveRulesForTests();
 		setDisabledProviders([]);
 		for (const key of ENV_KEYS) {
 			if (savedEnv[key] === undefined) delete process.env[key];
@@ -161,8 +160,9 @@ describe("github discovery — Copilot user-global surface", () => {
 		expect(scoped?.alwaysApply).toBe(false);
 		expect(scoped?.globs).toEqual(["**/*.cs"]);
 		expect(scoped?.description).toBe("C# guidance");
-		setActiveRules(result.items);
-		const resource = await new RuleProtocolHandler().resolve(Object.assign(new URL("rule://cs"), { rawHost: "cs" }));
+		const resource = await new RuleProtocolHandler().resolve(Object.assign(new URL("rule://cs"), { rawHost: "cs" }), {
+			rules: result.items,
+		});
 		expect(resource.content.trim()).toBe("C# body");
 	});
 

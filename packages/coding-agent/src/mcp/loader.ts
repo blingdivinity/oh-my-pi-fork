@@ -39,6 +39,8 @@ export interface MCPToolsLoadOptions {
 	cacheStorage?: AgentStorage | null;
 	/** Auth storage used to resolve OAuth credentials before initial MCP connect */
 	authStorage?: AuthStorage;
+	/** Caller-owned cancellation source for discovery and connection startup. */
+	signal?: AbortSignal;
 }
 
 async function resolveToolCache(storage: AgentStorage | null | undefined): Promise<MCPToolCache | null> {
@@ -51,6 +53,28 @@ async function resolveToolCache(storage: AgentStorage | null | undefined): Promi
 		return null;
 	}
 }
+function abortReason(signal: AbortSignal): unknown {
+	return signal.reason ?? new Error("MCP operation aborted");
+}
+
+function throwIfAborted(signal?: AbortSignal): void {
+	if (signal?.aborted) throw abortReason(signal);
+}
+
+async function awaitWithAbort<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
+	throwIfAborted(signal);
+	if (!signal) return promise;
+
+	const { promise: abortPromise, reject } = Promise.withResolvers<never>();
+	const onAbort = () => reject(abortReason(signal));
+	signal.addEventListener("abort", onAbort, { once: true });
+	if (signal.aborted) onAbort();
+	try {
+		return await Promise.race([promise, abortPromise]);
+	} finally {
+		signal.removeEventListener("abort", onAbort);
+	}
+}
 
 /**
  * Discover and load MCP tools from .mcp.json files.
@@ -60,7 +84,9 @@ async function resolveToolCache(storage: AgentStorage | null | undefined): Promi
  * @returns MCP tools in LoadedCustomTool format for integration
  */
 export async function discoverAndLoadMCPTools(cwd: string, options?: MCPToolsLoadOptions): Promise<MCPToolsLoadResult> {
-	const toolCache = await resolveToolCache(options?.cacheStorage);
+	throwIfAborted(options?.signal);
+	const toolCache = await awaitWithAbort(resolveToolCache(options?.cacheStorage), options?.signal);
+	throwIfAborted(options?.signal);
 	const manager = new MCPManager(cwd, toolCache);
 	if (options?.authStorage) {
 		manager.setAuthStorage(options.authStorage);
@@ -73,8 +99,14 @@ export async function discoverAndLoadMCPTools(cwd: string, options?: MCPToolsLoa
 			enableProjectConfig: options?.enableProjectConfig,
 			filterExa: options?.filterExa,
 			filterBrowser: options?.filterBrowser,
+			signal: options?.signal,
 		});
+		throwIfAborted(options?.signal);
 	} catch (error) {
+		if (options?.signal?.aborted) {
+			await manager.disconnectAll({ signal: options.signal });
+			throw abortReason(options.signal);
+		}
 		// If discovery fails entirely, return empty result
 		const message = error instanceof Error ? error.message : String(error);
 		return {
@@ -88,9 +120,7 @@ export async function discoverAndLoadMCPTools(cwd: string, options?: MCPToolsLoa
 
 	// Convert MCP tools to LoadedCustomTool format
 	const loadedTools: LoadedCustomTool[] = result.tools.map(tool => {
-		// MCPTool and DeferredMCPTool have these properties
-		const mcpTool = tool as { mcpServerName?: string };
-		const serverName = mcpTool.mcpServerName;
+		const serverName = tool.mcpServerName;
 
 		// Get provider info from manager's connection if available
 		const connection = serverName ? manager.getConnection(serverName) : undefined;
@@ -105,7 +135,7 @@ export async function discoverAndLoadMCPTools(cwd: string, options?: MCPToolsLoa
 		return {
 			path,
 			resolvedPath: `mcp:${tool.name}`,
-			tool: tool as any, // MCPToolDetails is compatible with CustomTool<TSchema, any>
+			tool,
 		};
 	});
 

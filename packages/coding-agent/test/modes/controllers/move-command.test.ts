@@ -35,7 +35,7 @@ function createMoveContext(sourceDir: string, settingsFlush?: () => Promise<void
 		ui: { requestRender: vi.fn() },
 		present,
 	} as unknown as InteractiveModeContext;
-	return { ctx, state, present };
+	return { ctx, state, present, applyCwdChange };
 }
 
 describe("CommandController /move", () => {
@@ -62,6 +62,27 @@ describe("CommandController /move", () => {
 			expect(ctx.ui.requestRender).toHaveBeenCalledWith();
 			expect(present).toHaveBeenCalled();
 			expect(ctx.showError).not.toHaveBeenCalled();
+		} finally {
+			await fs.rm(sourceDir, { recursive: true, force: true });
+			await fs.rm(targetDir, { recursive: true, force: true });
+		}
+	});
+
+	it("reports partial relocation when resource reload fails instead of presenting success", async () => {
+		const sourceDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-move-source-"));
+		const targetDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-move-target-"));
+		try {
+			const { ctx, present, applyCwdChange } = createMoveContext(sourceDir);
+			applyCwdChange.mockRejectedValueOnce(new Error("extension generation failed"));
+			const controller = new CommandController(ctx);
+
+			await controller.handleMoveCommand(targetDir);
+
+			expect(ctx.showError).toHaveBeenCalledWith(
+				expect.stringContaining("failed to reload resources: extension generation failed"),
+			);
+			expect(present).not.toHaveBeenCalled();
+			expect(ctx.updateEditorBorderColor).not.toHaveBeenCalled();
 		} finally {
 			await fs.rm(sourceDir, { recursive: true, force: true });
 			await fs.rm(targetDir, { recursive: true, force: true });

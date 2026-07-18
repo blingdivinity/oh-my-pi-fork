@@ -13,8 +13,6 @@
 import { getOAuthProviders } from "@oh-my-pi/pi-ai/oauth";
 import { isZodSchema, zodToWireSchema } from "@oh-my-pi/pi-ai/utils/schema";
 import { $env, isRecord, readLines, Snowflake } from "@oh-my-pi/pi-utils";
-import { reset as resetCapabilities } from "../../capability";
-import { clearPluginRootsAndCaches, resolveActiveProjectRegistryPath } from "../../discovery/helpers";
 import {
 	type ExtensionUIContext,
 	type ExtensionUIDialogOptions,
@@ -23,7 +21,6 @@ import {
 	getExtensionUISelectOptionLabel,
 } from "../../extensibility/extensions";
 import { buildSkillPromptMessage, parseSkillInvocation } from "../../extensibility/skills";
-import { loadSlashCommands } from "../../extensibility/slash-commands";
 import { type Theme, theme } from "../../modes/theme/theme";
 import type { AgentSession } from "../../session/agent-session";
 import { SKILL_PROMPT_MESSAGE_TYPE, USER_INTERRUPT_LABEL } from "../../session/messages";
@@ -910,15 +907,7 @@ export async function runRpcMode(
 	});
 
 	const getAvailableCommands = async () => buildAvailableSlashCommands(session);
-	const reloadPluginState = async () => {
-		const cwd = session.sessionManager.getCwd();
-		const projectPath = await resolveActiveProjectRegistryPath(cwd);
-		clearPluginRootsAndCaches(projectPath ? [projectPath] : undefined);
-		resetCapabilities();
-		await session.refreshSkills();
-		session.setSlashCommands(await loadSlashCommands({ cwd }));
-		await emitAvailableCommandsUpdate();
-	};
+	const reloadPluginState = async () => session.reloadPluginResources();
 	const emitAvailableCommandsUpdate = async () => {
 		output({ type: "available_commands_update", commands: await getAvailableCommands() });
 	};
@@ -1046,6 +1035,7 @@ export async function runRpcMode(
 						examples: tool.examples,
 					})),
 					contextUsage: session.getContextUsage(),
+					resourceStatus: session.resourceStatus,
 				};
 				return success(id, "get_state", state);
 			}

@@ -125,6 +125,8 @@ export class TanCommandController {
 							hasUI: false,
 							enableMCP: false,
 							customTools,
+							asyncJobManager: manager,
+							mcpManager,
 							enableLsp,
 							agentId: cloneId,
 							agentDisplayName: "tan",

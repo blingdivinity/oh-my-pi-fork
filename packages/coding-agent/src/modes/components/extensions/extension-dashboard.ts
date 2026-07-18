@@ -79,6 +79,7 @@ export class ExtensionDashboard implements Component {
 
 	onClose?: () => void;
 	onRequestRender?: () => void;
+	onResourcesChanged?: () => Promise<void>;
 
 	private constructor(
 		private readonly cwd: string,
@@ -258,7 +259,7 @@ export class ExtensionDashboard implements Component {
 
 	#handleProviderToggle(providerId: string): void {
 		toggleProvider(providerId);
-		void this.#refreshFromState();
+		void this.#reconcileMutation();
 	}
 
 	#handleExtensionToggle(extensionId: string, enabled: boolean): void {
@@ -288,7 +289,7 @@ export class ExtensionDashboard implements Component {
 		}
 
 		this.#applyDisabledExtensions(disabled);
-		void this.#refreshFromState();
+		void this.#reconcileMutation();
 	}
 
 	async #toggleMcpExtension(extensionId: string, enabled: boolean, sm: Settings): Promise<void> {
@@ -317,7 +318,7 @@ export class ExtensionDashboard implements Component {
 			this.#applyDisabledExtensions(stored);
 		}
 
-		await this.#refreshFromState();
+		await this.#reconcileMutation();
 	}
 
 	#writableMcpSourcePath(extensionId: string): string | undefined {
@@ -325,6 +326,15 @@ export class ExtensionDashboard implements Component {
 		if (!extension) return undefined;
 		if (extension.source.provider !== "native" && extension.source.provider !== "mcp-json") return undefined;
 		return extension.path;
+	}
+
+	async #reconcileMutation(): Promise<void> {
+		try {
+			await this.onResourcesChanged?.();
+		} catch (error) {
+			logger.warn("Failed to apply extension dashboard change to the active session", { error: String(error) });
+		}
+		await this.#refreshFromState();
 	}
 
 	async #refreshFromState(): Promise<void> {

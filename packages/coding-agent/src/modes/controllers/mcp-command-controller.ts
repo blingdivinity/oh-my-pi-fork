@@ -1882,21 +1882,22 @@ export class MCPCommandController {
 	}
 
 	/**
-	 * Reload MCP manager with new configs
+	 * Reload MCP resources through the session-owned lifecycle so dashboard,
+	 * slash-command, and SDK callers all replace the same tool generation.
 	 */
 	async #reloadMCP(): Promise<void> {
-		if (!this.ctx.mcpManager) {
+		const manager = this.ctx.mcpManager;
+		if (!manager) return;
+		const result = await this.ctx.session.reloadMCPResources();
+		if (result) {
+			this.#showMCPConnectionErrors(result.errors);
 			return;
 		}
 
-		// Disconnect all existing servers
-		await this.ctx.mcpManager.disconnectAll();
-
-		// Rediscover and connect
-		const result = await this.ctx.mcpManager.discoverAndConnect();
-		await this.ctx.session.refreshMCPTools(this.ctx.mcpManager.getTools());
-
-		this.#showMCPConnectionErrors(result.errors);
+		await manager.disconnectAll();
+		const fallback = await manager.discoverAndConnect();
+		await this.ctx.session.refreshMCPTools(manager.getTools());
+		this.#showMCPConnectionErrors(fallback.errors);
 	}
 
 	/**

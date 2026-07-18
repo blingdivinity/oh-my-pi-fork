@@ -24,7 +24,9 @@ export interface AvailableCommandsSession {
 	readonly mcpPromptCommands?: ReadonlyArray<LoadedCustomCommand>;
 	readonly skills: ReadonlyArray<Skill>;
 	readonly skillsSettings?: SkillsSettings;
-	setSlashCommands(slashCommands: FileSlashCommand[]): void;
+	/** Currently applied file-based commands, when exposed by the session host. */
+	readonly slashCommands?: ReadonlyArray<FileSlashCommand>;
+	setSlashCommands(slashCommands: FileSlashCommand[]): void | Promise<void>;
 	sessionManager: { getCwd(): string };
 }
 
@@ -87,8 +89,15 @@ export async function buildAvailableSlashCommands(
 		});
 	}
 
-	const fileCommands = await loadFileCommands(session.sessionManager.getCwd());
-	session.setSlashCommands(fileCommands);
+	const appliedSlashCommands = session.slashCommands;
+	let fileCommands: ReadonlyArray<FileSlashCommand>;
+	if (appliedSlashCommands !== undefined) {
+		fileCommands = appliedSlashCommands;
+	} else {
+		const loadedCommands = await loadFileCommands(session.sessionManager.getCwd());
+		await session.setSlashCommands(loadedCommands);
+		fileCommands = loadedCommands;
+	}
 	for (const command of fileCommands) {
 		appendCommand({ name: command.name, description: command.description, source: "file" });
 	}

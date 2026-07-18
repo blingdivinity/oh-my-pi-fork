@@ -11,7 +11,6 @@ import { $env, prompt, Snowflake } from "@oh-my-pi/pi-utils";
 import { resolveAgentModelPatterns } from "../config/model-resolver";
 import type { LocalProtocolOptions } from "../internal-urls";
 import { registerArtifactsDir } from "../internal-urls/registry-helpers";
-import { MCPManager } from "../mcp/manager";
 import { loadOverallPlanReference } from "../plan-mode/plan-handoff";
 import planModeSubagentPrompt from "../prompts/system/plan-mode-subagent.md" with { type: "text" };
 import subagentUserPromptTemplate from "../prompts/system/subagent-user-prompt.md" with { type: "text" };
@@ -409,14 +408,15 @@ function buildExecutorOptions(
 		authStorage: session.authStorage,
 		modelRegistry: session.modelRegistry,
 		settings: session.settings,
-		mcpManager: enableMCP ? (session.mcpManager ?? MCPManager.instance()) : undefined,
+		mcpManager: enableMCP ? session.mcpManager : undefined,
 		enableMCP,
+		asyncJobManager: session.asyncJobManager,
 		contextFiles: session.contextFiles?.filter(file => path.basename(file.path).toLowerCase() !== "agents.md"),
 		skills,
 		autoloadSkills,
 		workspaceTree: session.workspaceTree,
 		promptTemplates: session.promptTemplates,
-		rules: session.rules,
+		rules: session.rules ? [...session.rules] : undefined,
 		preloadedExtensionPaths: policy.planMode ? [] : session.extensionPaths,
 		preloadedCustomToolPaths: policy.planMode ? [] : session.customToolPaths,
 		localProtocolOptions,

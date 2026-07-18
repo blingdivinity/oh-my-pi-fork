@@ -11,7 +11,6 @@ import type * as fsTypes from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { isEnoent } from "@oh-my-pi/pi-utils";
-import { getActiveSkills } from "../extensibility/skills";
 import { buildDirectoryResource } from "./filesystem-resource";
 import type { InternalResource, InternalUrl, ProtocolHandler, ResolveContext, UrlCompletion } from "./types";
 
@@ -43,7 +42,7 @@ export class SkillProtocolHandler implements ProtocolHandler {
 	readonly immutable = true;
 
 	async resolve(url: InternalUrl, context?: ResolveContext): Promise<InternalResource> {
-		const skills = context?.skills ?? getActiveSkills();
+		const skills = context?.skills ?? [];
 
 		const skillName = url.rawHost || url.hostname;
 		if (!skillName) {
@@ -58,7 +57,7 @@ export class SkillProtocolHandler implements ProtocolHandler {
 		}
 
 		let targetPath: string;
-		const urlPath = url.pathname;
+		const urlPath = url.rawPathname ?? url.pathname;
 		const hasRelativePath = urlPath && urlPath !== "/" && urlPath !== "";
 
 		if (hasRelativePath) {
@@ -80,7 +79,7 @@ export class SkillProtocolHandler implements ProtocolHandler {
 			stats = await fs.stat(targetPath);
 		} catch (error) {
 			if (isEnoent(error)) {
-				throw new Error(`File not found: ${targetPath}`);
+				throw new Error(`File not found: ${url.href}`);
 			}
 			throw error;
 		}
@@ -92,7 +91,15 @@ export class SkillProtocolHandler implements ProtocolHandler {
 			throw new Error(`skill:// URL must resolve to a file or directory: ${url.href}`);
 		}
 
-		const content = await Bun.file(targetPath).text();
+		let content: string;
+		try {
+			content = await Bun.file(targetPath).text();
+		} catch (error) {
+			if (isEnoent(error)) {
+				throw new Error(`File not found: ${url.href}`);
+			}
+			throw error;
+		}
 		return {
 			url: url.href,
 			content,
@@ -103,8 +110,8 @@ export class SkillProtocolHandler implements ProtocolHandler {
 		};
 	}
 
-	async complete(): Promise<UrlCompletion[]> {
-		return getActiveSkills().map(skill => ({
+	async complete(_query?: string, context?: ResolveContext): Promise<UrlCompletion[]> {
+		return (context?.skills ?? []).map(skill => ({
 			value: skill.name,
 			...(skill.description ? { description: skill.description } : {}),
 		}));

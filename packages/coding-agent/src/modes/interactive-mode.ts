@@ -52,7 +52,6 @@ import {
 	setProjectDir,
 } from "@oh-my-pi/pi-utils";
 import chalk from "chalk";
-import { reset as resetCapabilities } from "../capability";
 import type { CollabGuestLink } from "../collab/guest";
 import type { CollabHost } from "../collab/host";
 import { KeybindingsManager } from "../config/keybindings";
@@ -65,7 +64,6 @@ import {
 	Settings,
 	settings,
 } from "../config/settings";
-import { clearClaudePluginRootsCache } from "../discovery/helpers";
 import type {
 	AutocompleteProviderFactory,
 	ContextUsage,
@@ -77,7 +75,6 @@ import type {
 } from "../extensibility/extensions";
 import type { CompactOptions } from "../extensibility/extensions/types";
 import type { Skill } from "../extensibility/skills";
-import { loadSlashCommands } from "../extensibility/slash-commands";
 import { type GuidedGoalMessage, newGuidedGoalSessionId, runGuidedGoalTurn } from "../goals/guided-setup";
 import type { Goal, GoalModeState } from "../goals/state";
 import { resolveLocalUrlToPath } from "../internal-urls";
@@ -100,7 +97,7 @@ import planModeApprovedPrompt from "../prompts/system/plan-mode-approved.md" wit
 import planModeCompactInstructionsPrompt from "../prompts/system/plan-mode-compact-instructions.md" with {
 	type: "text",
 };
-import { type AgentRegistry, MAIN_AGENT_ID } from "../registry/agent-registry";
+import type { AgentRegistry } from "../registry/agent-registry";
 import {
 	type AgentSession,
 	type AgentSessionEvent,
@@ -112,6 +109,7 @@ import { HistoryStorage } from "../session/history-storage";
 import type { SessionContext } from "../session/session-context";
 import { getRecentSessions } from "../session/session-listing";
 import type { SessionManager } from "../session/session-manager";
+import type { SessionResourceReloadResult } from "../session/session-resource-runtime";
 import type { ShakeMode } from "../session/shake-types";
 import { BUILTIN_SLASH_COMMAND_RESERVED_NAMES, buildTuiBuiltinSlashCommands } from "../slash-commands/builtin-registry";
 import { formatDuration } from "../slash-commands/helpers/format";
@@ -736,25 +734,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.hideThinkingBlock = settings.get("hideThinkingBlock");
 		this.proseOnlyThinking = settings.get("proseOnlyThinking");
 
-		const hookCommands: SlashCommand[] = (
-			this.session.extensionRunner?.getRegisteredCommands(BUILTIN_SLASH_COMMAND_RESERVED_NAMES) ?? []
-		).map(cmd => ({
-			name: cmd.name,
-			description: cmd.description ?? "(hook command)",
-			getArgumentCompletions: cmd.getArgumentCompletions,
-		}));
-
-		// Convert custom commands (TypeScript) to SlashCommand format
-		const customCommands: SlashCommand[] = this.session.customCommands.map(loaded => ({
-			name: loaded.command.name,
-			description: `${loaded.command.description} (${loaded.source})`,
-		}));
-
-		const skillCommandList = this.#rebuildSkillCommandsFromSession();
-
-		const builtinCommands = buildTuiBuiltinSlashCommands({ ctx: this });
-		// Store pending commands for init() where file commands are loaded async
-		this.#pendingSlashCommands = [...builtinCommands, ...hookCommands, ...customCommands, ...skillCommandList];
+		this.#rebuildPendingSlashCommandsFromSession();
 
 		this.#uiHelpers = new UiHelpers(this);
 		this.#btwController = new BtwController(this);
@@ -1101,6 +1081,24 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.session.setTitleSystemPrompt(resolved);
 	}
 
+	/** Rebuild generation-owned slash commands from the session's applied resources. */
+	#rebuildPendingSlashCommandsFromSession(): void {
+		const hookCommands: SlashCommand[] = (
+			this.session.extensionRunner?.getRegisteredCommands(BUILTIN_SLASH_COMMAND_RESERVED_NAMES) ?? []
+		).map(cmd => ({
+			name: cmd.name,
+			description: cmd.description ?? "(hook command)",
+			getArgumentCompletions: cmd.getArgumentCompletions,
+		}));
+		const customCommands: SlashCommand[] = this.session.customCommands.map(loaded => ({
+			name: loaded.command.name,
+			description: `${loaded.command.description} (${loaded.source})`,
+		}));
+		const skillCommands = this.#rebuildSkillCommandsFromSession();
+		const builtinCommands = buildTuiBuiltinSlashCommands({ ctx: this });
+		this.#pendingSlashCommands = [...builtinCommands, ...hookCommands, ...customCommands, ...skillCommands];
+	}
+
 	#rebuildSkillCommandsFromSession(): SlashCommand[] {
 		const commands: SlashCommand[] = [];
 		this.skillCommands.clear();
@@ -1114,9 +1112,8 @@ export class InteractiveMode implements InteractiveModeContext {
 		return commands;
 	}
 
-	/** Reload session skills and the `/skill:<name>` command list. */
+	/** Rebuild the `/skill:<name>` command list from the applied manifest. */
 	async refreshSkillState(): Promise<void> {
-		await this.session.refreshSkills();
 		const retainedCommands = this.#pendingSlashCommands.filter(command => !command.name.startsWith("skill:"));
 		const skillCommands = this.#rebuildSkillCommandsFromSession();
 		this.#pendingSlashCommands = [...retainedCommands, ...skillCommands];
@@ -1125,7 +1122,7 @@ export class InteractiveMode implements InteractiveModeContext {
 	/** Reload slash commands and autocomplete for the provided working directory. */
 	async refreshSlashCommandState(cwd?: string): Promise<void> {
 		const basePath = cwd ?? this.sessionManager.getCwd();
-		const fileCommands = await loadSlashCommands({ cwd: basePath });
+		const fileCommands = [...this.session.slashCommands];
 		this.fileSlashCommands = new Set(fileCommands.map(cmd => cmd.name));
 		const fileSlashCommands: SlashCommand[] = fileCommands.map(cmd => ({
 			name: cmd.name,
@@ -1158,7 +1155,44 @@ export class InteractiveMode implements InteractiveModeContext {
 			basePath,
 		);
 		this.#applyAutocompleteProvider();
-		this.session.setSlashCommands(fileCommands);
+	}
+
+	/** Apply the canonical session plugin reload, then refresh TUI-only command metadata. */
+	async reloadPluginState(cwd?: string): Promise<SessionResourceReloadResult | undefined> {
+		// A candidate generation registers its autocomplete factories through the
+		// same UI context as the active generation. Isolate that registration while
+		// the reload runs so removed extensions cannot keep wrapping the provider.
+		const previousFactories = this.#autocompleteProviderFactories;
+		const previousRunner = this.session.extensionRunner;
+		this.#autocompleteProviderFactories = [];
+		this.#applyAutocompleteProvider();
+		this.#extensionUiController.beginReloadGeneration();
+		let result: SessionResourceReloadResult | undefined;
+		try {
+			result = await this.session.reloadPluginResources();
+		} catch (error) {
+			this.#extensionUiController.rollbackReloadGeneration();
+			this.#autocompleteProviderFactories = previousFactories;
+			this.#applyAutocompleteProvider();
+			throw error;
+		}
+		const generationApplied =
+			result !== undefined && result.state !== "failed" && this.session.extensionRunner !== previousRunner;
+		if (generationApplied) {
+			this.#extensionUiController.commitReloadGeneration();
+		} else {
+			this.#extensionUiController.rollbackReloadGeneration();
+			this.#autocompleteProviderFactories = previousFactories;
+			this.#applyAutocompleteProvider();
+		}
+		if (result?.state !== "failed") {
+			this.#rebuildPendingSlashCommandsFromSession();
+			await this.refreshSlashCommandState(cwd);
+			this.#inputController.refreshExtensionShortcuts();
+		}
+		this.statusLine.invalidate();
+		this.ui.requestRender();
+		return result;
 	}
 
 	/**
@@ -1215,13 +1249,18 @@ export class InteractiveMode implements InteractiveModeContext {
 			// exclusions leak and newly-excluded providers are still used.
 			applyProviderGlobalsFromSettings(settings);
 		}
-		// Re-warm plugin roots, capabilities, slash commands, and the ssh tool so
-		// the next prompt sees everything scoped to the new project directory.
-		clearClaudePluginRootsCache();
+		// Reconcile project-scoped resources and rebuild editor command metadata
+		// from the newly applied manifest before the next prompt is admitted.
 		await this.refreshTitleSystemPrompt(newCwd);
-		resetCapabilities();
-		await this.refreshSkillState();
-		await this.refreshSlashCommandState(newCwd);
+		const result = await this.reloadPluginState(newCwd);
+		if (result?.state === "failed") {
+			const diagnostics = result.diagnostics
+				.map(diagnostic => (diagnostic.domain ? `${diagnostic.domain}: ` : "") + diagnostic.message)
+				.join("; ");
+			throw new Error(
+				`Failed to reload resources after changing working directory to "${newCwd}": ${diagnostics || "unknown error"}`,
+			);
+		}
 		setSessionTerminalTitle(this.sessionManager.getSessionName(), this.sessionManager.getCwd());
 		this.statusLine.invalidate();
 		this.ui.requestRender();
@@ -2242,10 +2281,7 @@ export class InteractiveMode implements InteractiveModeContext {
 			this.session.setVibeModeState(undefined);
 			this.vibeModeEnabled = false;
 			this.#vibeModePreviousTools = undefined;
-			await VibeSessionRegistry.global().killAll(
-				this.session.getAgentId() ?? MAIN_AGENT_ID,
-				this.session.asyncJobManager,
-			);
+			await VibeSessionRegistry.global().killAll(this.sessionManager.getSessionId(), this.session.asyncJobManager);
 			this.#updateVibeModeStatus();
 		}
 	}
@@ -3115,7 +3151,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.#vibeModePreviousTools = undefined;
 		this.lastAssistantUsage = undefined;
 		const killed = await VibeSessionRegistry.global().killAll(
-			this.session.getAgentId() ?? MAIN_AGENT_ID,
+			this.sessionManager.getSessionId(),
 			this.session.asyncJobManager,
 		);
 		this.#updateVibeModeStatus();

@@ -1,9 +1,7 @@
-import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "bun:test";
+import { afterAll, afterEach, beforeAll, describe, expect, it } from "bun:test";
 import * as path from "node:path";
 import * as url from "node:url";
 import { resetSettingsForTest, Settings, settings } from "@oh-my-pi/pi-coding-agent/config/settings";
-import { LocalProtocolHandler } from "@oh-my-pi/pi-coding-agent/internal-urls/local-protocol";
-import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import {
 	fileHyperlink,
 	isHyperlinkEnabled,
@@ -274,20 +272,6 @@ describe("urlHyperlinkAlways", () => {
 });
 
 describe("tryResolveInternalUrlSync", () => {
-	// The "no session options" contract below asserts on process-global state
-	// (AgentRegistry main session, LocalProtocolHandler override) that sibling
-	// test files in the same worker may have populated. Pin the premise
-	// explicitly so the test is full-suite safe, not just file-local safe.
-	beforeEach(() => {
-		AgentRegistry.resetGlobalForTests();
-		LocalProtocolHandler.resetOverrideForTests();
-	});
-
-	afterEach(() => {
-		AgentRegistry.resetGlobalForTests();
-		LocalProtocolHandler.resetOverrideForTests();
-	});
-
 	it("returns undefined for non-internal URLs", () => {
 		expect(tryResolveInternalUrlSync("/abs/path/file.ts")).toBeUndefined();
 		expect(tryResolveInternalUrlSync("relative/path.ts")).toBeUndefined();
@@ -302,8 +286,7 @@ describe("tryResolveInternalUrlSync", () => {
 		expect(tryResolveInternalUrlSync("omp://docs.md")).toBeUndefined();
 	});
 
-	it("returns undefined when local:// resolution has no session options", () => {
-		// No AgentRegistry main session in this unit test, no override installed.
+	it("returns undefined for contextless local:// resolution", () => {
 		expect(tryResolveInternalUrlSync("local://foo.md")).toBeUndefined();
 	});
 

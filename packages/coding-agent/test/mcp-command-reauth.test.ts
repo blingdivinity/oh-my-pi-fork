@@ -71,6 +71,7 @@ function createController(authStorage: AuthStorage, mcpManagerOverrides: Record<
 		},
 		session: {
 			refreshMCPTools: vi.fn(),
+			reloadMCPResources: vi.fn(async () => undefined),
 			modelRegistry: { authStorage },
 		},
 		mcpManager,

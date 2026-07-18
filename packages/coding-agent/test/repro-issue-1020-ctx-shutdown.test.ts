@@ -63,6 +63,7 @@ describe("issue #1020 - ctx.shutdown() in interactive mode", () => {
 			): void {
 				capturedContextActions = contextActions;
 			},
+			async activate(): Promise<void> {},
 			onError(_handler: (error: unknown) => void): void {},
 			async emit(_event: unknown): Promise<void> {},
 		};

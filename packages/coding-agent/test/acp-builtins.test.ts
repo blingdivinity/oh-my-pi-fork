@@ -9,9 +9,12 @@ import type {
 	UsageReport,
 } from "@oh-my-pi/pi-ai";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { MarketplaceManager } from "@oh-my-pi/pi-coding-agent/extensibility/plugins/marketplace";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import type { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import type { SessionResourceReloadResult } from "@oh-my-pi/pi-coding-agent/session/session-resource-runtime";
 import { executeAcpBuiltinSlashCommand } from "@oh-my-pi/pi-coding-agent/slash-commands/acp-builtins";
+import type { SlashCommandRuntime } from "@oh-my-pi/pi-coding-agent/slash-commands/types";
 import { removeWithRetries, setProjectDir } from "@oh-my-pi/pi-utils";
 
 interface FakeAcpBuiltinSession {
@@ -220,11 +223,22 @@ function createRuntime() {
 				output.push(text);
 			},
 			refreshCommands: () => {},
-			reloadPlugins: async () => {},
+			reloadPlugins: (async () => undefined) as SlashCommandRuntime["reloadPlugins"],
 			notifyTitleChanged: undefined as (() => Promise<void> | void) | undefined,
 			notifyConfigChanged: undefined as (() => Promise<void> | void) | undefined,
 		},
 	};
+}
+
+function reloadResult(
+	state: SessionResourceReloadResult["state"],
+	message = "extension registry is invalid",
+): SessionResourceReloadResult {
+	return {
+		state,
+		manifest: {},
+		diagnostics: [{ severity: state === "degraded" ? "warning" : "error", message }],
+	} as unknown as SessionResourceReloadResult;
 }
 
 describe("ACP builtin slash commands", () => {
@@ -235,6 +249,27 @@ describe("ACP builtin slash commands", () => {
 
 		expect(result).toEqual({ consumed: true });
 		expect(output).toEqual(["Fast mode is off."]);
+	});
+
+	it("reports degraded plugin reloads through the shared headless command", async () => {
+		const { output, runtime } = createRuntime();
+		runtime.reloadPlugins = async () =>
+			({
+				state: "degraded",
+				manifest: {},
+				diagnostics: [
+					{
+						severity: "warning",
+						domain: "mcp",
+						message: "broken-server: connection refused",
+					},
+				],
+			}) as unknown as SessionResourceReloadResult;
+
+		const result = await executeAcpBuiltinSlashCommand("/reload-plugins", runtime);
+
+		expect(result).toEqual({ consumed: true });
+		expect(output).toEqual(["Plugins reloaded with warnings: broken-server: connection refused."]);
 	});
 
 	it("forces a tool and returns remaining prompt text", async () => {
@@ -746,6 +781,7 @@ describe("wave 3 commands", () => {
 
 	it("/move: relocates the current session instead of switching to an empty target session", async () => {
 		const { output, runtime, session, fakeSessionManager } = createRuntime();
+		runtime.reloadPlugins = async () => reloadResult("applied");
 		const targetDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-move-target-"));
 		const originalProjectDir = process.cwd();
 		const reloadForCwd = spyOn(runtime.settings, "reloadForCwd");
@@ -768,6 +804,59 @@ describe("wave 3 commands", () => {
 		} finally {
 			setProjectDir(originalProjectDir);
 			await fs.rm(targetDir, { recursive: true, force: true });
+		}
+	});
+
+	it("/move: reports a partial success when extension reload fails", async () => {
+		const { output, runtime, fakeSessionManager } = createRuntime();
+		const targetDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-move-reload-failed-"));
+		const originalProjectDir = process.cwd();
+		runtime.reloadPlugins = async () => reloadResult("failed", "extension load failed");
+
+		try {
+			const result = await executeAcpBuiltinSlashCommand(`/move ${targetDir}`, runtime);
+
+			expect(result).toEqual({ consumed: true });
+			expect(fakeSessionManager._movedTo).toBe(targetDir);
+			expect(output).toEqual([`Moved to ${targetDir}, but plugin reload failed: extension load failed.`]);
+		} finally {
+			setProjectDir(originalProjectDir);
+			await fs.rm(targetDir, { recursive: true, force: true });
+		}
+	});
+
+	it("/move: reports a partial success when plugin reload is unavailable", async () => {
+		const { output, runtime } = createRuntime();
+		const targetDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-move-reload-unavailable-"));
+		const originalProjectDir = process.cwd();
+
+		try {
+			const result = await executeAcpBuiltinSlashCommand(`/move ${targetDir}`, runtime);
+
+			expect(result).toEqual({ consumed: true });
+			expect(output).toEqual([`Moved to ${targetDir}, but plugin reload unavailable.`]);
+		} finally {
+			setProjectDir(originalProjectDir);
+			await fs.rm(targetDir, { recursive: true, force: true });
+		}
+	});
+
+	it("/move: preserves its success message for applied, degraded, and unchanged reloads", async () => {
+		for (const state of ["applied", "degraded", "unchanged"] as const) {
+			const { output, runtime } = createRuntime();
+			const targetDir = await fs.mkdtemp(path.join(os.tmpdir(), `omp-move-reload-${state}-`));
+			const originalProjectDir = process.cwd();
+			runtime.reloadPlugins = async () => reloadResult(state);
+
+			try {
+				const result = await executeAcpBuiltinSlashCommand(`/move ${targetDir}`, runtime);
+
+				expect(result).toEqual({ consumed: true });
+				expect(output).toEqual([`Moved to ${targetDir}.`]);
+			} finally {
+				setProjectDir(originalProjectDir);
+				await fs.rm(targetDir, { recursive: true, force: true });
+			}
 		}
 	});
 
@@ -937,6 +1026,28 @@ describe("wave 4 commands", () => {
 		const result = await executeAcpBuiltinSlashCommand("/marketplace uninstall", runtime);
 		expect(result).toEqual({ consumed: true });
 		expect(output[0]).toContain("TUI-only");
+	});
+
+	it("/marketplace install: reports a partial success when extension reload fails", async () => {
+		const installSpy = spyOn(MarketplaceManager.prototype, "installPlugin").mockResolvedValue({
+			scope: "user",
+			installPath: "/tmp/demo",
+			version: "1.0.0",
+			installedAt: "2026-01-01T00:00:00.000Z",
+			lastUpdated: "2026-01-01T00:00:00.000Z",
+		});
+		try {
+			const { output, runtime } = createRuntime();
+			runtime.reloadPlugins = async () => reloadResult("failed", "extension command rejected");
+
+			const result = await executeAcpBuiltinSlashCommand("/marketplace install demo@catalog", runtime);
+
+			expect(result).toEqual({ consumed: true });
+			expect(installSpy).toHaveBeenCalledWith("demo", "catalog", { force: false, scope: "user" });
+			expect(output).toEqual(["Installed demo from catalog, but plugin reload failed: extension command rejected."]);
+		} finally {
+			installSpy.mockRestore();
+		}
 	});
 
 	// /plugins

@@ -90,7 +90,7 @@ describe("AgentSession refreshMCPTools rebuild skipping", () => {
 	}
 
 	function newSession(
-		rebuildSystemPrompt: (toolNames: string[]) => Promise<string>,
+		rebuildSystemPrompt: (toolNames: readonly string[]) => Promise<string>,
 		options: NewSessionOptions = {},
 	): {
 		session: AgentSession;

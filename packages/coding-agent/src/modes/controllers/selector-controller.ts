@@ -12,7 +12,6 @@ import {
 	resolveAdvisorConfigEditPath,
 	saveWatchdogConfigFile,
 } from "../../advisor";
-import { reset as resetCapabilities } from "../../capability";
 import {
 	formatModelSelectorValue,
 	resolveAdvisorRoleSelection,
@@ -43,6 +42,7 @@ import type { InteractiveModeContext } from "../../modes/types";
 import type { ResetCreditAccountStatus, ResetCreditRedeemOutcome } from "../../session/auth-storage";
 import type { SessionInfo } from "../../session/session-listing";
 import { SessionManager } from "../../session/session-manager";
+import type { SessionResourceReloadResult } from "../../session/session-resource-runtime";
 import { FileSessionStorage } from "../../session/session-storage";
 import { type LogoutAccount, toLogoutAccounts } from "../../slash-commands/helpers/logout";
 import {
@@ -93,6 +93,11 @@ import type { SessionObserverRegistry } from "../session-observer-registry";
 import { buildCopyTargets } from "../utils/copy-targets";
 
 const MANUAL_LOGIN_PROMPT = "Paste the authorization code (or full redirect URL), then press Enter:";
+
+function assertResourceReloadSucceeded(result: SessionResourceReloadResult | undefined): void {
+	if (result?.state !== "failed") return;
+	throw new Error(result.diagnostics.map(diagnostic => diagnostic.message).join("; "));
+}
 
 export class SelectorController {
 	constructor(private ctx: InteractiveModeContext) {}
@@ -204,12 +209,8 @@ export class SelectorController {
 						return this.ctx.statusLine.getTopBorder(availableWidth).content;
 					},
 					onPluginsChanged: async () => {
-						const projectPath = await resolveActiveProjectRegistryPath(this.ctx.sessionManager.getCwd());
-						clearPluginRootsAndCaches(projectPath ? [projectPath] : undefined);
-						await this.ctx.refreshSkillState();
-						await this.ctx.refreshSlashCommandState();
-						resetCapabilities();
-						this.ctx.ui.requestRender();
+						const result = await this.ctx.reloadPluginState();
+						assertResourceReloadSucceeded(result);
 					},
 					onCancel: () => {
 						done();
@@ -286,7 +287,10 @@ export class SelectorController {
 					// Re-discover the merged roster (project + user) so the live advisors
 					// reflect cross-level precedence, not just the edited file.
 					const discovered = await discoverAdvisorConfigs(cwd, agentDir);
-					const count = this.ctx.session.applyAdvisorConfigs(discovered.advisors, discovered.sharedInstructions);
+					const count = await this.ctx.session.applyAdvisorConfigs(
+						discovered.advisors,
+						discovered.sharedInstructions,
+					);
 					this.ctx.statusLine.invalidate();
 					this.ctx.showStatus(
 						count > 0
@@ -362,6 +366,17 @@ export class SelectorController {
 		};
 		dashboard.onRequestRender = () => {
 			this.ctx.ui.requestRender();
+		};
+		dashboard.onResourcesChanged = async () => {
+			try {
+				const result = await this.ctx.reloadPluginState();
+				assertResourceReloadSucceeded(result);
+			} catch (error) {
+				this.ctx.showError(
+					`Failed to apply extension changes: ${error instanceof Error ? error.message : String(error)}`,
+				);
+				throw error;
+			}
 		};
 	}
 
@@ -1376,7 +1391,15 @@ export class SelectorController {
 		if (movedProject) {
 			// Resumed a session from another project: re-point the process and every
 			// cwd-derived cache at it before rendering.
-			await this.ctx.applyCwdChange(newCwd);
+			try {
+				await this.ctx.applyCwdChange(newCwd);
+			} catch (err) {
+				const message = err instanceof Error ? err.message : String(err);
+				this.ctx.showError(
+					`Resumed session in "${shortenPath(newCwd)}", but failed to reload resources: ${message}`,
+				);
+				return false;
+			}
 		}
 		this.#refreshSessionTerminalTitle();
 		this.ctx.updateEditorBorderColor();

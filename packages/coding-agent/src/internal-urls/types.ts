@@ -5,7 +5,9 @@
  * providing access to agent outputs and server resources without exposing filesystem paths.
  */
 
+import type { Rule } from "../capability/rule";
 import type { Skill } from "../extensibility/skills";
+import type { MCPManager } from "../mcp";
 import type { LocalProtocolOptions } from "./local-protocol";
 
 /**
@@ -98,8 +100,12 @@ export interface ResolveContext {
 	 * [#1608](https://github.com/can1357/oh-my-pi/issues/1608).
 	 */
 	localProtocolOptions?: LocalProtocolOptions;
-	/** Calling session's loaded skills. Prefer this over process-global skill state. */
+	/** Calling session's loaded skills. */
 	skills?: readonly Skill[];
+	/** Calling session's loaded rules. */
+	rules?: readonly Rule[];
+	/** Calling session's MCP manager. */
+	mcpManager?: MCPManager;
 	/** Session-bound `xd://` documentation resolver. */
 	xd?: {
 		read(name: string | null): Promise<string>;

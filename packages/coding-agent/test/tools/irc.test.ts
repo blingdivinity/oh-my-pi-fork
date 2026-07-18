@@ -960,7 +960,10 @@ describe("IRC", () => {
 		it("wakes an idle session with a real turn and emits the irc_message event", async () => {
 			const { session } = createRealSession();
 			sessions.push(session);
-			const promptSpy = vi.spyOn(session.agent, "prompt").mockResolvedValue(undefined);
+			const promptStarted = Promise.withResolvers<void>();
+			const promptSpy = vi.spyOn(session.agent, "prompt").mockImplementation(async () => {
+				promptStarted.resolve();
+			});
 			const ircEvent = new Promise<AgentSessionEvent>(resolve => {
 				session.subscribe(event => {
 					if (event.type === "irc_message") resolve(event);
@@ -975,6 +978,7 @@ describe("IRC", () => {
 				ts: Date.now(),
 			});
 			expect(outcome).toBe("woken");
+			await promptStarted.promise;
 			expect(promptSpy).toHaveBeenCalledTimes(1);
 			// The idle wake routes through #wakeForIrc, which batches records into one prompt —
 			// even a lone incoming message is delivered as a one-element array.

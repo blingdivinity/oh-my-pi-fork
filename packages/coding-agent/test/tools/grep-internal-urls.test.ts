@@ -5,12 +5,11 @@ import * as path from "node:path";
 import * as capability from "@oh-my-pi/pi-coding-agent/capability";
 import type { CapabilityResult } from "@oh-my-pi/pi-coding-agent/capability/types";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
-import { resetActiveSkillsForTests, setActiveSkills } from "@oh-my-pi/pi-coding-agent/extensibility/skills";
+import type { Skill } from "@oh-my-pi/pi-coding-agent/extensibility/skills";
 import {
 	type InternalResource,
 	type InternalUrl,
 	InternalUrlRouter,
-	LocalProtocolHandler,
 	type ProtocolHandler,
 } from "@oh-my-pi/pi-coding-agent/internal-urls";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
@@ -69,14 +68,15 @@ function registerVirtualDocs(docs: ReadonlyMap<string, string>): void {
 describe("GrepTool internal URL resolution", () => {
 	let tmpDir: string;
 	let artifactsDir: string;
+	let sessionSkills: Skill[];
 
 	beforeEach(async () => {
 		tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "grep-test-"));
 		artifactsDir = path.join(tmpDir, "artifacts");
 		await fs.mkdir(artifactsDir);
+		sessionSkills = [];
 
 		AgentRegistry.resetGlobalForTests();
-		LocalProtocolHandler.resetOverrideForTests();
 		InternalUrlRouter.resetForTests();
 
 		// Register a synthetic main session so artifact:// can derive
@@ -93,9 +93,7 @@ describe("GrepTool internal URL resolution", () => {
 	afterEach(async () => {
 		await removeWithRetries(tmpDir);
 		AgentRegistry.resetGlobalForTests();
-		LocalProtocolHandler.resetOverrideForTests();
 		InternalUrlRouter.resetForTests();
-		resetActiveSkillsForTests();
 		vi.restoreAllMocks();
 	});
 
@@ -106,6 +104,11 @@ describe("GrepTool internal URL resolution", () => {
 			getSessionFile: () => null,
 			getSessionSpawns: () => "*",
 			settings: Settings.isolated({ "grep.contextBefore": 0, "grep.contextAfter": 0 }),
+			skills: sessionSkills,
+			localProtocolOptions: {
+				getArtifactsDir: () => artifactsDir,
+				getSessionId: () => "session",
+			},
 			...overrides,
 		};
 	}
@@ -116,7 +119,7 @@ describe("GrepTool internal URL resolution", () => {
 		await Bun.write(path.join(skillDir, "SKILL.md"), "# Demo\n");
 		await Bun.write(path.join(skillDir, "references", "index.md"), "install needle\n");
 		await Bun.write(path.join(skillDir, "references", "docs", "guide.md"), "deep needle\n");
-		setActiveSkills([
+		sessionSkills = [
 			{
 				name: "demo",
 				description: "demo skill",
@@ -124,7 +127,7 @@ describe("GrepTool internal URL resolution", () => {
 				baseDir: skillDir,
 				source: "test",
 			},
-		]);
+		];
 		return skillDir;
 	}
 
@@ -141,9 +144,8 @@ describe("GrepTool internal URL resolution", () => {
 		expect(result.details?.resolvedPath).toBe(path.join(skillDir, "references"));
 	});
 
-	it("resolves skill:// through session skills when active skill globals are empty", async () => {
+	it("resolves skill:// through the calling session's skills", async () => {
 		const skillDir = await registerSkillDirectory();
-		resetActiveSkillsForTests();
 		const session = createSession({
 			skills: [
 				{
@@ -411,8 +413,6 @@ describe("GrepTool internal URL resolution", () => {
 		await fs.mkdir(localRoot, { recursive: true });
 		await Bun.write(path.join(localRoot, "PLAN.md"), "# Plan\n");
 
-		LocalProtocolHandler.setOverride({ getArtifactsDir: () => artifactsDir, getSessionId: () => "session" });
-
 		const session = createSession();
 		const tool = new GlobTool(session);
 
@@ -429,14 +429,14 @@ describe("GrepTool internal URL resolution", () => {
 		await fs.mkdir(path.join(localRoot, "notes"), { recursive: true });
 		await Bun.write(path.join(localRoot, "notes", "PLAN.md"), "# Plan\n");
 
-		LocalProtocolHandler.setOverride({ getArtifactsDir: () => artifactsDir, getSessionId: () => "session" });
-
 		const session = createSession({ hasEditTool: true });
 		const readResult = await new ReadTool(session).execute("test-read", { path: "local://notes" });
 		const findResult = await new GlobTool(session).execute("test-find", {
 			path: "local://notes",
 		});
-		const dirResource = await InternalUrlRouter.instance().resolve("local://notes");
+		const dirResource = await InternalUrlRouter.instance().resolve("local://notes", {
+			localProtocolOptions: session.localProtocolOptions,
+		});
 
 		const readText = getResultText(readResult);
 		expect(readText).toContain("PLAN.md");
@@ -450,8 +450,6 @@ describe("GrepTool internal URL resolution", () => {
 		const localRoot = path.join(artifactsDir, "local");
 		await fs.mkdir(localRoot, { recursive: true });
 		await Bun.write(path.join(localRoot, "plan.md"), "alpha line\nbeta needle line\ngamma line\n");
-
-		LocalProtocolHandler.setOverride({ getArtifactsDir: () => artifactsDir, getSessionId: () => "session" });
 
 		const session = createSession({ hasEditTool: true });
 		const tool = new GrepTool(session);
@@ -479,8 +477,6 @@ describe("GrepTool internal URL resolution", () => {
 		// Sibling literal `notes.md:1-2` under the same local root — must NOT
 		// shadow the URL selector semantics of `local://notes.md:1-2`.
 		await Bun.write(path.join(localRoot, "notes.md:1-2"), "sibling literal shadow\n");
-
-		LocalProtocolHandler.setOverride({ getArtifactsDir: () => artifactsDir, getSessionId: () => "session" });
 
 		const session = createSession({ hasEditTool: true });
 		session.settings.set("read.summarize.enabled", false);

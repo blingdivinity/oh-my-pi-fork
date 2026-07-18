@@ -277,4 +277,41 @@ describe("ast_edit tool schema", () => {
 			await removeWithRetries(tempDir);
 		}
 	});
+	it("rejects immutable skill resources before registering an apply action", async () => {
+		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "ast-edit-immutable-"));
+		try {
+			const skillDir = path.join(tempDir, "skills", "sealed-skill");
+			const skillFile = path.join(skillDir, "SKILL.md");
+			await fs.mkdir(skillDir, { recursive: true });
+			await Bun.write(skillFile, "legacyWrap(x, value)\n");
+			const queue = new ToolChoiceQueue();
+			const tools = await createTools(
+				createTestSession(tempDir, {
+					getToolChoiceQueue: () => queue,
+					skills: [
+						{
+							name: "sealed-skill",
+							description: "immutable test skill",
+							filePath: skillFile,
+							baseDir: skillDir,
+							source: "test",
+						},
+					],
+				}),
+			);
+			const tool = tools.find(entry => entry.name === "ast_edit");
+			expect(tool).toBeDefined();
+
+			await expect(
+				tool!.execute("ast-edit-immutable", {
+					ops: [{ pat: "legacyWrap($A, $B)", out: "modernWrap($A, $B)" }],
+					paths: ["skill://sealed-skill/SKILL.md"],
+				}),
+			).rejects.toThrow("Cannot rewrite immutable internal resource skill://sealed-skill/SKILL.md");
+			expect(queue.hasPendingInvoker).toBe(false);
+			expect(await Bun.file(skillFile).text()).toBe("legacyWrap(x, value)\n");
+		} finally {
+			await removeWithRetries(tempDir);
+		}
+	});
 });

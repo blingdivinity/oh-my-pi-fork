@@ -268,12 +268,10 @@ This is advisory/contextual: prompt text asks the model to read applicable rules
 
 ## 8. `rule://` internal URL behavior
 
-`RuleProtocolHandler` resolves against the process-global active-rule snapshot
-installed once per top-level session in `sdk.ts`:
-
-```ts
-setActiveRules([...rulebookRules, ...alwaysApplyRules, ...ttsrManager.getRules()]);
-```
+`RuleProtocolHandler` resolves against the calling session's rule snapshot.
+`createAgentSession` builds that snapshot from rulebook rules, always-apply
+rules, and registered TTSR rules, and tools pass it through
+`ResolveContext.rules` whenever they resolve a `rule://` URL.
 
 Implications:
 

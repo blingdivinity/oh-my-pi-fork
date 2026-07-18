@@ -1,6 +1,6 @@
-import { MCPManager } from "../mcp/manager";
+import type { MCPManager } from "../mcp/manager";
 import type { MCPResourceReadResult } from "../mcp/types";
-import type { InternalResource, InternalUrl, ProtocolHandler } from "./types";
+import type { InternalResource, InternalUrl, ProtocolHandler, ResolveContext } from "./types";
 
 function escapeRegex(text: string): string {
 	return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -104,8 +104,8 @@ export class McpProtocolHandler implements ProtocolHandler {
 	readonly scheme = "mcp";
 	readonly immutable = true;
 
-	async resolve(url: InternalUrl): Promise<InternalResource> {
-		const mcpManager = MCPManager.instance();
+	async resolve(url: InternalUrl, context?: ResolveContext): Promise<InternalResource> {
+		const mcpManager = context?.mcpManager;
 		if (!mcpManager) {
 			throw new Error("No MCP manager available. MCP servers may not be configured.");
 		}
@@ -120,8 +120,14 @@ export class McpProtocolHandler implements ProtocolHandler {
 
 		let result: MCPResourceReadResult | undefined;
 		try {
-			result = await mcpManager.readServerResource(targetServer, uri);
+			result = await mcpManager.readServerResource(targetServer, uri, { signal: context?.signal });
 		} catch (error) {
+			if (
+				context?.signal?.aborted ||
+				(error instanceof Error && (error.name === "AbortError" || error.name === "ToolAbortError"))
+			) {
+				throw error;
+			}
 			const message = error instanceof Error ? error.message : String(error);
 			throw new Error(`MCP resource read error: ${message}`);
 		}

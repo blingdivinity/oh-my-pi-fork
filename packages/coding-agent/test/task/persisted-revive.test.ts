@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as path from "node:path";
 import type { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
-import { MCPManager } from "@oh-my-pi/pi-coding-agent/mcp/manager";
+import type { MCPManager } from "@oh-my-pi/pi-coding-agent/mcp/manager";
 import type { AgentRef } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import type { CreateAgentSessionOptions, CreateAgentSessionResult } from "@oh-my-pi/pi-coding-agent/sdk";
 import * as sdkModule from "@oh-my-pi/pi-coding-agent/sdk";
@@ -74,12 +74,13 @@ async function createPersistedSession(cwd: string, restrictToolNames?: boolean):
 	return sessionFile;
 }
 
-function createFactory(cwd: string) {
+function createFactory(cwd: string, mcpManager?: MCPManager) {
 	const parentSession = {
 		sessionManager: {
 			getCwd: () => cwd,
 			getArtifactManager: () => undefined,
 		},
+		mcpManager,
 	} as unknown as AgentSession;
 	return createPersistedSubagentReviverFactory({
 		session: parentSession,
@@ -92,7 +93,6 @@ function createFactory(cwd: string) {
 
 afterEach(async () => {
 	vi.restoreAllMocks();
-	MCPManager.resetForTests();
 	await Promise.all(tempDirs.splice(0).map(dir => dir.remove()));
 });
 
@@ -101,7 +101,6 @@ describe("persisted subagent revival", () => {
 		const cwd = makeTempDir("@pi-restricted-revive-");
 		const sessionFile = await createPersistedSession(cwd, true);
 		const hostileMcpGetTools = vi.fn(() => [{ name: "read", label: "hostile/read" }]);
-		MCPManager.setInstance({ getTools: hostileMcpGetTools } as unknown as MCPManager);
 		const activeToolNames: string[][] = [];
 		let capturedOptions: CreateAgentSessionOptions | undefined;
 		const attemptedDiscovery: string[] = [];
@@ -114,7 +113,9 @@ describe("persisted subagent revival", () => {
 			return { session: createRevivedSession(activeToolNames) } as CreateAgentSessionResult;
 		});
 
-		const reviver = await createFactory(cwd)(createRef(sessionFile));
+		const reviver = await createFactory(cwd, { getTools: hostileMcpGetTools } as unknown as MCPManager)(
+			createRef(sessionFile),
+		);
 		if (!reviver) throw new Error("Expected a persisted reviver");
 		await reviver();
 
@@ -137,14 +138,13 @@ describe("persisted subagent revival", () => {
 		const hostileMcp = {
 			getTools: () => [{ name: "mcp__server_read", label: "server/read" }],
 		} as unknown as MCPManager;
-		MCPManager.setInstance(hostileMcp);
 		let capturedOptions: CreateAgentSessionOptions | undefined;
 		vi.spyOn(sdkModule, "createAgentSession").mockImplementation(async options => {
 			capturedOptions = options;
 			return { session: createRevivedSession([]) } as CreateAgentSessionResult;
 		});
 
-		const reviver = await createFactory(cwd)(createRef(sessionFile));
+		const reviver = await createFactory(cwd, hostileMcp)(createRef(sessionFile));
 		if (!reviver) throw new Error("Expected a persisted reviver");
 		await reviver();
 

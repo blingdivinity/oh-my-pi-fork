@@ -52,15 +52,20 @@ export class LegacySseTransport implements MCPTransport {
 		return this.#config.url;
 	}
 
-	async connect(): Promise<void> {
+	async connect(signal?: AbortSignal): Promise<void> {
 		if (this.#connected) return;
 		if (this.#sseConnection) return;
 
+		const cancellationReason = (): unknown => signal?.reason ?? new Error("Legacy SSE connection aborted");
+		if (signal?.aborted) throw cancellationReason();
 		const connection = new AbortController();
 		const timeout = resolveMCPTimeoutMs(this.#config.timeout);
 		const operation = createMCPTimeout(timeout, connection.signal);
 		const endpointReady = Promise.withResolvers<void>();
 		this.#sseConnection = connection;
+		const onAbort = (): void => connection.abort(cancellationReason());
+		signal?.addEventListener("abort", onAbort, { once: true });
+		if (signal?.aborted) onAbort();
 
 		try {
 			const response = await fetch(this.#config.url, {
@@ -86,14 +91,18 @@ export class LegacySseTransport implements MCPTransport {
 				if (wasConnected) this.onClose?.();
 			});
 			await endpointReady.promise;
+			if (signal?.aborted) throw cancellationReason();
 		} catch (error) {
 			operation.clear();
 			if (this.#sseConnection === connection) this.#sseConnection = null;
 			connection.abort();
+			if (signal?.aborted) throw cancellationReason();
 			if (operation.isTimeoutAbort(error)) {
 				throw new Error(`Legacy SSE endpoint timeout after ${timeout}ms`);
 			}
 			throw error;
+		} finally {
+			signal?.removeEventListener("abort", onAbort);
 		}
 	}
 
@@ -370,8 +379,11 @@ export class LegacySseTransport implements MCPTransport {
 }
 
 /** Create and connect a legacy HTTP+SSE transport. */
-export async function createSseTransport(config: MCPSseServerConfig): Promise<LegacySseTransport> {
+export async function createSseTransport(
+	config: MCPSseServerConfig,
+	signal?: AbortSignal,
+): Promise<LegacySseTransport> {
 	const transport = new LegacySseTransport(config);
-	await transport.connect();
+	await transport.connect(signal);
 	return transport;
 }

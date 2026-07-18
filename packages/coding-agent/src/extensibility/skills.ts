@@ -41,26 +41,6 @@ export interface LoadSkillsResult {
 	warnings: SkillWarning[];
 }
 
-let activeSkills: readonly Skill[] = [];
-
-/**
- * Process-global snapshot of skills the active session loaded.
- * Read by internal URL protocol handlers (skill://).
- */
-export function getActiveSkills(): readonly Skill[] {
-	return activeSkills;
-}
-
-/** Replace the active skill snapshot. Called once per top-level session. */
-export function setActiveSkills(value: readonly Skill[]): void {
-	activeSkills = value;
-}
-
-/** Reset the active skill snapshot. Test-only. */
-export function resetActiveSkillsForTests(): void {
-	activeSkills = [];
-}
-
 /**
  * Whether `name` is already claimed by an active authored (non-managed) skill.
  *
@@ -70,10 +50,8 @@ export function resetActiveSkillsForTests(): void {
  * `manage_skill` create consults this to refuse the write up front instead of
  * reporting a false "Created" for a skill that can never appear.
  */
-export function isNameClaimedByAuthoredSkill(name: string): boolean {
-	return getActiveSkills().some(
-		skill => skill.name === name && skill._source?.provider !== MANAGED_SKILLS_PROVIDER_ID,
-	);
+export function isNameClaimedByAuthoredSkill(name: string, skills: readonly Skill[]): boolean {
+	return skills.some(skill => skill.name === name && skill._source?.provider !== MANAGED_SKILLS_PROVIDER_ID);
 }
 
 export interface LoadSkillsFromDirOptions {

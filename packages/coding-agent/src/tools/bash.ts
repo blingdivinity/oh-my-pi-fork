@@ -779,6 +779,8 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 
 		const internalUrlOptions: InternalUrlExpansionOptions = {
 			skills: this.session.skills ?? [],
+			rules: this.session.internalUrlRules,
+			mcpManager: this.session.mcpManager,
 			internalRouter: InternalUrlRouter.instance(),
 			cwd: this.session.cwd,
 			localOptions: {

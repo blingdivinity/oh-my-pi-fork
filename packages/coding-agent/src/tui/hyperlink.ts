@@ -8,13 +8,7 @@
 import * as url from "node:url";
 import { TERMINAL } from "@oh-my-pi/pi-tui";
 import { isSettingsInitialized, settings } from "../config/settings";
-import {
-	LocalProtocolHandler,
-	memoryRootsFromRegistry,
-	parseInternalUrl,
-	resolveLocalUrlToPath,
-	resolveMemoryUrlToPath,
-} from "../internal-urls";
+import { memoryRootsFromRegistry, parseInternalUrl, resolveMemoryUrlToPath } from "../internal-urls";
 
 const OSC = "\x1b]";
 const ST = "\x1b\\";
@@ -139,7 +133,7 @@ export function fileHyperlink(filePath: string, displayText: string, opts?: { li
 }
 
 /**
- * Synchronously resolve a filesystem-backed internal URL (e.g. `local://foo.md`,
+ * Synchronously resolve a filesystem-backed internal URL (e.g.
  * `memory://root/notes.md`) to its absolute filesystem path. Returns `undefined`
  * for inputs that aren't fs-backed, aren't resolvable in the current session
  * registry, or fail to parse.
@@ -149,16 +143,11 @@ export function fileHyperlink(filePath: string, displayText: string, opts?: { li
  * during the call/streaming phase before a result lands).
  *
  * Async-resolved schemes (`artifact://`, `agent://`, `skill://`, `rule://`,
- * `omp://`) are not handled here — those rely on `details.resolvedPath` set
+ * `local://`) are not handled here — those rely on `details.resolvedPath` set
  * by the read tool's router resolution.
  */
 export function tryResolveInternalUrlSync(input: string): string | undefined {
 	try {
-		if (input.startsWith("local://")) {
-			const opts = LocalProtocolHandler.resolveOptions();
-			if (!opts) return undefined;
-			return resolveLocalUrlToPath(input, opts);
-		}
 		if (input.startsWith("memory://")) {
 			const url = parseInternalUrl(input);
 			const roots = memoryRootsFromRegistry();

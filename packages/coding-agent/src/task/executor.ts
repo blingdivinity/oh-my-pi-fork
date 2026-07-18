@@ -9,6 +9,7 @@ import type { AgentEvent, AgentIdentity, AgentTelemetryConfig } from "@oh-my-pi/
 import { recordHandoff, resolveTelemetry } from "@oh-my-pi/pi-agent-core";
 import type { Api, Model, ServiceTierByFamily, Usage } from "@oh-my-pi/pi-ai";
 import { logger, popLoopPhase, prompt, pushLoopPhase, untilAborted } from "@oh-my-pi/pi-utils";
+import type { AsyncJobManager } from "../async/job-manager";
 import type { Rule } from "../capability/rule";
 import { ModelRegistry } from "../config/model-registry";
 import {
@@ -364,6 +365,7 @@ export interface ExecutorOptions {
 	 */
 	preloadedCustomToolPaths?: ToolPathWithSource[];
 	mcpManager?: MCPManager;
+	asyncJobManager?: AsyncJobManager;
 	authStorage?: AuthStorage;
 	modelRegistry?: ModelRegistry;
 	settings?: Settings;
@@ -2524,6 +2526,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				skipPythonPreflight,
 				enableMCP,
 				mcpManager,
+				asyncJobManager: options.asyncJobManager,
 				customTools: mcpProxyTools.length > 0 ? mcpProxyTools : undefined,
 				localProtocolOptions: options.localProtocolOptions,
 				telemetry: subagentTelemetry,
@@ -2670,7 +2673,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				extensionRunner.onError(err => {
 					logger.error("Extension error", { path: err.extensionPath, error: err.error });
 				});
-				await awaitAbortable(extensionRunner.emit({ type: "session_start" }));
+				await awaitAbortable(extensionRunner.activate());
 				while (pendingExtensionMessages.length > 0) {
 					await awaitAbortable(Promise.all(pendingExtensionMessages.splice(0)));
 				}

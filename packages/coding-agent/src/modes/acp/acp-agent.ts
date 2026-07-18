@@ -43,9 +43,8 @@ import {
 import type { AgentToolResult } from "@oh-my-pi/pi-agent-core";
 import type { AssistantMessage, Model } from "@oh-my-pi/pi-ai";
 import { getBlobsDir, isEnoent, logger, type postmortem, VERSION } from "@oh-my-pi/pi-utils";
-import { disableProvider, enableProvider, reset as resetCapabilities } from "../../capability";
+import { disableProvider, enableProvider } from "../../capability";
 import { Settings } from "../../config/settings";
-import { clearPluginRootsAndCaches, resolveActiveProjectRegistryPath } from "../../discovery/helpers";
 import {
 	type ExtensionUIContext,
 	type ExtensionUIDialogOptions,
@@ -54,7 +53,6 @@ import {
 import { runExtensionCompact } from "../../extensibility/extensions/compact-handler";
 import { getSessionSlashCommands } from "../../extensibility/extensions/get-commands-handler";
 import { buildSkillPromptMessage, parseSkillInvocation } from "../../extensibility/skills";
-import { loadSlashCommands } from "../../extensibility/slash-commands";
 import { resolveLocalUrlToPath } from "../../internal-urls";
 import { MCPManager } from "../../mcp/manager";
 import type { MCPServerConfig } from "../../mcp/types";
@@ -67,6 +65,7 @@ import { isSilentAbort, SKILL_PROMPT_MESSAGE_TYPE, USER_INTERRUPT_LABEL } from "
 import type { UsageStatistics } from "../../session/session-entries";
 import type { SessionInfo as StoredSessionInfo } from "../../session/session-listing";
 import { SessionManager } from "../../session/session-manager";
+import type { SessionResourceReloadResult } from "../../session/session-resource-runtime";
 import { executeAcpBuiltinSlashCommand } from "../../slash-commands/acp-builtins";
 import { buildAvailableSlashCommands, toAcpAvailableCommands } from "../../slash-commands/available-commands";
 import { DEFAULT_STT_MODEL_KEY, STT_MODEL_OPTIONS } from "../../stt/models";
@@ -163,7 +162,16 @@ function isPromptTurnInFlight(turn: PromptTurnState | undefined): turn is Prompt
 
 type ManagedSessionRecord = {
 	session: AgentSession;
+	/** The generation currently published to the session, if any. */
 	mcpManager: MCPManager | undefined;
+	/**
+	 * Every manager created for this record remains here until its
+	 * disconnectAll() succeeds. A manager can be retired while another
+	 * generation is current.
+	 */
+	ownedMcpManagers: Set<MCPManager>;
+	/** Serializes each publish/rollback/retire transaction for this session. */
+	mcpConfigurationQueue: Promise<void>;
 	promptTurn: PromptTurnState | undefined;
 	promptQueue: PromptQueueState;
 	liveMessageId: string | undefined;
@@ -1132,6 +1140,8 @@ export class AcpAgent implements Agent {
 		return {
 			session,
 			mcpManager: undefined,
+			ownedMcpManagers: new Set(),
+			mcpConfigurationQueue: Promise.resolve(),
 			promptTurn: undefined,
 			promptQueue: { promise: Promise.resolve(), release: undefined },
 			liveMessageId: undefined,
@@ -1901,21 +1911,15 @@ export class AcpAgent implements Agent {
 	}
 
 	/**
-	 * Reload plugin/registry state for an ACP session. Mirrors the interactive
-	 * `/reload-plugins` and `/move` flows: invalidates the plugin-roots cache,
-	 * resets the capability cache, refreshes the session's slash-command state,
-	 * then re-advertises commands so the client sees newly installed/disabled
-	 * plugins.
+	 * Reconcile plugin resources through the session-owned reload pipeline, then
+	 * re-advertise command metadata from the applied manifest.
 	 */
-	async #reloadPluginState(record: ManagedSessionRecord): Promise<void> {
-		const cwd = record.session.sessionManager.getCwd();
-		const projectPath = await resolveActiveProjectRegistryPath(cwd);
-		clearPluginRootsAndCaches(projectPath ? [projectPath] : undefined);
-		resetCapabilities();
-		await record.session.refreshSkills();
-		const fileCommands = await loadSlashCommands({ cwd });
-		record.session.setSlashCommands(fileCommands);
-		await this.#emitAvailableCommandsUpdate(record);
+	async #reloadPluginState(record: ManagedSessionRecord): Promise<SessionResourceReloadResult | undefined> {
+		const result = await record.session.reloadPluginResources();
+		if (result?.state !== "failed") {
+			await this.#emitAvailableCommandsUpdate(record);
+		}
+		return result;
 	}
 
 	async #emitEndOfTurnUpdates(record: ManagedSessionRecord): Promise<void> {
@@ -2365,21 +2369,56 @@ export class AcpAgent implements Agent {
 			// the per-`record` binding.
 			createAcpExtensionUiContext(this.#connection, () => record.session.sessionId, this.#clientCapabilities),
 		);
-		await extensionRunner.emit({ type: "session_start" });
+		await extensionRunner.activate();
 		record.extensionsConfigured = true;
 	}
 
 	async #configureMcpServers(record: ManagedSessionRecord, servers: McpServer[]): Promise<void> {
-		if (record.mcpManager) {
-			await record.mcpManager.disconnectAll();
+		const configuration = record.mcpConfigurationQueue.then(async () => {
+			if (record.closedError) {
+				throw record.closedError;
+			}
+			await this.#replaceMcpServers(record, servers);
+		});
+		record.mcpConfigurationQueue = configuration.then(
+			() => undefined,
+			() => undefined,
+		);
+		await configuration;
+	}
+
+	async #replaceMcpServers(record: ManagedSessionRecord, servers: McpServer[]): Promise<void> {
+		const previousManager = record.mcpManager;
+		if (previousManager) {
+			record.ownedMcpManagers.add(previousManager);
 		}
+
 		if (servers.length === 0) {
-			record.mcpManager = undefined;
-			await record.session.refreshMCPTools([]);
+			let replacementPublished = false;
+			try {
+				await record.session.replaceMCPManager(undefined);
+				replacementPublished = true;
+				await record.session.refreshMCPTools([]);
+				record.mcpManager = undefined;
+			} catch (error) {
+				if (replacementPublished) {
+					try {
+						await record.session.replaceMCPManager(previousManager);
+						await record.session.refreshMCPTools(previousManager?.getTools() ?? []);
+					} catch (rollbackError) {
+						throw new AggregateError([error, rollbackError], "Failed to remove ACP MCP servers and restore them");
+					}
+				}
+				throw error;
+			}
+			await this.#retireMcpManager(record, previousManager);
 			return;
 		}
 
 		const manager = new MCPManager(record.session.sessionManager.getCwd());
+		// Claim ownership before any connection work so even a partially
+		// initialized manager remains available for teardown.
+		record.ownedMcpManagers.add(manager);
 		const configs: MCPConfigMap = {};
 		const sources: MCPSourceMap = {};
 		for (const server of servers) {
@@ -2392,17 +2431,67 @@ export class AcpAgent implements Agent {
 			};
 		}
 
-		const result = await manager.connectServers(configs, sources);
-		if (result.errors.size > 0) {
-			throw new Error(
-				Array.from(result.errors.entries())
-					.map(([name, message]) => `${name}: ${message}`)
-					.join("; "),
-			);
+		let replacementPublished = false;
+		try {
+			const result = await manager.connectServers(configs, sources);
+			if (result.errors.size > 0) {
+				throw new Error(
+					Array.from(result.errors.entries())
+						.map(([name, message]) => `${name}: ${message}`)
+						.join("; "),
+				);
+			}
+
+			await record.session.replaceMCPManager(manager);
+			replacementPublished = true;
+			await record.session.refreshMCPTools(result.tools);
+			record.mcpManager = manager;
+		} catch (error) {
+			const cleanupErrors: unknown[] = [error];
+			if (replacementPublished) {
+				try {
+					await record.session.replaceMCPManager(previousManager);
+					await record.session.refreshMCPTools(previousManager?.getTools() ?? []);
+				} catch (rollbackError) {
+					cleanupErrors.push(rollbackError);
+				}
+			}
+			try {
+				await this.#retireMcpManager(record, manager);
+			} catch (disconnectError) {
+				cleanupErrors.push(disconnectError);
+			}
+			if (cleanupErrors.length > 1) {
+				throw new AggregateError(
+					cleanupErrors,
+					"Failed to configure ACP MCP servers and restore the previous generation",
+				);
+			}
+			throw error;
 		}
 
-		record.mcpManager = manager;
-		await record.session.refreshMCPTools(result.tools);
+		// Keep the newly published generation active even when retiring the old
+		// one fails. The old manager remains in ownedMcpManagers for disposal.
+		await this.#retireMcpManager(record, previousManager);
+	}
+
+	async #retireMcpManager(record: ManagedSessionRecord, manager: MCPManager | undefined): Promise<void> {
+		if (!manager) {
+			return;
+		}
+		try {
+			await manager.disconnectAll();
+			record.ownedMcpManagers.delete(manager);
+			if (record.mcpManager === manager) {
+				record.mcpManager = undefined;
+			}
+		} catch (error) {
+			logger.warn("Failed to disconnect ACP MCP manager", {
+				sessionId: record.session.sessionId,
+				error,
+			});
+			throw error;
+		}
 	}
 
 	#toMcpConfig(server: McpServer): MCPServerConfig {
@@ -2463,13 +2552,21 @@ export class AcpAgent implements Agent {
 
 	async #disposeSessionRecord(record: ManagedSessionRecord, reason?: postmortem.Reason): Promise<void> {
 		record.lifetimeUnsubscribe?.();
+		await record.mcpConfigurationQueue;
 		if (record.mcpManager) {
+			record.ownedMcpManagers.add(record.mcpManager);
+		}
+		for (const manager of Array.from(record.ownedMcpManagers)) {
 			try {
-				await record.mcpManager.disconnectAll();
+				await this.#retireMcpManager(record, manager);
 			} catch (error) {
-				logger.warn("Failed to disconnect ACP MCP servers", { error });
+				// Keep failed managers in the ownership set so a later disposal
+				// attempt can retry the transport cleanup.
+				logger.warn("Failed to disconnect ACP MCP manager during session disposal", {
+					sessionId: record.session.sessionId,
+					error,
+				});
 			}
-			record.mcpManager = undefined;
 		}
 		try {
 			await record.session.dispose({ reason });

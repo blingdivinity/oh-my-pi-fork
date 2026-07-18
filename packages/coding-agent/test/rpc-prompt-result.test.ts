@@ -117,6 +117,7 @@ describe("reportLocalOnlyPromptResult", () => {
 					extensionActions = actions;
 				},
 				onError: () => {},
+				activate: async () => {},
 				emit: async () => {},
 			},
 			sendCustomMessage: async (_message: unknown, options?: { triggerTurn?: boolean }) => {
@@ -161,6 +162,7 @@ describe("reportLocalOnlyPromptResult", () => {
 					extensionActions = actions;
 				},
 				onError: () => {},
+				activate: async () => {},
 				emit: async () => {},
 			},
 			sendUserMessage: async (content: unknown) => {
@@ -213,6 +215,7 @@ describe("reportLocalOnlyPromptResult", () => {
 					extensionActions = actions;
 				},
 				onError: () => {},
+				activate: async () => {},
 				emit: async () => {},
 			},
 			sendUserMessage: async () => {

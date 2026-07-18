@@ -2,7 +2,6 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { isEnoent } from "@oh-my-pi/pi-utils";
-import { AgentRegistry } from "../registry/agent-registry";
 import { buildDirectoryResource } from "./filesystem-resource";
 import { parseInternalUrl } from "./parse";
 import { validateRelativePath } from "./skill-protocol";
@@ -195,7 +194,6 @@ async function buildListing(url: InternalUrl, localRoot: string): Promise<Intern
 	const content =
 		`# Local\n\n` +
 		`Session-scoped scratch space for large intermediate data, subagent handoffs, and reusable planning artifacts.\n\n` +
-		`Root: ${localRoot}\n\n` +
 		`${files.length} file${files.length === 1 ? "" : "s"} available:\n\n` +
 		`${listing}\n`;
 
@@ -354,14 +352,13 @@ async function resolveLocalTarget(url: InternalUrl, opts: LocalProtocolOptions):
  * Resolve a local:// URL to a regular on-disk file, applying the same
  * realpath + containment guarantees as {@link LocalProtocolHandler.resolve}
  * but WITHOUT reading or UTF-8-decoding its contents. Returns null when there
- * is no active session or when the URL targets the root listing or a directory;
+ * is no session context or when the URL targets the root listing or a directory;
  * throws the handler's not-found and "escapes local root" errors for missing
  * files and symlink escapes.
  *
- * Options are resolved via {@link LocalProtocolHandler.resolveOptions} so the
- * caller-options → override → registry order matches router resolution exactly.
- * The read tool uses this to detect and emit image files from their real path
- * before the text-only resource contract would decode the binary into mojibake.
+ * Only caller-supplied context is honored: contextless callers return null
+ * rather than guessing which session owns the local root. The read tool uses
+ * this helper before the text-only resource contract would decode binary into mojibake.
  */
 export async function resolveLocalUrlToFile(
 	input: string | InternalUrl,
@@ -385,56 +382,12 @@ export class LocalProtocolHandler implements ProtocolHandler {
 	readonly scheme = "local";
 	readonly immutable = false;
 
-	static #override: LocalProtocolOptions | undefined;
-
 	/**
-	 * Install a process-global override that wins over the AgentRegistry-based
-	 * derivation. Used by SDK consumers that wire `localProtocolOptions` on
-	 * `createAgentSession` and by subagents that share their parent's root.
-	 */
-	static setOverride(value: LocalProtocolOptions | undefined): void {
-		LocalProtocolHandler.#override = value;
-	}
-
-	/** Reset the process-global override. Test-only. */
-	static resetOverrideForTests(): void {
-		LocalProtocolHandler.#override = undefined;
-	}
-
-	/**
-	 * Returns the active local-protocol options.
-	 *
-	 * Resolution order:
-	 * 1. **Caller-supplied** `context.localProtocolOptions` (the actual session
-	 *    that initiated the `read`/`find`/`search`/`router.resolve` call). This
-	 *    is what keeps `local://` reads pinned to the calling session in
-	 *    multi-session hosts (cmux/ACP, embedded SDK consumers) where every
-	 *    session registers as `kind: "main"` and "first one wins" would route
-	 *    to the wrong artifacts directory.
-	 * 2. Explicit process-global override installed via {@link setOverride}
-	 *    (used by SDK consumers with a custom artifacts/session-id mapping and
-	 *    by code paths that do not have a calling session, e.g. TUI hyperlink
-	 *    resolution).
-	 * 3. The first `main`-kind session in `AgentRegistry.global()`. Its
-	 *    `SessionManager` supplies both `getArtifactsDir` and `getSessionId`.
-	 *    Last-resort fallback — every caller that has a session reference
-	 *    SHOULD thread it through `context` so this branch is never taken in
-	 *    multi-session setups.
+	 * Returns caller-supplied local-protocol options. Contextless callers must
+	 * not guess which session owns a local:// root.
 	 */
 	static resolveOptions(context?: ResolveContext): LocalProtocolOptions | undefined {
-		const fromContext = context?.localProtocolOptions;
-		if (fromContext) return fromContext;
-		const override = LocalProtocolHandler.#override;
-		if (override) return override;
-		const main = AgentRegistry.global()
-			.list()
-			.find(ref => ref.kind === "main");
-		const sessionManager = main?.session?.sessionManager;
-		if (!sessionManager) return undefined;
-		return {
-			getArtifactsDir: () => sessionManager.getArtifactsDir(),
-			getSessionId: () => sessionManager.getSessionId(),
-		};
+		return context?.localProtocolOptions;
 	}
 
 	async resolve(url: InternalUrl, context?: ResolveContext): Promise<InternalResource> {

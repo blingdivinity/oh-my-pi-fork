@@ -4,7 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import {
 	InternalUrlRouter,
-	LocalProtocolHandler,
+	type LocalProtocolOptions,
 	resolveLocalRoot,
 	resolveLocalUrlToPath,
 } from "@oh-my-pi/pi-coding-agent/internal-urls";
@@ -19,14 +19,19 @@ async function withTempDir<T>(fn: (dir: string) => Promise<T>): Promise<T> {
 	}
 }
 
+function createRouter(localProtocolOptions: LocalProtocolOptions) {
+	const router = InternalUrlRouter.instance();
+	return {
+		resolve: (input: string) => router.resolve(input, { localProtocolOptions }),
+	};
+}
+
 describe("LocalProtocolHandler", () => {
 	beforeEach(() => {
-		LocalProtocolHandler.resetOverrideForTests();
 		InternalUrlRouter.resetForTests();
 	});
 
 	afterEach(() => {
-		LocalProtocolHandler.resetOverrideForTests();
 		InternalUrlRouter.resetForTests();
 	});
 
@@ -36,15 +41,15 @@ describe("LocalProtocolHandler", () => {
 			await fs.mkdir(path.join(artifactsDir, "local"), { recursive: true });
 			await Bun.write(path.join(artifactsDir, "local", "handoff.json"), '{"ok":true}');
 
-			LocalProtocolHandler.setOverride({
+			const router = createRouter({
 				getArtifactsDir: () => artifactsDir,
 				getSessionId: () => "session-a",
 			});
-			const router = InternalUrlRouter.instance();
 			const resource = await router.resolve("local://");
 
 			expect(resource.contentType).toBe("text/markdown");
 			expect(resource.content).toContain("handoff.json");
+			expect(resource.content).not.toContain(artifactsDir);
 		});
 	});
 
@@ -55,11 +60,10 @@ describe("LocalProtocolHandler", () => {
 			await fs.mkdir(path.dirname(localFile), { recursive: true });
 			await Bun.write(localFile, "trace");
 
-			LocalProtocolHandler.setOverride({
+			const router = createRouter({
 				getArtifactsDir: () => artifactsDir,
 				getSessionId: () => "session-b",
 			});
-			const router = InternalUrlRouter.instance();
 			const resource = await router.resolve("local://subtasks/trace.txt");
 
 			expect(resource.content).toBe("trace");
@@ -69,11 +73,10 @@ describe("LocalProtocolHandler", () => {
 
 	it("blocks path traversal attempts", async () => {
 		await withTempDir(async tempDir => {
-			LocalProtocolHandler.setOverride({
+			const router = createRouter({
 				getArtifactsDir: () => path.join(tempDir, "artifacts"),
 				getSessionId: () => "session-c",
 			});
-			const router = InternalUrlRouter.instance();
 			await expect(router.resolve("local://../secret.txt")).rejects.toThrow(
 				"Path traversal (..) is not allowed in local:// URLs",
 			);
@@ -126,16 +129,15 @@ describe("LocalProtocolHandler", () => {
 			await Bun.write(path.join(outsideDir, "secret.txt"), "secret");
 			await fs.symlink(outsideDir, path.join(localRoot, "linked"));
 
-			LocalProtocolHandler.setOverride({
+			const router = createRouter({
 				getArtifactsDir: () => artifactsDir,
 				getSessionId: () => "session-d",
 			});
-			const router = InternalUrlRouter.instance();
 			await expect(router.resolve("local://linked/secret.txt")).rejects.toThrow("local:// URL escapes local root");
 		});
 	});
 
-	it("prefers caller-supplied context.localProtocolOptions over the installed override", async () => {
+	it("isolates caller-supplied local roots", async () => {
 		await withTempDir(async tempDir => {
 			const overrideArtifactsDir = path.join(tempDir, "override-artifacts");
 			const callerArtifactsDir = path.join(tempDir, "caller-artifacts");
@@ -144,16 +146,13 @@ describe("LocalProtocolHandler", () => {
 			await Bun.write(path.join(overrideArtifactsDir, "local", "PLAN.md"), "# wrong session");
 			await Bun.write(path.join(callerArtifactsDir, "local", "PLAN.md"), "# caller session");
 
-			// Process-global override points at the WRONG session (simulates a
-			// stale override leaked from a prior subagent, or the multi-`main`
-			// AgentRegistry case in cmux/ACP where "first one wins" lookup
-			// picks a sibling session's artifacts dir — issue #1608).
-			LocalProtocolHandler.setOverride({
-				getArtifactsDir: () => overrideArtifactsDir,
-				getSessionId: () => "stale-session",
-			});
-
 			const router = InternalUrlRouter.instance();
+			const wrongSession = await router.resolve("local://PLAN.md", {
+				localProtocolOptions: {
+					getArtifactsDir: () => overrideArtifactsDir,
+					getSessionId: () => "other-session",
+				},
+			});
 			const resource = await router.resolve("local://PLAN.md", {
 				localProtocolOptions: {
 					getArtifactsDir: () => callerArtifactsDir,
@@ -163,6 +162,7 @@ describe("LocalProtocolHandler", () => {
 
 			const expectedSourcePath = await fs.realpath(path.join(callerArtifactsDir, "local", "PLAN.md"));
 
+			expect(wrongSession.content).toBe("# wrong session");
 			expect(resource.content).toBe("# caller session");
 			// `sourcePath` is canonicalized by the handler after symlink escape checks.
 			// On macOS this may turn `/var/...` into `/private/var/...`.
@@ -170,19 +170,13 @@ describe("LocalProtocolHandler", () => {
 		});
 	});
 
-	it("surfaces ENOENT against the caller's local root when the file is missing in that session", async () => {
+	it("surfaces ENOENT against the caller's local root when another session has the file", async () => {
 		await withTempDir(async tempDir => {
-			const overrideArtifactsDir = path.join(tempDir, "override-artifacts");
+			const otherArtifactsDir = path.join(tempDir, "other-artifacts");
 			const callerArtifactsDir = path.join(tempDir, "caller-artifacts");
-			await fs.mkdir(path.join(overrideArtifactsDir, "local"), { recursive: true });
+			await fs.mkdir(path.join(otherArtifactsDir, "local"), { recursive: true });
 			await fs.mkdir(path.join(callerArtifactsDir, "local"), { recursive: true });
-			// PLAN.md exists only in the override-pointed session.
-			await Bun.write(path.join(overrideArtifactsDir, "local", "PLAN.md"), "# wrong session");
-
-			LocalProtocolHandler.setOverride({
-				getArtifactsDir: () => overrideArtifactsDir,
-				getSessionId: () => "stale-session",
-			});
+			await Bun.write(path.join(otherArtifactsDir, "local", "PLAN.md"), "# other session");
 
 			const router = InternalUrlRouter.instance();
 			await expect(

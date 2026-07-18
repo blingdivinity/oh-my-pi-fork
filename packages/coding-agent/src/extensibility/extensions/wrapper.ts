@@ -17,6 +17,7 @@ import { normalizeToolEventInput, resolveToolEventInput } from "../tool-event-in
 import { applyToolProxy } from "../tool-proxy";
 import type { ExtensionRunner } from "./runner";
 import type { RegisteredTool, ToolCallEventResult } from "./types";
+export type ExtensionRunnerSource = ExtensionRunner | (() => ExtensionRunner);
 
 /**
  * Adapts a RegisteredTool into an AgentTool.
@@ -99,9 +100,17 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 
 	constructor(
 		private tool: AgentTool<TParameters, TDetails>,
-		private runner: ExtensionRunner,
+		runner: ExtensionRunnerSource,
 	) {
+		this.#runnerSource = runner;
 		applyToolProxy(tool, this);
+	}
+
+	readonly #runnerSource: ExtensionRunnerSource;
+
+	#getRunner(): ExtensionRunner {
+		const source = this.#runnerSource;
+		return typeof source === "function" ? source() : source;
 	}
 
 	/**
@@ -120,6 +129,7 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 		onUpdate?: AgentToolUpdateCallback<TDetails, TParameters>,
 		context?: AgentToolContext,
 	): Promise<AgentToolResult<TDetails, TParameters>> {
+		const runner = this.#getRunner();
 		// 1. Check approval policy (before extension handlers).
 		// CLI `--auto-approve` / `--yolo` sets approval mode to yolo.
 		// User `tools.approval.<tool>` policies are still applied in all modes.
@@ -146,10 +156,10 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 
 		if (approvalCheck.required) {
 			const hasApprovalHandlers =
-				this.runner.hasHandlers("tool_approval_requested") || this.runner.hasHandlers("tool_approval_resolved");
+				runner.hasHandlers("tool_approval_requested") || runner.hasHandlers("tool_approval_resolved");
 			const sessionId = context?.sessionManager?.getSessionId() ?? "";
 			if (hasApprovalHandlers) {
-				await this.runner.emit({
+				await runner.emit({
 					type: "tool_approval_requested",
 					sessionId,
 					toolName: this.tool.name,
@@ -160,8 +170,8 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 			}
 
 			const resolveApproval = async (approved: boolean, reason?: string) => {
-				if (!hasApprovalHandlers) return;
-				await this.runner.emit({
+				if (!runner.hasHandlers("tool_approval_requested") && !runner.hasHandlers("tool_approval_resolved")) return;
+				await runner.emit({
 					type: "tool_approval_resolved",
 					sessionId,
 					toolName: this.tool.name,
@@ -172,7 +182,7 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 			};
 
 			// Check if UI is available
-			if (!this.runner.hasUI()) {
+			if (!runner.hasUI()) {
 				const reason = "no interactive UI available";
 				await resolveApproval(false, reason);
 				throw new Error(
@@ -184,7 +194,7 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 				);
 			}
 
-			const uiContext = this.runner.getUIContext();
+			const uiContext = runner.getUIContext();
 			let choice: string | undefined;
 			try {
 				choice = await uiContext.select(formatApprovalPrompt(this.tool, params, approvalCheck.reason), [
@@ -201,11 +211,9 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 				throw new Error(`Tool call denied by user: ${this.tool.name}`);
 			}
 		}
-
-		// 2. Emit tool_call event - extensions can block execution
-		if (this.runner.hasHandlers("tool_call")) {
+		if (runner.hasHandlers("tool_call")) {
 			try {
-				const callResult = (await this.runner.emitToolCall({
+				const callResult = (await runner.emitToolCall({
 					type: "tool_call",
 					toolName: this.tool.name,
 					toolCallId,
@@ -242,8 +250,8 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 		}
 
 		// Emit tool_result event - extensions can modify the result and error status
-		if (this.runner.hasHandlers("tool_result")) {
-			const resultResult = await this.runner.emitToolResult({
+		if (runner.hasHandlers("tool_result")) {
+			const resultResult = await runner.emitToolResult({
 				type: "tool_result",
 				toolName: this.tool.name,
 				toolCallId,

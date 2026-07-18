@@ -4,7 +4,6 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
-import { getActiveSkills } from "@oh-my-pi/pi-coding-agent/extensibility/skills";
 import type { Skill } from "@oh-my-pi/pi-coding-agent/sdk";
 import { createAgentSession } from "@oh-my-pi/pi-coding-agent/sdk";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
@@ -202,7 +201,6 @@ This skill is added after session creation.
 
 			expect(session.skills.some(skill => skill.name === "runtime-managed-skill")).toBe(true);
 			expect(commandMetadataChanges).toBe(1);
-			expect(getActiveSkills().some(skill => skill.name === "runtime-managed-skill")).toBe(true);
 			expect(session.agent.state.systemPrompt.join("\n")).toContain("runtime-managed-skill");
 			const readSkill = session.getToolByName("read");
 			expect(readSkill).toBeDefined();
@@ -216,7 +214,6 @@ This skill is added after session creation.
 				name: "runtime-managed-skill",
 			});
 			expect(session.skills.some(skill => skill.name === "runtime-managed-skill")).toBe(false);
-			expect(getActiveSkills().some(skill => skill.name === "runtime-managed-skill")).toBe(false);
 			expect(session.agent.state.systemPrompt.join("\n")).not.toContain("runtime-managed-skill");
 			expect(commandMetadataChanges).toBe(2);
 			await expect(

@@ -253,4 +253,58 @@ describe("createAgentSession session storage isolation", () => {
 			}
 		});
 	});
+	it("keeps extension and custom-command discovery disabled across restricted reloads", async () => {
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `pi-sdk-restricted-reload-${Snowflake.next()}-`));
+		tempDirs.push(tempDir);
+		const cwd = path.join(tempDir, "project");
+		const agentDir = path.join(tempDir, "agent");
+		const extensionsDir = path.join(cwd, ".omp", "extensions");
+		const commandDir = path.join(cwd, ".omp", "commands", "restricted");
+		fs.mkdirSync(extensionsDir, { recursive: true });
+		fs.mkdirSync(commandDir, { recursive: true });
+		fs.writeFileSync(
+			path.join(extensionsDir, "restricted.ts"),
+			[
+				"export default function(pi) {",
+				'\tpi.registerCommand("restricted-extension", { handler: async () => {} });',
+				"}",
+			].join("\n"),
+		);
+		fs.writeFileSync(
+			path.join(commandDir, "index.ts"),
+			[
+				"export default function() {",
+				'\treturn { name: "restricted-custom", description: "must stay unavailable", execute: async () => undefined };',
+				"}",
+			].join("\n"),
+		);
+
+		const { session } = await createAgentSession({
+			cwd,
+			agentDir,
+			modelRegistry: sharedModelRegistry,
+			settings: Settings.isolated(),
+			restrictToolNames: true,
+			toolNames: ["read"],
+			skills: [],
+			rules: [],
+			contextFiles: [],
+			promptTemplates: [],
+			slashCommands: [],
+			enableMCP: false,
+			enableLsp: false,
+		});
+		try {
+			expect(session.extensionRunner?.getCommand("restricted-extension")).toBeUndefined();
+			expect(session.customCommands.map(command => command.command.name)).not.toContain("restricted-custom");
+
+			const result = await session.reloadResources(["extensions", "commands"]);
+
+			expect(result?.state).not.toBe("failed");
+			expect(session.extensionRunner?.getCommand("restricted-extension")).toBeUndefined();
+			expect(session.customCommands.map(command => command.command.name)).not.toContain("restricted-custom");
+		} finally {
+			await session.dispose();
+		}
+	});
 });

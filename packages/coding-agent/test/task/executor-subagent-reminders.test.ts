@@ -157,6 +157,9 @@ describe("runSubprocess yield reminders", () => {
 				extensionSendUserMessage = actions.sendUserMessage;
 			},
 			onError: () => {},
+			activate: async () => {
+				await mutableSession.extensionRunner.emit({ type: "session_start" });
+			},
 			emit: async (event: { type: string }) => {
 				if (event.type === "session_start") {
 					extensionSendUserMessage?.("hello from session_start", { deliverAs: "followUp" });

@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it } from "bun:test";
 import { connectToServer, listTools } from "@oh-my-pi/pi-coding-agent/mcp/client";
 import { isRetriableConnectionError } from "@oh-my-pi/pi-coding-agent/mcp/tool-bridge";
+import { LegacySseTransport } from "@oh-my-pi/pi-coding-agent/mcp/transports/sse";
 import type { JsonRpcMessage } from "@oh-my-pi/pi-coding-agent/mcp/types";
 
 const encoder = new TextEncoder();
@@ -69,11 +70,17 @@ describe("legacy MCP HTTP+SSE transport", () => {
 			},
 		});
 
-		const connection = await connectToServer("legacy-sse", {
-			type: "sse",
-			url: `http://127.0.0.1:${server.port}/mcp/sse`,
-			timeout: 1000,
-		});
+		const startup = new AbortController();
+		const connection = await connectToServer(
+			"legacy-sse",
+			{
+				type: "sse",
+				url: `http://127.0.0.1:${server.port}/mcp/sse`,
+				timeout: 1000,
+			},
+			{ signal: startup.signal },
+		);
+		startup.abort(new Error("completed startup signal"));
 		try {
 			const tools = await listTools(connection);
 
@@ -81,6 +88,46 @@ describe("legacy MCP HTTP+SSE transport", () => {
 			expect(tools).toEqual([{ name: "crawl", inputSchema: { type: "object" } }]);
 		} finally {
 			await connection.transport.close();
+		}
+	});
+
+	it("aborts endpoint acquisition when client timeouts are disabled", async () => {
+		const requestStarted = Promise.withResolvers<void>();
+		const hangingResponse = Promise.withResolvers<Response>();
+		server = Bun.serve({
+			port: 0,
+			fetch(req) {
+				const url = new URL(req.url);
+				if (req.method === "GET" && url.pathname === "/mcp/sse") {
+					requestStarted.resolve();
+					return hangingResponse.promise;
+				}
+				return new Response("not found", { status: 404 });
+			},
+		});
+		const transport = new LegacySseTransport({
+			type: "sse",
+			url: `http://127.0.0.1:${server.port}/mcp/sse`,
+			timeout: 0,
+		});
+		const controller = new AbortController();
+		const reason = new Error("cancel legacy SSE startup");
+		const connectionAttempt = transport.connect(controller.signal);
+		await requestStarted.promise;
+		controller.abort(reason);
+		try {
+			const outcome = await Promise.race([
+				connectionAttempt.then(
+					() => "resolved",
+					error => error,
+				),
+				Bun.sleep(100).then(() => "timed out"),
+			]);
+			expect(outcome).toBe(reason);
+		} finally {
+			controller.abort(reason);
+			await transport.close();
+			await Promise.allSettled([connectionAttempt]);
 		}
 	});
 

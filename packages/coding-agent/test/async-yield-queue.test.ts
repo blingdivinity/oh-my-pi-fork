@@ -61,6 +61,8 @@ function createToolSession(asyncJobManager?: AsyncJobManager): ToolSession {
 	} as unknown as ToolSession;
 }
 
+const managers: AsyncJobManager[] = [];
+
 function createHarness(initialStreaming: boolean) {
 	let streaming = initialStreaming;
 	const followUps: AgentMessage[] = [];
@@ -94,7 +96,7 @@ function createHarness(initialStreaming: boolean) {
 			});
 		},
 	});
-	AsyncJobManager.setInstance(manager);
+	managers.push(manager);
 	return {
 		manager,
 		queue,
@@ -116,11 +118,9 @@ async function waitUntil(predicate: () => boolean, message: string): Promise<voi
 }
 
 afterEach(async () => {
-	const manager = AsyncJobManager.instance();
-	if (manager) {
+	for (const manager of managers.splice(0)) {
 		await manager.dispose({ timeoutMs: 200 });
 	}
-	AsyncJobManager.resetForTests();
 });
 
 describe("async result yield queue delivery", () => {

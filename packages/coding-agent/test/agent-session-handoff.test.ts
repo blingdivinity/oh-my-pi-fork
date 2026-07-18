@@ -38,6 +38,8 @@ describe("AgentSession handoff", () => {
 	let session: AgentSession;
 	let sessionManager: SessionManager;
 	let events: AgentSessionEvent[];
+	let vibeCleanup: (ownerSessionId: string) => Promise<void>;
+	let disposeVibeSessions: (ownerSessionId: string) => Promise<void>;
 	let obfuscator: SecretObfuscator;
 
 	/** Poll `predicate` until it holds (returns as soon as the state is reached) or the
@@ -87,6 +89,10 @@ describe("AgentSession handoff", () => {
 		sessionManager = SessionManager.create(tempDir.path(), tempDir.path());
 		events = [];
 		obfuscator = new SecretObfuscator([{ type: "plain", content: HANDOFF_SECRET }]);
+		vibeCleanup = async () => {};
+		disposeVibeSessions = async ownerSessionId => {
+			await vibeCleanup(ownerSessionId);
+		};
 
 		const agent = new Agent({
 			initialState: {
@@ -106,6 +112,7 @@ describe("AgentSession handoff", () => {
 			}),
 			modelRegistry,
 			obfuscator,
+			disposeVibeSessions,
 		});
 
 		session.subscribe(event => {
@@ -163,6 +170,29 @@ describe("AgentSession handoff", () => {
 		expect(sessionManager.getEntries().filter(entry => entry.type === "compaction")).toHaveLength(0);
 	});
 
+	it("awaits vibe disposal before handoff changes the session identity", async () => {
+		const handoffText = "## Goal\nContinue from here";
+		const generateHandoffSpy = vi
+			.spyOn(compactionModule, "generateHandoffFromContext")
+			.mockResolvedValue(handoffText);
+		const cleanupStarted = Promise.withResolvers<string>();
+		const releaseCleanup = Promise.withResolvers<void>();
+		vibeCleanup = async ownerSessionId => {
+			cleanupStarted.resolve(ownerSessionId);
+			await releaseCleanup.promise;
+		};
+		const oldSessionId = session.sessionId;
+
+		const transition = session.handoff();
+		expect(await cleanupStarted.promise).toBe(oldSessionId);
+		expect(session.sessionId).toBe(oldSessionId);
+
+		releaseCleanup.resolve();
+		expect((await transition)?.document).toBe(handoffText);
+		expect(session.sessionId).not.toBe(oldSessionId);
+		expect(generateHandoffSpy).toHaveBeenCalledTimes(1);
+	});
+
 	it("emits handoff lifecycle hooks on the outgoing and replacement sessions", async () => {
 		const extensionsResult = await loadExtensions([], tempDir.path());
 		const extensionRunner = new ExtensionRunner(
@@ -216,6 +246,7 @@ describe("AgentSession handoff", () => {
 			modelRegistry,
 			extensionRunner,
 			obfuscator,
+			disposeVibeSessions,
 		});
 		const previousSessionFile = session.sessionFile;
 		const generateHandoffSpy = vi

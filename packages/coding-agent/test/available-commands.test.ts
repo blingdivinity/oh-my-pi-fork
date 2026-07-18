@@ -61,6 +61,40 @@ describe("buildAvailableSlashCommands", () => {
 		expect(byName.notes.source).toBe("file");
 	});
 
+	test("uses an applied slash-command snapshot without publishing resources", async () => {
+		let appliedCommands = [{ name: "notes", description: "Open notes", content: "body", source: "test" }];
+		let loadCalls = 0;
+		let setCalls = 0;
+		const session = {
+			customCommands: [],
+			skills: [],
+			get slashCommands() {
+				return appliedCommands;
+			},
+			sessionManager: { getCwd: () => process.cwd() },
+			setSlashCommands() {
+				setCalls++;
+			},
+		};
+
+		const frames: string[][] = [];
+		const advertise = async () => {
+			const commands = await buildAvailableSlashCommands(session as never, async () => {
+				loadCalls++;
+				return [];
+			});
+			frames.push(commands.filter(command => command.source === "file").map(command => command.name));
+		};
+
+		await advertise();
+		appliedCommands = [{ name: "updated", description: "Updated command", content: "body", source: "test" }];
+		await advertise();
+
+		expect(frames).toEqual([["notes"], ["updated"]]);
+		expect(loadCalls).toBe(0);
+		expect(setCalls).toBe(0);
+	});
+
 	test("loads file commands into the session before advertising them", async () => {
 		const fileCommands = [{ name: "notes", description: "Open notes", content: "body", source: "test" }];
 		let loadedCommands: typeof fileCommands | undefined;

@@ -1,6 +1,21 @@
 # Changelog
 
 ## [Unreleased]
+### Breaking Changes
+
+- Removed process-global `AsyncJobManager`, `MCPManager`, active-skill, active-rule, and local-protocol override singleton APIs. Sessions now expose and explicitly propagate their owned or borrowed managers and immutable resource snapshots; `isNameClaimedByAuthoredSkill` now requires the relevant skill snapshot.
+
+- Changed `AgentSession.setSlashCommands` to complete asynchronously after command-resource publication. `InteractiveModeContext` implementations must provide `reloadPluginState`, and `SlashCommandRuntime.reloadPlugins` now returns the resource reload result so hosts can surface failed or degraded reconciliation.
+
+- Changed `AgentSession.applyAdvisorConfigs` from returning a revision number synchronously to returning `Promise<number>` after advisor-resource publication completes.
+
+### Added
+
+- Added SDK-facing `ResourceRuntime` primitives and `AgentSession` resource reload/status APIs, including desired-versus-applied revisions and per-domain degraded diagnostics.
+
+### Changed
+
+- Unified session resource discovery and hot reload across startup, `/reload-plugins`, extension and MCP dashboards, ACP, RPC, and SDK callers. Extensions, providers, tools, prompts, commands, skills, rules, agents, MCP, and UI bindings now publish immutable generations with admission gating, ownership-aware handoff, rollback, and deferred retirement instead of mutating independent live caches.
 
 ## [17.0.4] - 2026-07-18
 
@@ -13,6 +28,8 @@
 - Fixed `/quit` and `/exit` hanging during interactive shutdown by making the mnemopi dispose path retain the current session and flush in-flight extractions without sleeping the bank; the `/memory enqueue` path and end-of-session backend enqueue still perform full cross-session consolidation. ([#3641](https://github.com/can1357/oh-my-pi/issues/3641))
 
 ## [17.0.3] - 2026-07-17
+
+## [17.0.1] - 2026-07-16
 
 ### Changed
 

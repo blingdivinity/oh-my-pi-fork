@@ -23,6 +23,7 @@ import type { CompactMode } from "../session/compact-modes";
 import type { HistoryStorage } from "../session/history-storage";
 import type { SessionContext } from "../session/session-context";
 import type { SessionManager } from "../session/session-manager";
+import type { SessionResourceReloadResult } from "../session/session-resource-runtime";
 import type { ShakeMode } from "../session/shake-types";
 import type { LspStartupServerInfo } from "../tools";
 import type { EventBus } from "../utils/event-bus";
@@ -357,6 +358,8 @@ export interface InteractiveModeContext {
 	refreshSlashCommandState(cwd?: string): Promise<void>;
 	/** Reload session skills and derived `/skill:<name>` commands. */
 	refreshSkillState(): Promise<void>;
+	/** Reconcile plugin resources, then rebuild TUI command metadata from the applied manifest. */
+	reloadPluginState(cwd?: string): Promise<SessionResourceReloadResult | undefined>;
 	applyCwdChange(newCwd: string): Promise<void>;
 
 	// Selector handling

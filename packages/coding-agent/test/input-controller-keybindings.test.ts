@@ -2,6 +2,7 @@ import { describe, expect, it, type Mock, vi } from "bun:test";
 import type { ImageContent } from "@oh-my-pi/pi-ai";
 import { InputController } from "@oh-my-pi/pi-coding-agent/modes/controllers/input-controller";
 import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/types";
+import type { Keybinding } from "@oh-my-pi/pi-tui";
 import manualContinuePrompt from "../src/prompts/system/manual-continue.md" with { type: "text" };
 
 type FakeEditor = {
@@ -257,6 +258,41 @@ describe("InputController keybinding setup", () => {
 		expect(spies.refreshAppearance.mock.invocationCallOrder[0]!).toBeLessThan(
 			spies.resetDisplay.mock.invocationCallOrder[0]!,
 		);
+	});
+
+	it("refreshes extension shortcuts without removing built-in custom handlers", async () => {
+		const { InputController, ctx, customHandlers } = await createContext();
+		const oldHandler = vi.fn();
+		const newHandler = vi.fn();
+		const oldRunner = {
+			getShortcuts: () => new Map([["ctrl+x", { handler: oldHandler, extensionPath: "/old-extension.ts" }]]),
+			createCommandContext: vi.fn(() => ({})),
+			emitError: vi.fn(),
+		};
+		const newRunner = {
+			getShortcuts: () => new Map([["ctrl+y", { handler: newHandler, extensionPath: "/new-extension.ts" }]]),
+			createCommandContext: vi.fn(() => ({})),
+			emitError: vi.fn(),
+		};
+		const originalGetKeys = ctx.keybindings.getKeys.bind(ctx.keybindings);
+		ctx.keybindings.getKeys = (action: Keybinding) =>
+			action === "app.session.new" ? ["ctrl+n"] : originalGetKeys(action);
+		(ctx.session as unknown as { extensionRunner: unknown }).extensionRunner = oldRunner;
+		const controller = new InputController(ctx);
+
+		controller.setupKeyHandlers();
+		expect(customHandlers.has("ctrl+x")).toBe(true);
+		expect(customHandlers.has("ctrl+n")).toBe(true);
+
+		(ctx.session as unknown as { extensionRunner: unknown }).extensionRunner = newRunner;
+		controller.refreshExtensionShortcuts();
+
+		expect(customHandlers.has("ctrl+x")).toBe(false);
+		expect(customHandlers.has("ctrl+y")).toBe(true);
+		expect(customHandlers.has("ctrl+n")).toBe(true);
+		customHandlers.get("ctrl+y")?.();
+		expect(oldHandler).not.toHaveBeenCalled();
+		expect(newHandler).toHaveBeenCalledTimes(1);
 	});
 
 	it("does not mark pasted shell prompts as Python mode while editing", async () => {

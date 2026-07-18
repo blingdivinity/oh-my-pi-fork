@@ -12,7 +12,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
-import { InternalUrlRouter, LocalProtocolHandler, parseInternalUrl } from "@oh-my-pi/pi-coding-agent/internal-urls";
+import { InternalUrlRouter } from "@oh-my-pi/pi-coding-agent/internal-urls";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { ReadTool } from "@oh-my-pi/pi-coding-agent/tools/read";
 import { removeWithRetries } from "@oh-my-pi/pi-utils";
@@ -25,7 +25,7 @@ const TINY_PNG = Buffer.from(
 
 function makeSession(testDir: string): ToolSession {
 	const sessionFile = path.join(testDir, "session.jsonl");
-	const artifactsDir = sessionFile.slice(0, -6);
+	const artifactsDir = path.join(testDir, "artifacts");
 	return {
 		cwd: testDir,
 		hasUI: false,
@@ -33,6 +33,10 @@ function makeSession(testDir: string): ToolSession {
 		getArtifactsDir: () => artifactsDir,
 		getSessionSpawns: () => null,
 		settings: Settings.isolated({ "images.autoResize": false }),
+		localProtocolOptions: {
+			getArtifactsDir: () => artifactsDir,
+			getSessionId: () => "session-local-image",
+		},
 	} as unknown as ToolSession;
 }
 
@@ -48,20 +52,14 @@ describe("read local:// images", () => {
 	let localRoot: string;
 
 	beforeEach(async () => {
-		LocalProtocolHandler.resetOverrideForTests();
 		InternalUrlRouter.resetForTests();
 		testDir = await fs.mkdtemp(path.join(os.tmpdir(), "read-local-image-"));
 		const artifactsDir = path.join(testDir, "artifacts");
 		localRoot = path.join(artifactsDir, "local");
 		await fs.mkdir(localRoot, { recursive: true });
-		LocalProtocolHandler.setOverride({
-			getArtifactsDir: () => artifactsDir,
-			getSessionId: () => "session-local-image",
-		});
 	});
 
 	afterEach(async () => {
-		LocalProtocolHandler.resetOverrideForTests();
 		InternalUrlRouter.resetForTests();
 		await removeWithRetries(testDir);
 	});
@@ -124,7 +122,9 @@ describe("read local:// images", () => {
 	it("does not materialize local:// binary resources in the protocol handler", async () => {
 		await Bun.write(path.join(localRoot, "archive.zip"), new Uint8Array([0, 1, 2, 3, 4, 5]));
 
-		const resource = await new LocalProtocolHandler().resolve(parseInternalUrl("local://archive.zip"));
+		const resource = await InternalUrlRouter.instance().resolve("local://archive.zip", {
+			localProtocolOptions: makeSession(testDir).localProtocolOptions,
+		});
 
 		expect(resource.content).toContain("Cannot read binary local:// file");
 		expect(resource.content).toContain("archive.zip");

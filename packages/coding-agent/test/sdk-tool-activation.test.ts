@@ -13,6 +13,7 @@ import {
 	discoverAuthStorage,
 	type ExtensionFactory,
 } from "@oh-my-pi/pi-coding-agent/sdk";
+import type { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { VIBE_TOOL_NAMES } from "@oh-my-pi/pi-coding-agent/tools/vibe";
 import { removeSyncWithRetries, Snowflake } from "@oh-my-pi/pi-utils";
@@ -60,6 +61,7 @@ describe("createAgentSession defaultInactive tool activation", () => {
 	// these tests vary, and skips the background model refresh the SDK would
 	// otherwise start when it builds its own registry.
 	let modelRegistry!: ModelRegistry;
+	let registryAuthStorage!: AuthStorage;
 	let registryAuthDir: string;
 
 	const makeTempDir = (): string => {
@@ -72,7 +74,8 @@ describe("createAgentSession defaultInactive tool activation", () => {
 	beforeAll(async () => {
 		registryAuthDir = path.join(os.tmpdir(), `pi-sdk-tool-activation-auth-${Snowflake.next()}`);
 		fs.mkdirSync(registryAuthDir, { recursive: true });
-		modelRegistry = new ModelRegistry(await discoverAuthStorage(registryAuthDir));
+		registryAuthStorage = await discoverAuthStorage(registryAuthDir);
+		modelRegistry = new ModelRegistry(registryAuthStorage);
 	});
 
 	// Shared options for every session. `rules: []` and `workspaceTree` short-circuit
@@ -108,6 +111,7 @@ describe("createAgentSession defaultInactive tool activation", () => {
 	});
 
 	afterAll(() => {
+		registryAuthStorage.close();
 		removeSyncWithRetries(registryAuthDir);
 	});
 
@@ -166,6 +170,85 @@ describe("createAgentSession defaultInactive tool activation", () => {
 			const context = await session.agent.buildSideRequestContext([]);
 			const providerToolNames = context.tools?.map(tool => tool.name);
 			expect(providerToolNames).toEqual(expect.arrayContaining(["ast_edit", "mcp__fixture_report"]));
+		} finally {
+			await session.dispose();
+		}
+	});
+
+	it("refreshes the public prompt state after a resource reload", async () => {
+		const tempDir = makeTempDir();
+		const { session } = await createAgentSession(baseOptions(tempDir));
+
+		try {
+			const before = session.resourceStatus;
+			expect(before).toBeDefined();
+			const result = await session.reloadResources(["instructions"]);
+			expect(result?.state).not.toBe("failed");
+			expect(session.resourceStatus?.manifestId).toBeGreaterThan(before?.manifestId ?? 0);
+		} finally {
+			await session.dispose();
+		}
+	});
+
+	it("preserves a cwd-updated title prompt through resource reload", async () => {
+		const tempDir = makeTempDir();
+		const { session } = await createAgentSession(baseOptions(tempDir));
+
+		try {
+			const titlePrompt = "Use the destination project's title policy.";
+			session.setTitleSystemPrompt(titlePrompt);
+
+			const result = await session.reloadPluginResources();
+			expect(result?.state).not.toBe("failed");
+			expect(session.titleSystemPrompt).toBe(titlePrompt);
+			expect(session.titleSystemPrompt).toBe(titlePrompt);
+		} finally {
+			await session.dispose();
+		}
+	});
+
+	it("preserves live provider settings through resource reload", async () => {
+		const tempDir = makeTempDir();
+		const { session } = await createAgentSession(baseOptions(tempDir));
+
+		try {
+			const baseline = await session.reloadPluginResources();
+			expect(baseline?.state).not.toBe("failed");
+
+			session.setServiceTierFamily("openai", "priority");
+
+			const partial = await session.reloadResources(["skills"]);
+			expect(partial?.state).not.toBe("failed");
+			expect(session.serviceTierByFamily).toEqual({ openai: "priority" });
+
+			const result = await session.reloadPluginResources();
+			expect(result?.state).not.toBe("failed");
+			expect(session.serviceTierByFamily).toEqual({ openai: "priority" });
+		} finally {
+			await session.dispose();
+		}
+	});
+
+	it("publishes command and advisor updates through public session state", async () => {
+		const tempDir = makeTempDir();
+		const { session } = await createAgentSession(baseOptions(tempDir));
+
+		try {
+			const slashCommand = {
+				name: "runtime-command",
+				description: "Runtime command",
+				content: "Apply the runtime command.",
+				source: "test",
+			};
+			await session.setSlashCommands([slashCommand]);
+			expect(session.slashCommands).toEqual([slashCommand]);
+
+			const beforeAdvisorUpdate = session.resourceStatus?.manifestId ?? 0;
+			await session.applyAdvisorConfigs(
+				[{ name: "runtime-reviewer", instructions: "Review the applied runtime snapshot." }],
+				"Shared runtime advisor instructions.",
+			);
+			expect(session.resourceStatus?.manifestId).toBeGreaterThan(beforeAdvisorUpdate);
 		} finally {
 			await session.dispose();
 		}
@@ -270,6 +353,43 @@ describe("createAgentSession defaultInactive tool activation", () => {
 
 		try {
 			expect(session.getToolByName("write")).toBeUndefined();
+		} finally {
+			await session.dispose();
+		}
+	});
+
+	it("reloads a newly mountable extension tool without reentrant write registration", async () => {
+		const tempDir = makeTempDir();
+		let exposeReloadTool = false;
+		const reloadExtension: ExtensionFactory = pi => {
+			if (!exposeReloadTool) return;
+			pi.registerTool({
+				name: "reload_mountable_tool",
+				label: "Reload Mountable Tool",
+				description: "Tool introduced by extension reload.",
+				parameters: type({}),
+				async execute() {
+					return { content: [{ type: "text", text: "reloaded" }] };
+				},
+			});
+		};
+		const settings = Settings.isolated();
+		settings.set("plan.enabled", false);
+		const { session } = await createAgentSession({
+			...baseOptions(tempDir),
+			settings,
+			extensions: [reloadExtension],
+			toolNames: ["read", "grep", "glob"],
+		});
+
+		try {
+			expect(session.getToolByName("write")).toBeUndefined();
+			exposeReloadTool = true;
+			const result = await session.reloadResources(["extensions"]);
+			expect(result?.state).toBe("applied");
+			expect(session.getToolByName("write")).toBeDefined();
+			expect(session.getXdevToolEntries().map(entry => entry.name)).toContain("reload_mountable_tool");
+			expect(session.getActiveToolNames()).toContain("write");
 		} finally {
 			await session.dispose();
 		}

@@ -310,7 +310,6 @@ describe("Coding Agent Tools", () => {
 		} else {
 			Bun.env.PI_EDIT_VARIANT = originalEditVariant;
 		}
-		AsyncJobManager.resetForTests();
 	});
 
 	describe("read tool", () => {

@@ -209,6 +209,8 @@ export class AstGrepTool implements AgentTool<typeof astGrepSchema, AstGrepToolD
 				signal,
 				localProtocolOptions: this.session.localProtocolOptions,
 				skills: this.session.skills,
+				rules: this.session.internalUrlRules,
+				mcpManager: this.session.mcpManager,
 				resolveExternalUrl: async rawPath => {
 					const target = parseReadUrlTarget(rawPath);
 					if (!target) return undefined;

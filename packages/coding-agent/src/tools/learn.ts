@@ -108,7 +108,24 @@ export class LearnTool implements AgentTool<typeof learnSchema> {
 			} catch {
 				safeSkillName = undefined;
 			}
-			if (params.skill.action === "create" && safeSkillName && isNameClaimedByAuthoredSkill(safeSkillName)) {
+			const skillSnapshot = this.session.skills;
+			if (params.skill.action === "create" && safeSkillName && skillSnapshot === undefined) {
+				return {
+					content: [
+						{
+							type: "text",
+							text: `${memoryMessage}. Did not create managed skill "${params.skill.name}": the session skill snapshot is unavailable, so authored-skill collisions cannot be checked safely.`,
+						},
+					],
+					isError: true,
+					details: { skill: null, skillSnapshotUnavailable: true },
+				};
+			}
+			if (
+				params.skill.action === "create" &&
+				safeSkillName &&
+				isNameClaimedByAuthoredSkill(safeSkillName, skillSnapshot ?? [])
+			) {
 				return {
 					content: [
 						{

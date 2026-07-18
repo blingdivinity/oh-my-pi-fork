@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, spyOn, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -21,6 +21,7 @@ import type { Model } from "@oh-my-pi/pi-ai";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { resolveLocalUrlToPath } from "@oh-my-pi/pi-coding-agent/internal-urls";
+import { MCPManager } from "@oh-my-pi/pi-coding-agent/mcp/manager";
 import {
 	ACP_BOOTSTRAP_RACE_GUARD_MS,
 	AcpAgent,
@@ -117,6 +118,7 @@ class FakeAgentSession {
 	queuedMessageCount = 0;
 	systemPrompt = "system";
 	disposed = false;
+	mcpManager: unknown;
 	fastMode = false;
 	forcedToolChoice: string | undefined;
 	get settings(): Settings {
@@ -264,6 +266,9 @@ class FakeAgentSession {
 	}
 
 	async refreshMCPTools(_tools: unknown[]): Promise<void> {}
+	async replaceMCPManager(manager: unknown): Promise<void> {
+		this.mcpManager = manager;
+	}
 
 	getContextUsage(): undefined {
 		return undefined;
@@ -282,6 +287,9 @@ class FakeAgentSession {
 	}
 
 	async reload(): Promise<void> {}
+	async reloadPluginResources(): Promise<undefined> {
+		return undefined;
+	}
 
 	async newSession(): Promise<boolean> {
 		await this.sessionManager.newSession();
@@ -440,6 +448,7 @@ afterEach(async () => {
 	for (const root of cleanupRoots.splice(0)) {
 		await fs.promises.rm(root, { recursive: true, force: true });
 	}
+	vi.restoreAllMocks();
 });
 
 async function createHarness(
@@ -504,8 +513,27 @@ async function createHarness(
  * session-lifetime subscription is installed. 30 ms of slack absorbs
  * `setTimeout` drift without slowing tests meaningfully.
  */
+
 async function waitForBootstrapGuard(): Promise<void> {
 	await Bun.sleep(ACP_BOOTSTRAP_RACE_GUARD_MS + 150);
+}
+
+function acpMcpServer(name: string) {
+	return { name, command: "mock-mcp", args: [], env: [] };
+}
+
+function mockConnectedMcpManager(_this: MCPManager): {
+	tools: [];
+	errors: Map<string, string>;
+	connectedServers: [];
+	exaApiKeys: [];
+} {
+	return {
+		tools: [],
+		errors: new Map(),
+		connectedServers: [],
+		exaApiKeys: [],
+	};
 }
 
 describe("ACP agent", () => {
@@ -2515,5 +2543,168 @@ describe("ACP agent", () => {
 			expect(second.sessionId).toBe("session-after-switch");
 			expect(third.sessionId).toBe("session-after-switch");
 		});
+	});
+	it("removes and disconnects the current MCP generation when servers become empty", async () => {
+		const harness = await createHarness();
+		const managers: MCPManager[] = [];
+		const disconnectCalls: MCPManager[] = [];
+		spyOn(MCPManager.prototype, "connectServers").mockImplementation(async function (this: MCPManager) {
+			managers.push(this);
+			return mockConnectedMcpManager(this);
+		});
+		spyOn(MCPManager.prototype, "disconnectAll").mockImplementation(async function (this: MCPManager) {
+			disconnectCalls.push(this);
+		});
+
+		const created = await harness.agent.newSession({
+			cwd: harness.cwdA,
+			mcpServers: [acpMcpServer("first")],
+		});
+		const session = harness.findSession(created.sessionId)!;
+		await harness.agent.loadSession({
+			sessionId: created.sessionId,
+			cwd: harness.cwdA,
+			mcpServers: [],
+		});
+
+		expect(session.mcpManager).toBeUndefined();
+		expect(disconnectCalls).toEqual([managers[0]]);
+		await harness.agent.dispose();
+	});
+
+	it("keeps the new MCP generation current after successful replacement", async () => {
+		const harness = await createHarness();
+		const managers: MCPManager[] = [];
+		const disconnectCalls: MCPManager[] = [];
+		spyOn(MCPManager.prototype, "connectServers").mockImplementation(async function (this: MCPManager) {
+			managers.push(this);
+			return mockConnectedMcpManager(this);
+		});
+		spyOn(MCPManager.prototype, "disconnectAll").mockImplementation(async function (this: MCPManager) {
+			disconnectCalls.push(this);
+		});
+
+		const created = await harness.agent.newSession({
+			cwd: harness.cwdA,
+			mcpServers: [acpMcpServer("first")],
+		});
+		const session = harness.findSession(created.sessionId)!;
+		await harness.agent.loadSession({
+			sessionId: created.sessionId,
+			cwd: harness.cwdA,
+			mcpServers: [acpMcpServer("second")],
+		});
+
+		expect(managers).toHaveLength(2);
+		expect(session.mcpManager).toBe(managers[1]);
+		expect(disconnectCalls).toEqual([managers[0]]);
+		await harness.agent.dispose();
+	});
+
+	it("serializes concurrent MCP replacement transactions for one session", async () => {
+		const harness = await createHarness();
+		const managers: MCPManager[] = [];
+		const disconnectCalls: MCPManager[] = [];
+		const firstConnectStarted = Promise.withResolvers<void>();
+		const releaseFirstConnect = Promise.withResolvers<void>();
+		spyOn(MCPManager.prototype, "connectServers").mockImplementation(async function (this: MCPManager) {
+			managers.push(this);
+			if (managers.length === 1) {
+				firstConnectStarted.resolve();
+				await releaseFirstConnect.promise;
+			}
+			return mockConnectedMcpManager(this);
+		});
+		spyOn(MCPManager.prototype, "disconnectAll").mockImplementation(async function (this: MCPManager) {
+			disconnectCalls.push(this);
+		});
+
+		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+		const session = harness.findSession(created.sessionId)!;
+		const firstReplacement = harness.agent.loadSession({
+			sessionId: created.sessionId,
+			cwd: harness.cwdA,
+			mcpServers: [acpMcpServer("first")],
+		});
+		await firstConnectStarted.promise;
+		const secondReplacement = harness.agent.loadSession({
+			sessionId: created.sessionId,
+			cwd: harness.cwdA,
+			mcpServers: [acpMcpServer("second")],
+		});
+		await Bun.sleep(1);
+		const connectionsWhileFirstBlocked = managers.length;
+
+		releaseFirstConnect.resolve();
+		await Promise.all([firstReplacement, secondReplacement]);
+
+		expect(connectionsWhileFirstBlocked).toBe(1);
+		expect(managers).toHaveLength(2);
+		expect(session.mcpManager).toBe(managers[1]);
+		expect(disconnectCalls).toEqual([managers[0]]);
+		await harness.agent.dispose();
+	});
+
+	it("disconnects a manager when connection setup fails", async () => {
+		const harness = await createHarness();
+		const managers: MCPManager[] = [];
+		const disconnectCalls: MCPManager[] = [];
+		spyOn(MCPManager.prototype, "connectServers").mockImplementation(async function (this: MCPManager) {
+			managers.push(this);
+			return {
+				...mockConnectedMcpManager(this),
+				errors: new Map([["broken", "connection refused"]]),
+			};
+		});
+		spyOn(MCPManager.prototype, "disconnectAll").mockImplementation(async function (this: MCPManager) {
+			disconnectCalls.push(this);
+		});
+
+		await expect(
+			harness.agent.newSession({
+				cwd: harness.cwdA,
+				mcpServers: [acpMcpServer("broken")],
+			}),
+		).rejects.toThrow("broken: connection refused");
+
+		expect(disconnectCalls).toEqual([managers[0]]);
+		expect(harness.sessions.at(-1)?.disposed).toBe(true);
+	});
+
+	it("retains a failed old-generation disconnect for session disposal retry", async () => {
+		const harness = await createHarness();
+		const managers: MCPManager[] = [];
+		const disconnectCalls: MCPManager[] = [];
+		let oldDisconnectFailed = false;
+		const oldDisconnectError = new Error("old MCP generation still open");
+		spyOn(MCPManager.prototype, "connectServers").mockImplementation(async function (this: MCPManager) {
+			managers.push(this);
+			return mockConnectedMcpManager(this);
+		});
+		spyOn(MCPManager.prototype, "disconnectAll").mockImplementation(async function (this: MCPManager) {
+			disconnectCalls.push(this);
+			if (this === managers[0] && !oldDisconnectFailed) {
+				oldDisconnectFailed = true;
+				throw oldDisconnectError;
+			}
+		});
+
+		const created = await harness.agent.newSession({
+			cwd: harness.cwdA,
+			mcpServers: [acpMcpServer("first")],
+		});
+		const session = harness.findSession(created.sessionId)!;
+		await expect(
+			harness.agent.loadSession({
+				sessionId: created.sessionId,
+				cwd: harness.cwdA,
+				mcpServers: [acpMcpServer("second")],
+			}),
+		).rejects.toBe(oldDisconnectError);
+
+		expect(session.mcpManager).toBe(managers[1]);
+		await harness.agent.dispose();
+		expect(disconnectCalls).toEqual([managers[0], managers[0], managers[1]]);
+		expect(session.disposed).toBe(true);
 	});
 });

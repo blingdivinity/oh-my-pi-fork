@@ -951,6 +951,26 @@ describe("ExtensionRunner", () => {
 			expect(firstText(res)).toBe("now failing");
 			expect(res.isError).toBe(true);
 		});
+		it("resolves a runner provider for each tool event", async () => {
+			const events: string[] = [];
+			const runnerFor = (label: string): ExtensionRunner =>
+				({
+					hasHandlers: (eventType: string) => eventType === "tool_call",
+					emitToolCall: async () => {
+						events.push(label);
+					},
+				}) as unknown as ExtensionRunner;
+			const runnerA = runnerFor("A");
+			const runnerB = runnerFor("B");
+			let currentRunner = runnerA;
+			const wrapper = new ExtensionToolWrapper(okTool, () => currentRunner);
+
+			await wrapper.execute("call-a", {} as never);
+			currentRunner = runnerB;
+			await wrapper.execute("call-b", {} as never);
+
+			expect(events).toEqual(["A", "B"]);
+		});
 	});
 
 	describe("handler timeouts", () => {

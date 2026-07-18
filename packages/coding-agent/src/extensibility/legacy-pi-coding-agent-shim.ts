@@ -1272,6 +1272,12 @@ export async function createAgentSession(
 	// `noExtensions: true`.
 	if (rest.preloadedExtensions === undefined && rest.preloadedExtensionPaths === undefined) {
 		forwarded.preloadedExtensions = state.extensionsResult;
+		// A legacy loader owns its discovery policy. Pair the reused startup
+		// instances with a fixed reload path snapshot so the SDK does not replace
+		// `noExtensions` or other loader filtering with ambient discovery.
+		forwarded.preloadedExtensionPaths = state.extensionsResult.extensions
+			.map(extension => extension.resolvedPath)
+			.filter(extensionPath => !extensionPath.startsWith("<inline"));
 	}
 
 	if (rest.skills === undefined) {

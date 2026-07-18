@@ -45,17 +45,17 @@ export class ManageSkillTool implements AgentTool<typeof manageSkillSchema> {
 	readonly loadMode = "essential" as const;
 	readonly summary = "Create, update, or delete an isolated managed skill";
 
-	constructor(private readonly refreshSkills?: () => Promise<void>) {}
+	constructor(private readonly session: ToolSession) {}
 
 	static createIf(session: ToolSession): ManageSkillTool | null {
 		if (!session.settings.get("autolearn.enabled")) return null;
-		return new ManageSkillTool(session.refreshSkills);
+		return new ManageSkillTool(session);
 	}
 
 	async execute(_id: string, params: ManageSkillParams): Promise<AgentToolResult> {
 		if (params.action === "delete") {
 			await deleteManagedSkill(params.name);
-			await this.refreshSkills?.();
+			await this.session.refreshSkills?.();
 			return {
 				content: [{ type: "text", text: `Deleted managed skill "${params.name}".` }],
 				details: { action: "delete", name: params.name },
@@ -68,12 +68,28 @@ export class ManageSkillTool implements AgentTool<typeof manageSkillSchema> {
 		if (!params.description || !params.body) {
 			throw new Error(`"${params.action}" requires both "description" and "body".`);
 		}
+		const skillSnapshot = this.session.skills;
+		if (params.action === "create" && skillSnapshot === undefined) {
+			return {
+				content: [
+					{
+						type: "text",
+						text: `Cannot create managed skill "${params.name}": the session skill snapshot is unavailable, so authored-skill collisions cannot be checked safely.`,
+					},
+				],
+				isError: true,
+				details: { action: "create", name: params.name, skillSnapshotUnavailable: true },
+			};
+		}
 		// A managed skill resolves below any authored skill of the same name
 		// (authored always wins in discovery), so creating one under a name an
 		// authored skill already claims writes a file that never surfaces. Refuse
 		// up front rather than report a false "Created". `sanitizeSkillName`
 		// normalizes to the on-disk name the discovery scan compares against.
-		if (params.action === "create" && isNameClaimedByAuthoredSkill(sanitizeSkillName(params.name))) {
+		if (
+			params.action === "create" &&
+			isNameClaimedByAuthoredSkill(sanitizeSkillName(params.name), skillSnapshot ?? [])
+		) {
 			return {
 				content: [
 					{
@@ -91,7 +107,7 @@ export class ManageSkillTool implements AgentTool<typeof manageSkillSchema> {
 			description: params.description,
 			body: params.body,
 		});
-		await this.refreshSkills?.();
+		await this.session.refreshSkills?.();
 		const relativePath = path.relative(getManagedSkillsDir(), skillPath);
 		const verb = params.action === "create" ? "Created" : "Updated";
 		return {

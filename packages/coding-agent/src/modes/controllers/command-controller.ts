@@ -1072,7 +1072,14 @@ export class CommandController {
 			this.ctx.showError(`Move failed: ${err instanceof Error ? err.message : String(err)}`);
 			return;
 		}
-		await this.ctx.applyCwdChange(resolvedPath);
+
+		try {
+			await this.ctx.applyCwdChange(resolvedPath);
+		} catch (err) {
+			const message = err instanceof Error ? err.message : String(err);
+			this.ctx.showError(`Moved to "${resolvedPath}", but failed to reload resources: ${message}`);
+			return;
+		}
 
 		this.ctx.updateEditorBorderColor();
 		await this.ctx.reloadTodos();

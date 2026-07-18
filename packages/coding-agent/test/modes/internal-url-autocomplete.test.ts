@@ -1,11 +1,9 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
+import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as capability from "@oh-my-pi/pi-coding-agent/capability";
 import type { Rule } from "@oh-my-pi/pi-coding-agent/capability/rule";
-import { resetActiveRulesForTests, setActiveRules } from "@oh-my-pi/pi-coding-agent/capability/rule";
 import type { SSHHost } from "@oh-my-pi/pi-coding-agent/capability/ssh";
 import type { CapabilityResult } from "@oh-my-pi/pi-coding-agent/capability/types";
 import type { Skill } from "@oh-my-pi/pi-coding-agent/extensibility/skills";
-import { resetActiveSkillsForTests, setActiveSkills } from "@oh-my-pi/pi-coding-agent/extensibility/skills";
 import { InternalUrlRouter } from "@oh-my-pi/pi-coding-agent/internal-urls/router";
 import {
 	applyInternalUrlCompletion,
@@ -29,15 +27,16 @@ function rule(name: string, description?: string): Rule {
 	};
 }
 
-describe("internal-url-autocomplete", () => {
-	beforeEach(() => {
-		setActiveSkills([skill("humanizer", "Remove AI tells"), skill("react", "React UI"), skill("tla", "TLA+ specs")]);
-		setActiveRules([rule("python", "robomp rules"), rule("style")]);
-	});
+const skills = [skill("humanizer", "Remove AI tells"), skill("react", "React UI"), skill("tla", "TLA+ specs")];
+const rules = [rule("python", "robomp rules"), rule("style")];
+const resourceContext = { skills, rules };
 
+function suggestions(text: string, cwd?: string) {
+	return getInternalUrlSuggestions(text, cwd, resourceContext);
+}
+
+describe("internal-url-autocomplete", () => {
 	afterEach(() => {
-		resetActiveSkillsForTests();
-		resetActiveRulesForTests();
 		vi.restoreAllMocks();
 	});
 
@@ -81,34 +80,34 @@ describe("internal-url-autocomplete", () => {
 
 	describe("getInternalUrlSuggestions", () => {
 		it("lists every skill for a bare skill:// and prefixes the scheme", async () => {
-			const result = await getInternalUrlSuggestions("skill://");
+			const result = await suggestions("skill://");
 			expect(result).not.toBeNull();
 			expect(result!.prefix).toBe("skill://");
 			expect(result!.items.map(i => i.value).sort()).toEqual(["skill://humanizer", "skill://react", "skill://tla"]);
 		});
 
 		it("fuzzy-filters candidates by the typed query", async () => {
-			const result = await getInternalUrlSuggestions("skill://hum");
+			const result = await suggestions("skill://hum");
 			expect(result!.items.map(i => i.value)).toEqual(["skill://humanizer"]);
 		});
 
 		it("ranks an exact/prefix match ahead of a scattered subsequence", async () => {
 			// "ra" is a prefix of "react" (score 80) and a subsequence of "humanizer" (lower).
-			const result = await getInternalUrlSuggestions("skill://ra");
+			const result = await suggestions("skill://ra");
 			expect(result!.items[0]!.value).toBe("skill://react");
 		});
 
 		it("carries the candidate description through", async () => {
-			const result = await getInternalUrlSuggestions("rule://python");
+			const result = await suggestions("rule://python");
 			expect(result!.items[0]).toMatchObject({ value: "rule://python", description: "robomp rules" });
 		});
 
 		it("returns null when no candidate matches", async () => {
-			expect(await getInternalUrlSuggestions("skill://zzzzz")).toBeNull();
+			expect(await suggestions("skill://zzzzz")).toBeNull();
 		});
 
 		it("returns null for schemes without a completion handler", async () => {
-			expect(await getInternalUrlSuggestions("issue://")).toBeNull();
+			expect(await suggestions("issue://")).toBeNull();
 		});
 
 		it("threads cwd through to ssh host completion", async () => {
@@ -125,8 +124,8 @@ describe("internal-url-autocomplete", () => {
 				providers: [],
 			};
 			const spy = vi.spyOn(capability, "loadCapability").mockResolvedValue(result as CapabilityResult<unknown>);
-			const suggestions = await getInternalUrlSuggestions("ssh://", "/tmp/proj");
-			expect(suggestions?.items.map(i => i.value)).toEqual(["ssh://web1"]);
+			const suggestionsResult = await suggestions("ssh://", "/tmp/proj");
+			expect(suggestionsResult?.items.map(i => i.value)).toEqual(["ssh://web1"]);
 			expect(spy.mock.calls[0]?.[1]).toEqual({ cwd: "/tmp/proj" });
 		});
 
@@ -144,16 +143,16 @@ describe("internal-url-autocomplete", () => {
 				providers: [],
 			} as unknown as CapabilityResult<SSHHost>;
 			vi.spyOn(capability, "loadCapability").mockResolvedValue(result as CapabilityResult<unknown>);
-			const suggestions = await getInternalUrlSuggestions("ssh://alice@pr");
+			const suggestionsResult = await suggestions("ssh://alice@pr");
 			// Inserted value is percent-encoded so the URL stays well-formed; the label
 			// keeps the human-readable name and the raw query still fuzzy-matches.
-			expect(suggestions?.items[0]).toMatchObject({ value: "ssh://alice%40prod", label: "alice@prod" });
+			expect(suggestionsResult?.items[0]).toMatchObject({ value: "ssh://alice%40prod", label: "alice@prod" });
 		});
 	});
 
 	describe("router.complete dispatch", () => {
 		it("returns candidates for a completion-capable scheme", async () => {
-			const candidates = await InternalUrlRouter.instance().complete("rule", "");
+			const candidates = await InternalUrlRouter.instance().complete("rule", "", resourceContext);
 			expect(candidates?.map(c => c.value).sort()).toEqual(["python", "style"]);
 		});
 
@@ -214,7 +213,7 @@ describe("internal-url-autocomplete", () => {
 
 	describe("PromptActionAutocompleteProvider integration", () => {
 		it("returns url suggestions before falling back to file/emoji completion", async () => {
-			const provider = new PromptActionAutocompleteProvider([], process.cwd(), []);
+			const provider = new PromptActionAutocompleteProvider([], process.cwd(), [], () => resourceContext);
 			const line = "look at skill://hum";
 			const result = await provider.getSuggestions([line], 0, line.length);
 			expect(result?.prefix).toBe("skill://hum");
@@ -222,7 +221,7 @@ describe("internal-url-autocomplete", () => {
 		});
 
 		it("applies the selected url candidate in place", async () => {
-			const provider = new PromptActionAutocompleteProvider([], process.cwd(), []);
+			const provider = new PromptActionAutocompleteProvider([], process.cwd(), [], () => resourceContext);
 			const line = "look at skill://hum";
 			const result = await provider.getSuggestions([line], 0, line.length);
 			const applied = provider.applyCompletion([line], 0, line.length, result!.items[0]!, result!.prefix);

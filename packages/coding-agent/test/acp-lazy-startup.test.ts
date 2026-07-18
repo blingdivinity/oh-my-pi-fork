@@ -99,6 +99,7 @@ class LazyFakeSession {
 	async abort(): Promise<void> {}
 	async promptCustomMessage(): Promise<void> {}
 	async refreshMCPTools(): Promise<void> {}
+	async replaceMCPManager(_manager: unknown): Promise<void> {}
 	getContextUsage(): undefined {
 		return undefined;
 	}

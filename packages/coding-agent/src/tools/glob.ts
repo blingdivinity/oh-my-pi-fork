@@ -184,6 +184,8 @@ export class GlobTool implements AgentTool<typeof findSchema, GlobToolDetails> {
 					signal,
 					localProtocolOptions: this.session.localProtocolOptions,
 					skills: this.session.skills,
+					rules: this.session.internalUrlRules,
+					mcpManager: this.session.mcpManager,
 					pathOnly: true,
 				});
 				if (!resource.sourcePath) {

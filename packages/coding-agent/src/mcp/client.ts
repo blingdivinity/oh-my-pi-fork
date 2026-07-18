@@ -46,6 +46,28 @@ const CLIENT_INFO = {
 	name: "omp-coding-agent",
 	version: "1.0.0",
 };
+function abortReason(signal: AbortSignal): unknown {
+	return signal.reason ?? new Error("MCP operation aborted");
+}
+
+function throwIfAborted(signal?: AbortSignal): void {
+	if (signal?.aborted) throw abortReason(signal);
+}
+
+async function awaitWithAbort<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
+	throwIfAborted(signal);
+	if (!signal) return promise;
+
+	const { promise: abortPromise, reject } = Promise.withResolvers<never>();
+	const onAbort = () => reject(abortReason(signal));
+	signal.addEventListener("abort", onAbort, { once: true });
+	if (signal.aborted) onAbort();
+	try {
+		return await Promise.race([promise, abortPromise]);
+	} finally {
+		signal.removeEventListener("abort", onAbort);
+	}
+}
 
 /**
  * Default handler for standard MCP server-to-client requests.
@@ -71,18 +93,30 @@ async function defaultRequestHandler(method: string, _params: unknown): Promise<
 /**
  * Create a transport for the given server config.
  */
-async function createTransport(config: MCPServerConfig): Promise<MCPTransport> {
-	const serverType = config.type ?? "stdio";
+async function createTransport(config: MCPServerConfig, signal?: AbortSignal): Promise<MCPTransport> {
+	const transportPromise = (async (): Promise<MCPTransport> => {
+		const serverType = config.type ?? "stdio";
 
-	switch (serverType) {
-		case "stdio":
-			return createStdioTransport(config as MCPStdioServerConfig);
-		case "http":
-			return createHttpTransport(config as MCPHttpServerConfig);
-		case "sse":
-			return createSseTransport(config as MCPSseServerConfig);
-		default:
-			throw new Error(`Unknown server type: ${serverType}`);
+		switch (serverType) {
+			case "stdio":
+				return createStdioTransport(config as MCPStdioServerConfig);
+			case "http":
+				return createHttpTransport(config as MCPHttpServerConfig);
+			case "sse":
+				return createSseTransport(config as MCPSseServerConfig, signal);
+			default:
+				throw new Error(`Unknown server type: ${serverType}`);
+		}
+	})();
+
+	try {
+		return await awaitWithAbort(transportPromise, signal);
+	} catch (error) {
+		// A transport factory may still be completing its pre-handshake fetch.
+		// Close it as soon as it materializes, while returning cancellation
+		// promptly to the caller.
+		void transportPromise.then(transport => transport.close()).catch(() => {});
+		throw error;
 	}
 }
 
@@ -111,17 +145,18 @@ async function initializeConnection(
 		{ signal: options?.signal },
 	);
 
-	if (options?.signal?.aborted) {
-		throw options.signal.reason instanceof Error ? options.signal.reason : new Error("Aborted");
-	}
+	throwIfAborted(options?.signal);
 
 	// Hook point: the transport now has the session ID from the initialize response.
-	// For HTTP, this is the moment to open the SSE stream so server-to-client requests
-	// triggered by notifications/initialized (e.g. roots/list) can be delivered.
-	await options?.onInitialized?.();
+	// For HTTP, this is the moment to open the SSE stream so server-to-client
+	// requests triggered by notifications/initialized (e.g. roots/list) can be delivered.
+	await awaitWithAbort(options?.onInitialized?.() ?? Promise.resolve(), options?.signal);
+	throwIfAborted(options?.signal);
 
-	// Send initialized notification
-	await transport.notify("notifications/initialized");
+	// Send initialized notification. Notifications have no request options, so
+	// race the operation explicitly to preserve caller cancellation.
+	await awaitWithAbort(transport.notify("notifications/initialized"), options?.signal);
+	throwIfAborted(options?.signal);
 
 	return result;
 }
@@ -144,7 +179,9 @@ export async function connectToServer(
 	let transport: MCPTransport | undefined;
 
 	const connect = async (): Promise<MCPServerConnection> => {
-		transport = await createTransport(config);
+		throwIfAborted(options?.signal);
+		transport = await createTransport(config, options?.signal);
+		throwIfAborted(options?.signal);
 		if (options?.onNotification) {
 			transport.onNotification = options.onNotification;
 		}
@@ -160,12 +197,17 @@ export async function connectToServer(
 				async onInitialized() {
 					// Open the SSE stream before sending initialized, so server-to-client
 					// requests triggered by on_initialized (e.g. roots/list) are delivered.
+					throwIfAborted(options?.signal);
 					if ("startSSEListener" in transport! && typeof transport!.startSSEListener === "function") {
-						await (transport as { startSSEListener(): Promise<void> }).startSSEListener();
+						await awaitWithAbort(
+							(transport as { startSSEListener(): Promise<void> }).startSSEListener(),
+							options?.signal,
+						);
 					}
 				},
 			});
 
+			throwIfAborted(options?.signal);
 			return {
 				name,
 				config,
@@ -175,12 +217,18 @@ export async function connectToServer(
 				instructions: initResult.instructions,
 			};
 		} catch (error) {
+			transport.onClose = undefined;
+			if (options?.signal?.aborted) {
+				void transport.close().catch(() => {});
+				throw abortReason(options.signal);
+			}
 			await transport.close();
 			throw error;
 		}
 	};
 
 	try {
+		throwIfAborted(options?.signal);
 		if (!isMCPTimeoutEnabled(timeoutMs)) {
 			return await connect();
 		}
@@ -194,8 +242,10 @@ export async function connectToServer(
 		// If withTimeout rejected (timeout/abort) while connect() was still pending,
 		// the transport may be alive with an open SSE listener. Close it.
 		if (transport) {
+			transport.onClose = undefined;
 			void transport.close().catch(() => {});
 		}
+		if (options?.signal?.aborted) throw abortReason(options.signal);
 		throw error;
 	}
 }
@@ -207,6 +257,7 @@ export async function listTools(
 	connection: MCPServerConnection,
 	options?: { signal?: AbortSignal },
 ): Promise<MCPToolDefinition[]> {
+	throwIfAborted(options?.signal);
 	// Check if server supports tools
 	if (!connection.capabilities.tools) {
 		return [];
@@ -221,17 +272,20 @@ export async function listTools(
 	let cursor: string | undefined;
 
 	do {
+		throwIfAborted(options?.signal);
 		const params: Record<string, unknown> = {};
 		if (cursor) {
 			params.cursor = cursor;
 		}
 
 		const result = await connection.transport.request<MCPToolsListResult>("tools/list", params, options);
+		throwIfAborted(options?.signal);
 		allTools.push(...result.tools);
 		cursor = result.nextCursor;
 	} while (cursor);
 
 	// Cache tools
+	throwIfAborted(options?.signal);
 	connection.tools = allTools;
 
 	return allTools;

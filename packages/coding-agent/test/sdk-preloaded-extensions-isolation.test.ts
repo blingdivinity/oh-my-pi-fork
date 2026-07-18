@@ -17,6 +17,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { ExtensionRuntime } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/loader";
 import type { LoadExtensionsResult } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
 import { createAgentSession } from "@oh-my-pi/pi-coding-agent/sdk";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
@@ -75,5 +76,54 @@ describe("createAgentSession preloadedExtensions isolation (issue #2190)", () =>
 		// caller's array (and its identity) must be untouched.
 		expect(preloaded.extensions).toBe(beforeArrayRef);
 		expect(preloaded.extensions.length).toBe(beforeLength);
+	});
+
+	it("rediscovers extension paths when a normal CLI preload is reloaded", async () => {
+		const cwd = path.join(sharedDir, "reloadable-cli-session");
+		const extensionDir = path.join(cwd, ".omp", "extensions");
+		const extensionPath = path.join(extensionDir, "live.ts");
+		fs.mkdirSync(extensionDir, { recursive: true });
+		fs.writeFileSync(
+			extensionPath,
+			[
+				"export default function(pi) {",
+				'\tpi.registerCommand("live-after-preload", { handler: async () => {} });',
+				"}",
+			].join("\n"),
+		);
+		const preloaded: LoadExtensionsResult = {
+			extensions: [],
+			errors: [],
+			runtime: new ExtensionRuntime(),
+		};
+		const { session } = await createAgentSession({
+			cwd,
+			agentDir: path.join(cwd, "agent"),
+			sessionManager: SessionManager.inMemory(cwd),
+			modelRegistry,
+			settings: Settings.isolated(),
+			preloadedExtensions: preloaded,
+			disableExtensionDiscovery: true,
+			additionalExtensionPaths: [extensionPath],
+			enableLsp: false,
+			enableMCP: false,
+			skipPythonPreflight: true,
+			skills: [],
+			rules: [],
+			preloadedCustomToolPaths: [],
+			contextFiles: [],
+			promptTemplates: [],
+			slashCommands: [],
+		});
+		try {
+			expect(session.extensionRunner?.getCommand("live-after-preload")).toBeUndefined();
+
+			const result = await session.reloadResources(["extensions"]);
+
+			expect(result).toMatchObject({ state: "applied" });
+			expect(session.extensionRunner?.getCommand("live-after-preload")).toBeDefined();
+		} finally {
+			await session.dispose();
+		}
 	});
 });

@@ -997,10 +997,9 @@ describe("AgentSession auto-compaction queue resume", () => {
 		session.agent.emitExternalEvent({ type: "agent_end", messages: [assistantMsg] });
 
 		await withTimeout(reminderDone, 1000, "Todo reminder timed out");
-		await Promise.resolve();
+		await session.waitForIdle();
 
 		expect(getRuntimeSignals()).toContain("todo:1/3");
 		expect(continueSpy).toHaveBeenCalledTimes(1);
-		await session.waitForIdle();
 	});
 });

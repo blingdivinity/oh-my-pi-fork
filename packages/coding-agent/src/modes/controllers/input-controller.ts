@@ -449,9 +449,58 @@ export class InputController {
 		this.ctx.editor.onDequeue = () => this.handleDequeue();
 		this.ctx.editor.setActionKeys("app.retry", this.ctx.keybindings.getKeys("app.retry"));
 		this.ctx.editor.onRetry = () => void this.handleRetry();
+		this.#refreshCustomKeyHandlers();
+
+		// Double-tap left arrow on an empty editor: opens the agent hub from the
+		// main session, or returns the focused subagent view to the main session.
+		// Focused ←← intentionally matches Esc. From the main session the gesture
+		// stays inert when there are no subagents (requireContent); the explicit
+		// hub key still opens the empty roster. `armCloseTap` hands this gesture's
+		// tap state to the hub so the same ←← that opened it also arms its close —
+		// otherwise the hub's fresh detector demands a second ←← (issue #4780).
+		this.ctx.editor.onLeftAtStart = () => {
+			if (this.ctx.focusedAgentId) {
+				this.#handleFocusedLeftTap();
+				return;
+			}
+			if (this.#detectLeftDoubleTap()) {
+				this.ctx.showAgentHub({ requireContent: true, armCloseTap: true });
+			}
+		};
+
+		this.#setupEnhancedPaste();
+
+		this.ctx.editor.onChange = (text: string) => {
+			const wasBashMode = this.ctx.isBashMode;
+			const wasPythonMode = this.ctx.isPythonMode;
+			const trimmed = text.trimStart();
+			this.ctx.isBashMode = trimmed.startsWith("!");
+			this.ctx.isPythonMode = parsePythonCommandInput(trimmed) !== undefined;
+			if (wasBashMode !== this.ctx.isBashMode || wasPythonMode !== this.ctx.isPythonMode) {
+				this.ctx.updateEditorBorderColor();
+			}
+		};
+	}
+
+	/**
+	 * Rebuild extension shortcuts after the session installs a new runner
+	 * generation. The editor's custom-handler map also contains built-in
+	 * shortcuts, so rebuilding the complete map keeps those handlers intact
+	 * while removing closures that point at the retired runner.
+	 */
+	refreshExtensionShortcuts(): void {
+		this.#refreshCustomKeyHandlers();
+	}
+
+	#refreshCustomKeyHandlers(): void {
 		this.ctx.editor.clearCustomKeyHandlers();
-		// Wire up extension shortcuts
+		// Register extension handlers first so built-in handlers win deterministically
+		// if an extension uses a non-reserved key that is also a built-in custom key.
 		this.registerExtensionShortcuts();
+		this.#registerBuiltinCustomKeyHandlers();
+	}
+
+	#registerBuiltinCustomKeyHandlers(): void {
 		const planModeKeys = this.ctx.keybindings.getKeys("app.plan.toggle");
 		for (const key of planModeKeys) {
 			this.ctx.editor.setCustomKeyHandler(key, () => void this.ctx.handlePlanModeCommand());
@@ -491,36 +540,6 @@ export class InputController {
 		for (const key of hubKeys) {
 			this.ctx.editor.setCustomKeyHandler(key, () => this.ctx.showAgentHub());
 		}
-
-		// Double-tap left arrow on an empty editor: opens the agent hub from the
-		// main session, or returns the focused subagent view to the main session.
-		// Focused ←← intentionally matches Esc. From the main session the gesture
-		// stays inert when there are no subagents (requireContent); the explicit
-		// hub key still opens the empty roster. `armCloseTap` hands this gesture's
-		// tap state to the hub so the same ←← that opened it also arms its close —
-		// otherwise the hub's fresh detector demands a second ←← (issue #4780).
-		this.ctx.editor.onLeftAtStart = () => {
-			if (this.ctx.focusedAgentId) {
-				this.#handleFocusedLeftTap();
-				return;
-			}
-			if (this.#detectLeftDoubleTap()) {
-				this.ctx.showAgentHub({ requireContent: true, armCloseTap: true });
-			}
-		};
-
-		this.#setupEnhancedPaste();
-
-		this.ctx.editor.onChange = (text: string) => {
-			const wasBashMode = this.ctx.isBashMode;
-			const wasPythonMode = this.ctx.isPythonMode;
-			const trimmed = text.trimStart();
-			this.ctx.isBashMode = trimmed.startsWith("!");
-			this.ctx.isPythonMode = parsePythonCommandInput(trimmed) !== undefined;
-			if (wasBashMode !== this.ctx.isBashMode || wasPythonMode !== this.ctx.isPythonMode) {
-				this.ctx.updateEditorBorderColor();
-			}
-		};
 	}
 
 	#handleFocusedLeftTap(): void {
@@ -1741,6 +1760,7 @@ export class InputController {
 			moveCursorToMessageStart: () => this.ctx.editor.moveToMessageStart(),
 			moveCursorToLineStart: () => this.ctx.editor.moveToLineStart(),
 			moveCursorToLineEnd: () => this.ctx.editor.moveToLineEnd(),
+			getInternalUrlContext: () => this.ctx.viewSession.getInternalUrlResolveContext(),
 		});
 	}
 

@@ -10,7 +10,7 @@ import type { Settings } from "../../config/settings";
 import type { LocalProtocolOptions } from "../../internal-urls/local-protocol";
 import type { MemoryRuntimeContext } from "../../memory-backend";
 import { type Theme, theme } from "../../modes/theme/theme";
-import type { SessionManager } from "../../session/session-manager";
+import type { ReadonlySessionManager, SessionManager } from "../../session/session-manager";
 import type { BranchHandler, NavigateTreeHandler, NewSessionHandler } from "../session-handler-types";
 import { ManagedTimers } from "./managed-timers";
 import { createExtensionModelQuery } from "./model-api";
@@ -221,8 +221,103 @@ const noOpUIContext: ExtensionUIContext = {
 	setToolsExpanded: () => {},
 };
 
+const uiContextLeaseOwners = new WeakMap<ExtensionUIContext, object>();
+const MUTATING_SESSION_MANAGER_MEMBERS = new Set<PropertyKey>([
+	"getArtifactManager",
+	"allocateArtifactPath",
+	"saveArtifact",
+	"putBlob",
+	"putBlobSync",
+]);
+
+function createLeasedUIContext(target: ExtensionUIContext, owner: object): ExtensionUIContext {
+	const isOwner = () => uiContextLeaseOwners.get(target) === owner;
+	const custom: ExtensionUIContext["custom"] = (factory, options) =>
+		isOwner() ? target.custom(factory, options) : noOpUIContext.custom(factory, options);
+	const leased: ExtensionUIContext = {
+		timeoutStartsOnPresentation: target.timeoutStartsOnPresentation,
+		select: (title, options, dialogOptions) =>
+			isOwner() ? target.select(title, options, dialogOptions) : noOpUIContext.select(title, options, dialogOptions),
+		confirm: (title, message, dialogOptions) =>
+			isOwner()
+				? target.confirm(title, message, dialogOptions)
+				: noOpUIContext.confirm(title, message, dialogOptions),
+		input: (title, placeholder, dialogOptions) =>
+			isOwner()
+				? target.input(title, placeholder, dialogOptions)
+				: noOpUIContext.input(title, placeholder, dialogOptions),
+		askDialog: (questions, dialogOptions) =>
+			isOwner() && target.askDialog ? target.askDialog(questions, dialogOptions) : Promise.resolve(undefined),
+		notify: (message, type) => {
+			if (isOwner()) target.notify(message, type);
+		},
+		onTerminalInput: handler => (isOwner() ? target.onTerminalInput(handler) : () => {}),
+		setStatus: (key, text) => {
+			if (isOwner()) target.setStatus(key, text);
+		},
+		setWorkingMessage: message => {
+			if (isOwner()) target.setWorkingMessage(message);
+		},
+		setWidget: (key, content, options) => {
+			if (isOwner()) target.setWidget(key, content, options);
+		},
+		setFooter: factory => {
+			if (isOwner()) target.setFooter(factory);
+		},
+		setHeader: factory => {
+			if (isOwner()) target.setHeader(factory);
+		},
+		setTitle: title => {
+			if (isOwner()) target.setTitle(title);
+		},
+		custom,
+		setEditorText: text => {
+			if (isOwner()) target.setEditorText(text);
+		},
+		pasteToEditor: text => {
+			if (isOwner()) target.pasteToEditor(text);
+		},
+		getEditorText: () => (isOwner() ? target.getEditorText() : noOpUIContext.getEditorText()),
+		editor: (title, prefill, dialogOptions, editorOptions) =>
+			isOwner()
+				? target.editor(title, prefill, dialogOptions, editorOptions)
+				: noOpUIContext.editor(title, prefill, dialogOptions, editorOptions),
+		addAutocompleteProvider: factory => {
+			if (isOwner()) target.addAutocompleteProvider(factory);
+		},
+		setEditorComponent: factory => {
+			if (isOwner()) target.setEditorComponent(factory);
+		},
+		get theme() {
+			return target.theme;
+		},
+		getAllThemes: () => target.getAllThemes(),
+		getTheme: name => target.getTheme(name),
+		setTheme: themeArg =>
+			isOwner()
+				? target.setTheme(themeArg)
+				: Promise.resolve({ success: false, error: "Extension UI generation is no longer active" }),
+		getToolsExpanded: () => (isOwner() ? target.getToolsExpanded() : noOpUIContext.getToolsExpanded()),
+		setToolsExpanded: expanded => {
+			if (isOwner()) target.setToolsExpanded(expanded);
+		},
+	};
+	return leased;
+}
+
+interface ExtensionRunnerActivationConfig {
+	actions: ExtensionActions;
+	contextActions: ExtensionContextActions;
+	commandContextActions?: ExtensionCommandContextActions;
+	uiContext?: ExtensionUIContext;
+}
+
+const NOOP_TIMER = {} as Timer;
+
 export class ExtensionRunner {
 	#uiContext: ExtensionUIContext;
+	#leasedUiContext: ExtensionUIContext;
+	#uiContextLeaseOwner: object | undefined;
 	#errorListeners: Set<ExtensionErrorListener> = new Set();
 	#getModel: () => Model | undefined = () => undefined;
 	#isIdleFn: () => boolean = () => true;
@@ -240,6 +335,15 @@ export class ExtensionRunner {
 	#shutdownHandler: ShutdownHandler = () => {};
 	#getMemoryFn?: () => MemoryRuntimeContext | undefined;
 	#commandDiagnostics: Array<{ type: string; message: string; path: string }> = [];
+	#active = false;
+	#deactivated = false;
+	#deactivationPromise: Promise<void> | undefined;
+	#activationConfig: ExtensionRunnerActivationConfig | undefined;
+	#activationPending = false;
+	#deactivating = false;
+	#sessionStartEmitted = false;
+	#generation = 0;
+	#shutdownEmitted = false;
 	#initialized = false;
 	/**
 	 * Buffer for `credential_disabled` events received via {@link emitCredentialDisabled}
@@ -273,7 +377,29 @@ export class ExtensionRunner {
 		private readonly localProtocolOptions?: LocalProtocolOptions,
 	) {
 		this.#uiContext = noOpUIContext;
+		this.#leasedUiContext = noOpUIContext;
 		this.#getMemoryFn = getMemory;
+	}
+
+	#bindUIContext(uiContext: ExtensionUIContext): void {
+		this.#releaseUIContextLease();
+		this.#uiContext = uiContext;
+		if (uiContext === noOpUIContext) {
+			this.#leasedUiContext = noOpUIContext;
+			return;
+		}
+		const owner = {};
+		this.#uiContextLeaseOwner = owner;
+		uiContextLeaseOwners.set(uiContext, owner);
+		this.#leasedUiContext = createLeasedUIContext(uiContext, owner);
+	}
+
+	#releaseUIContextLease(): void {
+		const owner = this.#uiContextLeaseOwner;
+		if (owner && uiContextLeaseOwners.get(this.#uiContext) === owner) {
+			uiContextLeaseOwners.delete(this.#uiContext);
+		}
+		this.#uiContextLeaseOwner = undefined;
 	}
 
 	initialize(
@@ -286,6 +412,7 @@ export class ExtensionRunner {
 		this.runtime.sendMessage = actions.sendMessage;
 		this.runtime.sendUserMessage = actions.sendUserMessage;
 		this.runtime.appendEntry = actions.appendEntry;
+		this.runtime.setLabel = actions.setLabel;
 		this.runtime.getActiveTools = actions.getActiveTools;
 		this.runtime.getAllTools = actions.getAllTools;
 		this.runtime.setActiveTools = actions.setActiveTools;
@@ -314,9 +441,19 @@ export class ExtensionRunner {
 			this.#reloadHandler = commandContextActions.reload;
 			this.#getContextUsageFn = commandContextActions.getContextUsage;
 			this.#compactFn = commandContextActions.compact;
+		} else {
+			this.#waitForIdleFn = async () => {};
+			this.#newSessionHandler = async () => ({ cancelled: false });
+			this.#branchHandler = async () => ({ cancelled: false });
+			this.#navigateTreeHandler = async () => ({ cancelled: false });
+			this.#switchSessionHandler = async () => ({ cancelled: false });
+			this.#reloadHandler = async () => {};
+			this.#getContextUsageFn = () => undefined;
+			this.#compactFn = async () => {};
 		}
 
-		this.#uiContext = uiContext ?? noOpUIContext;
+		this.#bindUIContext(uiContext ?? noOpUIContext);
+		this.#activationConfig = { actions, contextActions, commandContextActions, uiContext };
 		this.#initialized = true;
 
 		// Drain events buffered by emitCredentialDisabled() before initialize ran. The
@@ -337,6 +474,212 @@ export class ExtensionRunner {
 	}
 
 	/**
+	 * Configure and mark a logical extension generation active without emitting
+	 * `session_start`. Resource transactions use this phase before publication so
+	 * admitted work never observes an inactive published runner.
+	 */
+	async startActivation(
+		actions?: ExtensionActions,
+		contextActions?: ExtensionContextActions,
+		commandContextActions?: ExtensionCommandContextActions,
+		uiContext?: ExtensionUIContext,
+	): Promise<void> {
+		const pendingDeactivation = this.#deactivationPromise;
+		if (pendingDeactivation) await pendingDeactivation;
+
+		if (actions !== undefined || contextActions !== undefined) {
+			if (!actions || !contextActions) {
+				throw new Error("ExtensionRunner.startActivation requires both actions and contextActions");
+			}
+			this.initialize(actions, contextActions, commandContextActions, uiContext);
+		} else if (!this.#initialized) {
+			const config = this.#activationConfig;
+			if (!config) {
+				throw new Error("ExtensionRunner.startActivation requires an initialized runner when actions are omitted");
+			}
+			this.initialize(config.actions, config.contextActions, config.commandContextActions, config.uiContext);
+		}
+
+		const wasActive = this.#active;
+		const wasDeactivated = this.#deactivated;
+		const startsNewGeneration = !wasActive || wasDeactivated;
+		this.#active = true;
+		this.#deactivated = false;
+		this.#activationPending = false;
+		if (startsNewGeneration) {
+			this.#generation += 1;
+			this.#sessionStartEmitted = false;
+			this.#shutdownEmitted = false;
+		}
+	}
+
+	/** Emit `session_start` once for the active generation. */
+	async emitSessionStart(): Promise<void> {
+		if (!this.#active || this.#deactivated || this.#sessionStartEmitted) return;
+		await this.emit({ type: "session_start" });
+	}
+
+	/**
+	 * Start a logical extension generation and emit its activation event.
+	 *
+	 * The positional arguments intentionally mirror {@link initialize}; callers
+	 * that still configure the runner through initialize() can activate it with
+	 * no arguments.
+	 */
+	async activate(
+		actions?: ExtensionActions,
+		contextActions?: ExtensionContextActions,
+		commandContextActions?: ExtensionCommandContextActions,
+		uiContext?: ExtensionUIContext,
+	): Promise<void> {
+		await this.startActivation(actions, contextActions, commandContextActions, uiContext);
+		await this.emitSessionStart();
+	}
+
+	/**
+	 * Copy activation capabilities without starting the target generation.
+	 * Resource transactions use this split so `session_start` runs only after
+	 * publication and its admission gate have fully settled.
+	 */
+	prepareActivationFrom(previous: ExtensionRunner): void {
+		if (this.#active) throw new Error("ExtensionRunner.prepareActivationFrom requires an inactive target runner");
+		const config = previous.#activationConfig;
+		if (!config) {
+			throw new Error("Cannot prepare activation from an uninitialized ExtensionRunner");
+		}
+		for (const listener of previous.#errorListeners) {
+			this.#errorListeners.add(listener);
+		}
+		this.#activationConfig = config;
+		this.#activationPending = previous.#active || previous.#activationPending;
+	}
+
+	get canTransferActivation(): boolean {
+		return this.#activationConfig !== undefined;
+	}
+
+	get hasPendingActivation(): boolean {
+		return this.#activationPending;
+	}
+
+	/**
+	 * Transfer the initialized generation configuration and error observers from
+	 * another runner before starting this runner's generation.
+	 */
+	async activateFrom(previous: ExtensionRunner): Promise<void> {
+		this.prepareActivationFrom(previous);
+		await this.activate();
+	}
+
+	/**
+	 * Stop the current logical extension generation. Shutdown is the sole event
+	 * permitted through the inactive gate and is emitted before generation-owned
+	 * callbacks and error listeners are released.
+	 */
+	async deactivate(): Promise<void> {
+		const pendingDeactivation = this.#deactivationPromise;
+		if (pendingDeactivation) {
+			await pendingDeactivation;
+			return;
+		}
+		if (!this.#active) {
+			if (this.#initialized || this.#activationConfig) {
+				this.#deactivated = true;
+				this.#resetGenerationCallbacks();
+			}
+			return;
+		}
+		if (this.#deactivated) return;
+
+		this.#active = false;
+		this.#deactivated = true;
+		const deactivation = this.#deactivateGeneration();
+		this.#deactivationPromise = deactivation;
+		try {
+			await deactivation;
+		} finally {
+			if (this.#deactivationPromise === deactivation) {
+				this.#deactivationPromise = undefined;
+			}
+		}
+	}
+
+	get isActive(): boolean {
+		return this.#active;
+	}
+	async #deactivateGeneration(): Promise<void> {
+		this.#deactivating = true;
+		this.#revokeGenerationActions();
+		try {
+			if (!this.#shutdownEmitted && this.#sessionStartEmitted) {
+				await this.emit({ type: "session_shutdown" });
+			}
+		} finally {
+			this.#managedTimers.clearAll();
+			this.#deactivating = false;
+			this.#resetGenerationCallbacks();
+		}
+	}
+
+	#revokeGenerationActions(): void {
+		this.#waitForIdleFn = async () => {};
+		this.#abortFn = () => {};
+		this.#compactFn = async () => {};
+		this.#newSessionHandler = async () => ({ cancelled: false });
+		this.#branchHandler = async () => ({ cancelled: false });
+		this.#navigateTreeHandler = async () => ({ cancelled: false });
+		this.#switchSessionHandler = async () => ({ cancelled: false });
+		this.#reloadHandler = async () => {};
+		this.#shutdownHandler = () => {};
+		this.runtime.sendMessage = () => {};
+		this.runtime.sendUserMessage = () => {};
+		this.runtime.appendEntry = () => {};
+		this.runtime.setLabel = () => {};
+		this.runtime.setActiveTools = async () => {};
+		this.runtime.setModel = async () => false;
+		this.runtime.setThinkingLevel = () => {};
+		this.runtime.setSessionName = async () => {};
+	}
+
+	#resetGenerationCallbacks(): void {
+		this.#releaseUIContextLease();
+		this.#uiContext = noOpUIContext;
+		this.#leasedUiContext = noOpUIContext;
+		this.#getModel = () => undefined;
+		this.#isIdleFn = () => true;
+		this.#waitForIdleFn = async () => {};
+		this.#abortFn = () => {};
+		this.#hasPendingMessagesFn = () => false;
+		this.#getContextUsageFn = () => undefined;
+		this.#compactFn = async () => {};
+		this.#getSystemPromptFn = () => [];
+		this.#newSessionHandler = async () => ({ cancelled: false });
+		this.#branchHandler = async () => ({ cancelled: false });
+		this.#navigateTreeHandler = async () => ({ cancelled: false });
+		this.#switchSessionHandler = async () => ({ cancelled: false });
+		this.#reloadHandler = async () => {};
+		this.#shutdownHandler = () => {};
+		this.runtime.sendMessage = () => {};
+		this.runtime.sendUserMessage = () => {};
+		this.runtime.appendEntry = () => {};
+		this.runtime.setLabel = () => {};
+		this.runtime.getActiveTools = () => [];
+		this.runtime.getAllTools = () => [];
+		this.runtime.setActiveTools = async () => {};
+		this.runtime.getCommands = () => [];
+		this.runtime.setModel = async () => false;
+		this.runtime.getThinkingLevel = () => undefined;
+		this.runtime.setThinkingLevel = () => {};
+		this.runtime.getSessionName = () => undefined;
+		this.runtime.setSessionName = async () => {};
+		this.#initialized = false;
+		this.#activationConfig = undefined;
+		this.#activationPending = false;
+		this.#pendingCredentialDisabled = [];
+		this.#errorListeners.clear();
+	}
+
+	/**
 	 * Forward a `credential_disabled` event from `AuthStorage` to extension handlers.
 	 *
 	 * If {@link initialize} has not yet run, the event is buffered and replayed once
@@ -351,6 +694,7 @@ export class ExtensionRunner {
 	 * {@link onError} via {@link emit}'s normal isolation.
 	 */
 	async emitCredentialDisabled(event: CredentialDisabledEvent): Promise<void> {
+		if (this.#deactivated) return;
 		if (!this.#initialized) {
 			if (this.#pendingCredentialDisabled.length >= MAX_PENDING_CREDENTIAL_DISABLED) {
 				this.#pendingCredentialDisabled.shift();
@@ -367,6 +711,12 @@ export class ExtensionRunner {
 
 	getUIContext(): ExtensionUIContext {
 		return this.#uiContext;
+	}
+
+	claimUIContext(): void {
+		if (this.#uiContextLeaseOwner) {
+			uiContextLeaseOwners.set(this.#uiContext, this.#uiContextLeaseOwner);
+		}
 	}
 
 	hasUI(): boolean {
@@ -465,17 +815,20 @@ export class ExtensionRunner {
 	}
 
 	onError(listener: ExtensionErrorListener): () => void {
+		if (this.#deactivated) return () => {};
 		this.#errorListeners.add(listener);
 		return () => this.#errorListeners.delete(listener);
 	}
 
 	emitError(error: ExtensionError): void {
+		if (this.#deactivated && !this.#deactivating) return;
 		for (const listener of this.#errorListeners) {
 			listener(error);
 		}
 	}
 
 	hasHandlers(eventType: string): boolean {
+		if (this.#deactivated) return false;
 		for (const ext of this.extensions) {
 			const handlers = ext.handlers.get(eventType);
 			if (handlers && handlers.length > 0) {
@@ -535,30 +888,72 @@ export class ExtensionRunner {
 	}
 
 	createContext(): ExtensionContext {
-		const getModel = this.#getModel;
+		const runner = this;
+		const generation = this.#generation;
+		const isCurrentGeneration = () =>
+			runner.#generation === generation && (!runner.#deactivated || runner.#deactivating);
+		const canMutateGeneration = () =>
+			runner.#generation === generation && !runner.#deactivated && !runner.#deactivating;
+		const getModel = () => (isCurrentGeneration() ? runner.#getModel() : undefined);
+		const canScheduleTimer = () => canMutateGeneration();
 		return {
-			ui: this.#uiContext,
-			getContextUsage: () => this.#getContextUsageFn(),
-			compact: instructionsOrOptions => this.#compactFn(instructionsOrOptions),
-			hasUI: this.hasUI(),
+			get ui() {
+				return isCurrentGeneration() ? runner.#leasedUiContext : noOpUIContext;
+			},
+			getContextUsage: () => (isCurrentGeneration() ? runner.#getContextUsageFn() : undefined),
+			compact: instructionsOrOptions =>
+				canMutateGeneration() ? runner.#compactFn(instructionsOrOptions) : Promise.resolve(),
+			get hasUI() {
+				return isCurrentGeneration() && runner.#uiContext !== noOpUIContext;
+			},
 			cwd: this.cwd,
-			sessionManager: this.sessionManager,
+			sessionManager: runner.#createSessionManagerContext(isCurrentGeneration, canMutateGeneration),
 			modelRegistry: this.modelRegistry,
 			get model() {
 				return getModel();
 			},
 			models: createExtensionModelQuery(this.modelRegistry, this.settings, getModel),
-			isIdle: () => this.#isIdleFn(),
-			abort: () => this.#abortFn(),
-			hasPendingMessages: () => this.#hasPendingMessagesFn(),
-			shutdown: () => this.#shutdownHandler(),
-			getSystemPrompt: () => this.#getSystemPromptFn(),
+			isIdle: () => (isCurrentGeneration() ? runner.#isIdleFn() : true),
+			abort: () => {
+				if (canMutateGeneration()) runner.#abortFn();
+			},
+			hasPendingMessages: () => (isCurrentGeneration() ? runner.#hasPendingMessagesFn() : false),
+			shutdown: () => {
+				if (canMutateGeneration()) runner.#shutdownHandler();
+			},
+			getSystemPrompt: () => (isCurrentGeneration() ? runner.#getSystemPromptFn() : []),
 			localProtocolOptions: this.localProtocolOptions,
-			memory: this.#getMemoryFn?.(),
-			setInterval: (callback, ms, ...args) => this.#managedTimers.setInterval(callback, ms, ...args),
-			setTimeout: (callback, ms, ...args) => this.#managedTimers.setTimeout(callback, ms, ...args),
-			clearTimer: timer => this.#managedTimers.clear(timer),
+			get memory() {
+				return isCurrentGeneration() ? runner.#getMemoryFn?.() : undefined;
+			},
+			setInterval: (callback, ms, ...args) =>
+				canScheduleTimer() ? runner.#managedTimers.setInterval(callback, ms, ...args) : NOOP_TIMER,
+			setTimeout: (callback, ms, ...args) =>
+				canScheduleTimer() ? runner.#managedTimers.setTimeout(callback, ms, ...args) : NOOP_TIMER,
+			clearTimer: timer => runner.#managedTimers.clear(timer),
 		};
+	}
+
+	#createSessionManagerContext(
+		isCurrentGeneration: () => boolean,
+		canMutateGeneration: () => boolean,
+	): ReadonlySessionManager {
+		const target = this.sessionManager;
+		return new Proxy(target, {
+			get: (object, property, receiver) => {
+				const requiresActiveGeneration = MUTATING_SESSION_MANAGER_MEMBERS.has(property);
+				const canAccess = () => isCurrentGeneration() && (!requiresActiveGeneration || canMutateGeneration());
+				if (!canAccess()) return undefined;
+				const value = Reflect.get(object, property, receiver) as unknown;
+				if (typeof value !== "function") return value;
+				return (...args: unknown[]) => {
+					if (!canAccess()) {
+						throw new Error("Extension context session manager is no longer active");
+					}
+					return Reflect.apply(value, target, args);
+				};
+			},
+		}) as ReadonlySessionManager;
 	}
 
 	/**
@@ -579,19 +974,42 @@ export class ExtensionRunner {
 	}
 
 	createCommandContext(): ExtensionCommandContext {
+		const generation = this.#generation;
+		const context = this.createContext();
+		const isCurrentGeneration = () => this.#generation === generation && !this.#deactivated && !this.#deactivating;
 		return {
-			...this.createContext(),
-			getContextUsage: () => this.#getContextUsageFn(),
-			waitForIdle: () => this.#waitForIdleFn(),
-			newSession: options => this.#newSessionHandler(options),
-			branch: entryId => this.#branchHandler(entryId),
-			navigateTree: (targetId, options) => this.#navigateTreeHandler(targetId, options),
-			switchSession: sessionPath => this.#switchSessionHandler(sessionPath),
-			reload: () => this.#reloadHandler(),
-			compact: instructionsOrOptions => this.#compactFn(instructionsOrOptions),
+			...context,
+			get ui() {
+				return context.ui;
+			},
+			get hasUI() {
+				return context.hasUI;
+			},
+			get model() {
+				return context.model;
+			},
+			getContextUsage: () => context.getContextUsage(),
+			waitForIdle: () => (isCurrentGeneration() ? this.#waitForIdleFn() : Promise.resolve()),
+			newSession: options =>
+				isCurrentGeneration() ? this.#newSessionHandler(options) : Promise.resolve({ cancelled: false }),
+			branch: entryId =>
+				isCurrentGeneration() ? this.#branchHandler(entryId) : Promise.resolve({ cancelled: false }),
+			navigateTree: (targetId, options) =>
+				isCurrentGeneration()
+					? this.#navigateTreeHandler(targetId, options)
+					: Promise.resolve({ cancelled: false }),
+			switchSession: sessionPath =>
+				isCurrentGeneration() ? this.#switchSessionHandler(sessionPath) : Promise.resolve({ cancelled: false }),
+			reload: () => {
+				if (!isCurrentGeneration()) return Promise.resolve();
+				if (!this.#isIdleFn()) {
+					return Promise.reject(new Error("Cannot reload session resources while the agent is running"));
+				}
+				return this.#reloadHandler();
+			},
+			compact: instructionsOrOptions => context.compact(instructionsOrOptions),
 		};
 	}
-
 	#isSessionBeforeEvent(event: RunnerEmitEvent): event is SessionBeforeEvent {
 		return (
 			event.type === "session_before_switch" ||
@@ -641,6 +1059,17 @@ export class ExtensionRunner {
 	}
 
 	async emit<TEvent extends RunnerEmitEvent>(event: TEvent): Promise<RunnerEmitResult<TEvent>> {
+		if (this.#deactivated && !(this.#deactivating && event.type === "session_shutdown")) {
+			return undefined as RunnerEmitResult<TEvent>;
+		}
+		if (event.type === "session_start") {
+			if (this.#sessionStartEmitted) return undefined as RunnerEmitResult<TEvent>;
+			this.#sessionStartEmitted = true;
+		}
+		if (event.type === "session_shutdown") {
+			if (this.#shutdownEmitted) return undefined as RunnerEmitResult<TEvent>;
+			this.#shutdownEmitted = true;
+		}
 		// Defer the per-event context allocation (and the Promise.race/Bun.sleep
 		// timeout machinery) to the first matching handler. Streaming sessions emit
 		// message_update / tool_execution_* per delta with usually no extension
@@ -663,12 +1092,15 @@ export class ExtensionRunner {
 			return result as RunnerEmitResult<TEvent>;
 		}
 
+		if (this.#deactivated) return result as RunnerEmitResult<TEvent>;
 		for (const ext of this.extensions) {
+			if (this.#deactivated) return result as RunnerEmitResult<TEvent>;
 			const handlers = ext.handlers.get(event.type);
 			if (!handlers || handlers.length === 0) continue;
 			ctx ??= this.createContext();
 
 			for (const handler of handlers) {
+				if (this.#deactivated) return result as RunnerEmitResult<TEvent>;
 				const handlerResult = await this.#runHandlerWithTimeout(
 					handler,
 					event,
@@ -704,6 +1136,7 @@ export class ExtensionRunner {
 	}
 
 	async emitToolResult(event: ToolResultEvent): Promise<ToolResultEventResult | undefined> {
+		if (this.#deactivated) return undefined;
 		const ctx = this.createContext();
 		const currentEvent: ToolResultEvent = { ...event };
 		let modified = false;
@@ -762,6 +1195,7 @@ export class ExtensionRunner {
 	 * silent consent to run the tool.
 	 */
 	async emitToolCall(event: ToolCallEvent): Promise<ToolCallEventResult | undefined> {
+		if (this.#deactivated) return undefined;
 		const ctx = this.createContext();
 		const timeoutMs = extensionHandlerTimeoutMs;
 		let result: ToolCallEventResult | undefined;
@@ -827,6 +1261,7 @@ export class ExtensionRunner {
 		event: UserBashEvent | UserPythonEvent,
 		eventName: "user_bash" | "user_python",
 	): Promise<R | undefined> {
+		if (this.#deactivated) return undefined;
 		const ctx = this.createContext();
 
 		for (const ext of this.extensions) {
@@ -858,6 +1293,7 @@ export class ExtensionRunner {
 		promptPaths: Array<{ path: string; extensionPath: string }>;
 		themePaths: Array<{ path: string; extensionPath: string }>;
 	}> {
+		if (this.#deactivated) return { skillPaths: [], promptPaths: [], themePaths: [] };
 		const ctx = this.createContext();
 		const skillPaths: Array<{ path: string; extensionPath: string }> = [];
 		const promptPaths: Array<{ path: string; extensionPath: string }> = [];
@@ -899,6 +1335,7 @@ export class ExtensionRunner {
 		images: ImageContent[] | undefined,
 		source: "interactive" | "rpc" | "extension",
 	): Promise<InputEventResult> {
+		if (this.#deactivated) return {};
 		const ctx = this.createContext();
 		let currentText = text;
 		let currentImages = images;
@@ -920,6 +1357,7 @@ export class ExtensionRunner {
 	}
 
 	async emitContext(messages: AgentMessage[]): Promise<AgentMessage[]> {
+		if (this.#deactivated) return messages;
 		const ctx = this.createContext();
 
 		// Check if any extensions actually have context handlers before cloning
@@ -966,6 +1404,7 @@ export class ExtensionRunner {
 	}
 
 	async emitBeforeProviderRequest(payload: unknown): Promise<BeforeProviderRequestEventResult> {
+		if (this.#deactivated) return payload;
 		const ctx = this.createContext();
 		let currentPayload = payload;
 
@@ -995,6 +1434,7 @@ export class ExtensionRunner {
 	}
 
 	async emitAfterProviderResponse(response: ProviderResponseMetadata, _model?: Model): Promise<void> {
+		if (this.#deactivated) return;
 		const ctx = this.createContext();
 
 		for (const ext of this.extensions) {
@@ -1019,6 +1459,7 @@ export class ExtensionRunner {
 		images: ImageContent[] | undefined,
 		systemPrompt: string[],
 	): Promise<BeforeAgentStartCombinedResult | undefined> {
+		if (this.#deactivated) return undefined;
 		const ctx = this.createContext();
 		const messages: NonNullable<BeforeAgentStartEventResult["message"]>[] = [];
 		let currentSystemPrompt = systemPrompt;

@@ -4,18 +4,13 @@ import * as path from "node:path";
 import { getOAuthProviders } from "@oh-my-pi/pi-ai/oauth";
 import { type AutocompleteItem, Spacer } from "@oh-my-pi/pi-tui";
 import { APP_NAME, getProjectDir, setProjectDir } from "@oh-my-pi/pi-utils";
-import { reset as resetCapabilities } from "../capability";
 import { COLLAB_GUEST_ALLOWED_COMMANDS, CollabGuestLink } from "../collab/guest";
 import { CollabHost } from "../collab/host";
 import { expandRoleAlias, getModelMatchPreferences, resolveCliModel } from "../config/model-resolver";
 import { applyProviderGlobalsFromSettings } from "../config/provider-globals";
 import type { SettingPath, SettingValue } from "../config/settings";
 import { settings } from "../config/settings";
-import {
-	clearPluginRootsAndCaches,
-	resolveActiveProjectRegistryPath,
-	resolveOrDefaultProjectRegistryPath,
-} from "../discovery/helpers.js";
+import { clearPluginRootsAndCaches, resolveOrDefaultProjectRegistryPath } from "../discovery/helpers.js";
 import { shareSession } from "../export/share";
 import { PluginManager } from "../extensibility/plugins";
 import {
@@ -34,6 +29,7 @@ import { extractLastCodeBlock, extractLastCommand } from "../modes/utils/copy-ta
 import type { AgentSession, FreshSessionResult } from "../session/agent-session";
 import { COMPACT_MODES, parseCompactArgs } from "../session/compact-modes";
 import { resolveResumableSession } from "../session/session-listing";
+import type { SessionResourceReloadResult } from "../session/session-resource-runtime";
 import { formatShakeSummary, type ShakeMode } from "../session/shake-types";
 import { expandTilde, resolveToCwd } from "../tools/path-utils";
 import { urlHyperlinkAlways } from "../tui";
@@ -75,6 +71,48 @@ export interface TuiBuiltinSlashCommand extends BuiltinSlashCommand {
 	getArgumentCompletions?: (prefix: string) => AutocompleteItem[] | null | Promise<AutocompleteItem[] | null>;
 	getInlineHint?: (argumentText: string) => string | null;
 	getAutocompleteDescription?: () => string | undefined;
+}
+
+function formatPluginReloadDiagnostics(result: SessionResourceReloadResult): string {
+	const messages = Array.from(
+		new Set(
+			result.diagnostics.filter(diagnostic => diagnostic.severity !== "info").map(diagnostic => diagnostic.message),
+		),
+	);
+	return messages.length > 0 ? `: ${messages.join("; ")}` : "";
+}
+
+function formatPluginReloadResult(session: AgentSession, result: SessionResourceReloadResult | undefined): string {
+	if (!result) return "Plugin resource runtime is unavailable.";
+	const status = session.resourceStatus;
+	const revision = status
+		? ` (desired revision ${status.desiredRevision}, applied revision ${status.appliedRevision}, manifest ${status.manifestId})`
+		: "";
+	const details = formatPluginReloadDiagnostics(result);
+	switch (result.state) {
+		case "applied":
+			return `Plugins reloaded${revision}.`;
+		case "unchanged":
+			return `Plugins already current${revision}.`;
+		case "degraded":
+			return `Plugins reloaded with warnings${revision}${details}.`;
+		case "failed":
+			return `Plugin reload failed${revision}${details}.`;
+		case "pending":
+			return `Plugin reload pending${revision}.`;
+	}
+}
+
+/**
+ * Preserve the mutation's success message for every completed reload state,
+ * but make it explicit when the disk change succeeded while runtime reload
+ * failed or was unavailable.
+ */
+function formatPluginMutationResult(successMessage: string, result: SessionResourceReloadResult | undefined): string {
+	const message = successMessage.endsWith(".") ? successMessage.slice(0, -1) : successMessage;
+	if (!result) return `${message}, but plugin reload unavailable.`;
+	if (result.state !== "failed") return successMessage;
+	return `${message}, but plugin reload failed${formatPluginReloadDiagnostics(result)}.`;
 }
 
 function refreshStatusLine(ctx: InteractiveModeContext): void {
@@ -1720,10 +1758,10 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 			applyProviderGlobalsFromSettings(runtime.settings);
 			// Reload plugin/capability caches so the next prompt sees commands and
 			// capabilities scoped to the new cwd.
-			await runtime.reloadPlugins();
+			const reloadResult = await runtime.reloadPlugins();
 			await runtime.notifyConfigChanged?.();
 			await runtime.notifyTitleChanged?.();
-			await runtime.output(`Moved to ${runtime.sessionManager.getCwd()}.`);
+			await runtime.output(formatPluginMutationResult(`Moved to ${runtime.sessionManager.getCwd()}.`, reloadResult));
 			return commandConsumed();
 		},
 		handleTui: async (command, runtime) => {
@@ -1869,8 +1907,10 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 						const pluginName = parsed.installSpec.slice(0, atIndex);
 						const marketplace = parsed.installSpec.slice(atIndex + 1);
 						await manager.installPlugin(pluginName, marketplace, { force: parsed.force, scope: parsed.scope });
-						await runtime.reloadPlugins();
-						await runtime.output(`Installed ${pluginName} from ${marketplace}`);
+						const reloadResult = await runtime.reloadPlugins();
+						await runtime.output(
+							formatPluginMutationResult(`Installed ${pluginName} from ${marketplace}`, reloadResult),
+						);
 						return commandConsumed();
 					}
 					case "uninstall": {
@@ -1880,8 +1920,8 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 						);
 						if ("error" in parsed) return usage(parsed.error, runtime);
 						await manager.uninstallPlugin(parsed.pluginId, parsed.scope);
-						await runtime.reloadPlugins();
-						await runtime.output(`Uninstalled ${parsed.pluginId}`);
+						const reloadResult = await runtime.reloadPlugins();
+						await runtime.output(formatPluginMutationResult(`Uninstalled ${parsed.pluginId}`, reloadResult));
 						return commandConsumed();
 					}
 					case "installed": {
@@ -1904,17 +1944,24 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 							);
 							if ("error" in parsed) return usage(parsed.error, runtime);
 							const result = await manager.upgradePlugin(parsed.pluginId, parsed.scope);
-							await runtime.reloadPlugins();
-							await runtime.output(`Upgraded ${parsed.pluginId} to ${result.version}`);
+							const reloadResult = await runtime.reloadPlugins();
+							await runtime.output(
+								formatPluginMutationResult(`Upgraded ${parsed.pluginId} to ${result.version}`, reloadResult),
+							);
 							return commandConsumed();
 						}
 						const results = await manager.upgradeAllPlugins();
 						if (results.length === 0) {
 							await runtime.output("All marketplace plugins are up to date");
 						} else {
-							await runtime.reloadPlugins();
+							const reloadResult = await runtime.reloadPlugins();
 							const lines = results.map(r => `  ${r.pluginId}: ${r.from} -> ${r.to}`);
-							await runtime.output(`Upgraded ${results.length} plugin(s):\n${lines.join("\n")}`);
+							await runtime.output(
+								formatPluginMutationResult(
+									`Upgraded ${results.length} plugin(s):\n${lines.join("\n")}`,
+									reloadResult,
+								),
+							);
 						}
 						return commandConsumed();
 					}
@@ -2139,8 +2186,10 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 					const manager = await createMarketplaceManager(runtime);
 					const isEnable = verb === "enable";
 					await manager.setPluginEnabled(parsed.pluginId, isEnable, parsed.scope);
-					await runtime.reloadPlugins();
-					await runtime.output(`${isEnable ? "Enabled" : "Disabled"} ${parsed.pluginId}`);
+					const reloadResult = await runtime.reloadPlugins();
+					await runtime.output(
+						formatPluginMutationResult(`${isEnable ? "Enabled" : "Disabled"} ${parsed.pluginId}`, reloadResult),
+					);
 					return commandConsumed();
 				}
 				// Default: list
@@ -2251,20 +2300,9 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 		description: "Reload all plugins (skills, commands, hooks, tools, agents, MCP)",
 		acpDescription: "Reload all plugins",
 		handle: async (_command, runtime) => {
-			await runtime.reloadPlugins();
-			await runtime.output("Plugins reloaded.");
+			const result = await runtime.reloadPlugins();
+			await runtime.output(formatPluginReloadResult(runtime.session, result));
 			return commandConsumed();
-		},
-		handleTui: async (_command, runtime) => {
-			// Invalidate registry fs caches and the plugin roots cache so
-			// listClaudePluginRoots re-reads from disk on next access.
-			const projectPath = await resolveActiveProjectRegistryPath(runtime.ctx.sessionManager.getCwd());
-			clearPluginRootsAndCaches(projectPath ? [projectPath] : undefined);
-			await runtime.ctx.refreshSkillState();
-			await runtime.ctx.refreshSlashCommandState();
-			resetCapabilities();
-			runtime.ctx.showStatus("Plugins reloaded.");
-			runtime.ctx.editor.setText("");
 		},
 	},
 	{
@@ -2606,13 +2644,7 @@ export async function executeBuiltinSlashCommand(
 				ctx.showStatus(text);
 			},
 			refreshCommands: () => ctx.refreshSlashCommandState(),
-			reloadPlugins: async () => {
-				const projectPath = await resolveActiveProjectRegistryPath(ctx.sessionManager.getCwd());
-				clearPluginRootsAndCaches(projectPath ? [projectPath] : undefined);
-				await ctx.refreshSkillState();
-				await ctx.refreshSlashCommandState();
-				resetCapabilities();
-			},
+			reloadPlugins: () => ctx.reloadPluginState(),
 		};
 		const result = await command.handle(parsed, adapted);
 		ctx.editor.setText("");

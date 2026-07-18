@@ -13,6 +13,7 @@
  * Modes use this class and add their own I/O layer on top.
  */
 
+import { AsyncLocalStorage } from "node:async_hooks";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -169,7 +170,7 @@ import {
 	resolveAdvisorDeliveryChannel,
 	slugifyAdvisorName,
 } from "../advisor";
-import { type AsyncJob, type AsyncJobDeliveryState, AsyncJobManager } from "../async";
+import type { AsyncJob, AsyncJobDeliveryState, AsyncJobManager } from "../async";
 import { classifyDifficulty } from "../auto-thinking/classifier";
 import { reset as resetCapabilities } from "../capability";
 import type { Rule } from "../capability/rule";
@@ -200,6 +201,7 @@ import {
 } from "../config/settings";
 import { CursorExecHandlers } from "../cursor";
 import { RawSseDebugBuffer } from "../debug/raw-sse-buffer";
+import { clearPluginRootsAndCaches, resolveActiveProjectRegistryPath } from "../discovery/helpers";
 import { expandApplyPatchToEntries, normalizeDiff, normalizeToLF, ParseError, previewPatch, stripBom } from "../edit";
 import { getFileSnapshotStore } from "../edit/file-snapshot-store";
 import { disposeJuliaKernelSessionsByOwner } from "../eval/jl/executor";
@@ -241,13 +243,14 @@ import type { CompactOptions, ContextUsage } from "../extensibility/extensions/t
 import { ExtensionToolWrapper } from "../extensibility/extensions/wrapper";
 import type { HookCommandContext } from "../extensibility/hooks/types";
 import type { RecoveredRetryError } from "../extensibility/shared-events";
-import { loadSkills, type Skill, type SkillWarning, setActiveSkills } from "../extensibility/skills";
+import { loadSkills, type Skill, type SkillWarning } from "../extensibility/skills";
 import { expandSlashCommand, type FileSlashCommand } from "../extensibility/slash-commands";
 import { GoalRuntime } from "../goals/runtime";
 import type { Goal, GoalModeState } from "../goals/state";
 import type { HindsightSessionState } from "../hindsight/state";
-import { type LocalProtocolOptions, resolveLocalUrlToPath } from "../internal-urls";
+import { type LocalProtocolOptions, type ResolveContext, resolveLocalUrlToPath } from "../internal-urls";
 import { IrcBus, type IrcMessage } from "../irc/bus";
+import type { MCPDiscoverOptions, MCPLoadResult, MCPManager } from "../mcp";
 import { resolveMemoryBackend } from "../memory-backend";
 import { shutdownMnemopiEmbedClient } from "../mnemopi/embed-client";
 import { getMnemopiSessionState, type MnemopiSessionState, setMnemopiSessionState } from "../mnemopi/state";
@@ -296,6 +299,8 @@ import unexpectedStopRetryTemplate from "../prompts/system/unexpected-stop-retry
 import vibeModeActivePrompt from "../prompts/system/vibe-mode-active.md" with { type: "text" };
 import xdevMountNoticePrompt from "../prompts/system/xdev-mount-notice.md" with { type: "text" };
 import { AgentRegistry } from "../registry/agent-registry";
+import { ContributionStore, highestPriorityLatestWins } from "../runtime/contribution-store";
+import type { ReconcileState } from "../runtime/runtime-manifest";
 import {
 	deobfuscateAssistantContent,
 	deobfuscateSessionContext,
@@ -391,6 +396,21 @@ import type { BranchSummaryEntry, CompactionEntry, NewSessionOptions, SessionEnt
 import { EPHEMERAL_MODEL_CHANGE_ROLE } from "./session-entries";
 import { formatSessionHistoryMarkdown } from "./session-history-format";
 import { cleanupEmptyMoveSession, type SessionManager } from "./session-manager";
+import { SESSION_TOOL_CONTRIBUTION_PRIORITY } from "./session-resource-contributions";
+import type {
+	SessionAgentResources,
+	SessionCommandResources,
+	SessionEffectiveResources,
+	SessionMcpResources,
+	SessionResourceController,
+	SessionResourceDomain,
+	SessionResourceManifest,
+	SessionResourceReloadResult,
+	SessionRuleResources,
+	SessionRuntimeAdmission,
+	SessionSkillResources,
+	SessionSystemPromptBuilder,
+} from "./session-resource-runtime";
 import type { ShakeMode, ShakeResult } from "./shake-types";
 import { ToolChoiceQueue } from "./tool-choice-queue";
 import { planTurnPersistence, sameMessageContent, sessionMessagePersistenceKey } from "./turn-persistence";
@@ -835,6 +855,24 @@ export interface AsyncJobSnapshot {
 	delivery: AsyncJobDeliveryState;
 }
 
+export interface AgentSessionResourceDomainStatus {
+	readonly domain: SessionResourceDomain;
+	readonly desiredRevision: number;
+	readonly appliedRevision: number;
+	readonly state: ReconcileState;
+	readonly lastError?: string;
+}
+
+/** Compact, serialization-safe view of desired versus applied resource state. */
+export interface AgentSessionResourceStatus {
+	readonly desiredRevision: number;
+	readonly appliedRevision: number;
+	readonly manifestId: number;
+	readonly lastReloadState: SessionResourceReloadResult["state"] | "not-run";
+	readonly degraded: boolean;
+	readonly domains: readonly AgentSessionResourceDomainStatus[];
+}
+
 export type { ShakeMode, ShakeResult };
 /**
  * Prewalk: switches an active session one-way from its starting model to
@@ -908,6 +946,8 @@ export interface AgentSessionConfig {
 	toolRegistry?: Map<string, AgentTool>;
 	/** Creates the tools registered only while `/vibe` mode is active. */
 	createVibeTools?: () => AgentTool[];
+	/** Dispose vibe workers before this session changes its persisted identity. */
+	disposeVibeSessions?: (ownerSessionId: string) => Promise<void>;
 	/** Tool names whose current registry entry is still the built-in implementation. */
 	builtInToolNames?: Iterable<string>;
 	/** Update tool-session predicates that render guidance from the live active tool set. */
@@ -951,7 +991,7 @@ export interface AgentSessionConfig {
 	/** Current session message-to-LLM conversion pipeline */
 	convertToLlm?: (messages: AgentMessage[]) => Message[] | Promise<Message[]>;
 	/** System prompt builder that can consider tool availability. Returns ordered provider-facing blocks. */
-	rebuildSystemPrompt?: (toolNames: string[], tools: Map<string, AgentTool>) => Promise<{ systemPrompt: string[] }>;
+	rebuildSystemPrompt?: SessionSystemPromptBuilder;
 	/** Local calendar date provider used by prompt-cache invalidation. Defaults to the host local date. */
 	getLocalCalendarDate?: () => string;
 	/** Entries of tools mounted under `xd://` (name + one-line summary), for /tools display. */
@@ -968,7 +1008,9 @@ export interface AgentSessionConfig {
 	 * changes (e.g. an MCP server upgrade) that would otherwise pass the tool-set
 	 * signature comparison and silently keep a stale prompt cached.
 	 */
-	getMcpServerInstructions?: () => Map<string, string> | undefined;
+	getMcpServerInstructions?: () => ReadonlyMap<string, string> | undefined;
+	/** Build the prompt-backed slash commands exposed by an owned MCP manager. */
+	buildMcpPromptCommands?: (manager: MCPManager) => LoadedCustomCommand[];
 	/** TTSR manager for time-traveling stream rules */
 	ttsrManager?: TtsrManager;
 	/** Secret obfuscator for deobfuscating streaming edit content */
@@ -977,20 +1019,9 @@ export interface AgentSessionConfig {
 	parentEvalSessionId?: string;
 	/** Logical owner for retained eval kernels created by this session. */
 	evalKernelOwnerId?: string;
-	/**
-	 * AsyncJobManager that this session installed as the process-global instance.
-	 * Only set for top-level sessions; subagents inherit the parent's manager and
-	 * **MUST NOT** dispose it on their own teardown.
-	 */
+	/** Manager owned and disposed by this session. */
 	ownedAsyncJobManager?: AsyncJobManager;
-	/**
-	 * AsyncJobManager reachable by this session for scoped job actions.
-	 *
-	 * Top-level owners receive their own manager, subagents receive the inherited
-	 * parent manager, and secondary in-process top-level sessions receive
-	 * `undefined` so job snapshots and ACP drains cannot observe the primary's
-	 * state.
-	 */
+	/** Manager reachable by this session for scoped job actions. */
 	asyncJobManager?: AsyncJobManager;
 	/** Agent identity (registry id like "Main" or "Alice") used for IRC routing. */
 	agentId?: string;
@@ -1052,6 +1083,40 @@ export interface AgentSessionConfig {
 	 * cwd change via {@link AgentSession.setTitleSystemPrompt}.
 	 */
 	titleSystemPrompt?: string;
+}
+
+/** @internal Runtime-only hooks around an admitted manifest application. */
+export interface SessionResourceApplicationLifecycle {
+	readonly before?: () => void;
+	readonly applied?: (
+		manifest: SessionResourceManifest,
+		affectedDomains: readonly SessionResourceDomain[],
+	) => void | Promise<void>;
+	readonly after?: () => void;
+}
+
+interface PendingSessionResourceBinding {
+	readonly controller: SessionResourceController;
+	readonly lifecycle: SessionResourceApplicationLifecycle | undefined;
+}
+
+const pendingSessionResourceBindings = new WeakMap<AgentSessionConfig, PendingSessionResourceBinding>();
+
+/** @internal Construct the SDK session facade bound to its sole ResourceRuntime controller. */
+export function createResourceBoundAgentSession(
+	config: AgentSessionConfig,
+	controller: SessionResourceController,
+	lifecycle?: SessionResourceApplicationLifecycle,
+): AgentSession {
+	if (pendingSessionResourceBindings.has(config)) {
+		throw new Error("Agent session resource binding is already pending");
+	}
+	pendingSessionResourceBindings.set(config, { controller, lifecycle });
+	try {
+		return new AgentSession(config);
+	} finally {
+		pendingSessionResourceBindings.delete(config);
+	}
 }
 
 /** Options for AgentSession.prompt() */
@@ -1983,6 +2048,9 @@ export class AgentSession {
 	#titleGenerationAbortController = new AbortController();
 	#toolChoiceQueue = new ToolChoiceQueue();
 
+	/** Terminal cancellation source shared by every active and queued MCP reload. */
+	readonly #mcpReloadAbortController = new AbortController();
+
 	// Bash execution state
 	#bashAbortControllers = new Set<AbortController>();
 	#pendingBashMessages: PendingBashMessage[] = [];
@@ -1994,15 +2062,15 @@ export class AgentSession {
 	#parentEvalSessionId: string | undefined;
 	/**
 	 * AsyncJobManager owned by this session (top-level only). Subagents leave
-	 * this undefined and **MUST NOT** dispose the global instance on teardown.
+	 * this undefined and **MUST NOT** dispose their parent's borrowed manager.
 	 */
 	readonly #ownedAsyncJobManager: AsyncJobManager | undefined;
 	/**
 	 * AsyncJobManager scoped to this session for introspection/cancellation.
 	 *
 	 * This differs from `#ownedAsyncJobManager`: subagents can inherit a parent
-	 * manager for their own owner id, while secondary top-level sessions are left
-	 * undefined to avoid reading the primary's jobs.
+	 * manager for their own owner id, while each top-level session owns an
+	 * isolated manager so it cannot observe another session's jobs.
 	 */
 	readonly #asyncJobManager: AsyncJobManager | undefined;
 	#pendingPythonMessages: PythonExecutionMessage[] = [];
@@ -2023,6 +2091,17 @@ export class AgentSession {
 	#autolearnCaptureAbortController: AbortController | undefined;
 	#autolearnCaptureTask: Promise<void> | undefined;
 	#isDisposed = false;
+	#vibeTransitionActive = false;
+	readonly #resourceController: SessionResourceController | undefined;
+	#appliedInstructionResourceFingerprint: string | undefined;
+	readonly #resourceAdmissionContext = new AsyncLocalStorage<SessionRuntimeAdmission | undefined>();
+	readonly #activeResourceAdmissions = new WeakSet<SessionRuntimeAdmission>();
+	#lastResourceReloadResult: SessionResourceReloadResult | undefined;
+	#pluginReloadTail: Promise<void> = Promise.resolve();
+	readonly #pluginReloadContext = new AsyncLocalStorage<symbol>();
+	readonly #activePluginReloadTokens = new Set<symbol>();
+	#mcpReloadTail: Promise<void> = Promise.resolve();
+	#mcpReloadPendingCount = 0;
 	// Extension system
 	#extensionRunner: ExtensionRunner | undefined = undefined;
 	/**
@@ -2053,6 +2132,7 @@ export class AgentSession {
 	// Tool registry and prompt builder for extensions
 	#toolRegistry: Map<string, AgentTool>;
 	#createVibeTools: (() => AgentTool[]) | undefined;
+	#disposeVibeSessions: ((ownerSessionId: string) => Promise<void>) | undefined;
 	#installedVibeToolNames = new Set<string>();
 	#transformContext: (messages: AgentMessage[], signal?: AbortSignal) => AgentMessage[] | Promise<AgentMessage[]>;
 	#onPayload: SimpleStreamOptions["onPayload"] | undefined;
@@ -2063,11 +2143,10 @@ export class AgentSession {
 	#advisorStreamFn: StreamFn | undefined;
 	#preferWebsockets: boolean | undefined;
 	#convertToLlm: (messages: AgentMessage[]) => Message[] | Promise<Message[]>;
-	#rebuildSystemPrompt:
-		| ((toolNames: string[], tools: Map<string, AgentTool>) => Promise<{ systemPrompt: string[] }>)
-		| undefined;
+	#rebuildSystemPrompt: SessionSystemPromptBuilder | undefined;
 	#getLocalCalendarDate: () => string;
-	#getMcpServerInstructions: (() => Map<string, string> | undefined) | undefined;
+	#getMcpServerInstructions: (() => ReadonlyMap<string, string> | undefined) | undefined;
+	#buildMcpPromptCommands: ((manager: MCPManager) => LoadedCustomCommand[]) | undefined;
 	#setActiveToolNames: ((names: Iterable<string>) => void) | undefined;
 	#ensureWriteRegistered: (() => Promise<boolean>) | undefined;
 	#disconnectOwnedMcpManager: (() => Promise<void>) | undefined;
@@ -2222,20 +2301,25 @@ export class AgentSession {
 		}
 	}
 
-	#beginInFlight(): void {
+	async #beginInFlight(): Promise<SessionRuntimeAdmission | undefined> {
+		const admission = await this.#resourceController?.admit();
+		if (admission) this.#activeResourceAdmissions.add(admission);
 		this.#promptInFlightCount++;
 		if (this.#promptInFlightCount === 1) {
 			this.#acquirePowerAssertion();
 		}
+		return admission;
 	}
 
-	#endInFlight(): void {
+	#endInFlight(admission?: SessionRuntimeAdmission): void {
+		if (admission) this.#activeResourceAdmissions.delete(admission);
 		this.#promptInFlightCount = Math.max(0, this.#promptInFlightCount - 1);
 		if (this.#promptInFlightCount === 0) {
 			this.#releasePowerAssertion();
 			this.#flushPendingAgentEnd();
 			this.#drainStrandedQueuedMessages();
 		}
+		admission?.release();
 	}
 
 	/** A steer/follow-up can land after the agent loop's final queue poll, or
@@ -2322,21 +2406,25 @@ export class AgentSession {
 			this.agent.replaceQueues([...this.agent.peekSteeringQueue()], []);
 		}
 		this.#resetPromptMaintenanceState();
-		this.#beginInFlight();
-		void this.agent
-			.prompt(records)
-			.catch(error => {
+		void (async () => {
+			let admission: SessionRuntimeAdmission | undefined;
+			let beganInFlight = false;
+			try {
+				admission = await this.#beginInFlight();
+				beganInFlight = true;
+				await this.#resourceAdmissionContext.run(admission, () => this.agent.prompt(records));
+			} catch (error) {
 				logger.warn("IRC wake turn failed", { error: String(error) });
-			})
-			.finally(() => {
+			} finally {
 				if (parkedFollowUps.length > 0) {
 					this.agent.replaceQueues(
 						[...this.agent.peekSteeringQueue()],
 						[...parkedFollowUps, ...this.agent.peekFollowUpQueue()],
 					);
 				}
-				this.#endInFlight();
-			});
+				if (beganInFlight) this.#endInFlight(admission);
+			}
+		})();
 	}
 
 	/** Remove advisor concern/blocker cards from the agent-core steer/follow-up
@@ -2539,12 +2627,12 @@ export class AgentSession {
 	 * on this and every following prompt, and registers the auto-approve plan-proposal handler.
 	 * Idempotent — a no-op once armed or when PlanYolo is not configured.
 	 */
-	async #armPlanYoloIfNeeded(): Promise<void> {
+	async #armPlanYoloIfNeeded(promptResources?: SessionEffectiveResources): Promise<void> {
 		if (!this.#planYolo || this.#planYoloArmed) return;
 		this.#planYoloArmed = true;
 		const previousTools = this.getEnabledToolNames();
 		const augmentations = this.hasBuiltInTool("write") ? ["write"] : [];
-		await this.setActiveToolsByName([...new Set([...previousTools, ...augmentations])]);
+		await this.#setActiveToolsByNameFromManifest([...new Set([...previousTools, ...augmentations])], promptResources);
 		this.#planYoloPreviousTools = previousTools;
 		this.setPlanModeState({
 			enabled: true,
@@ -2643,6 +2731,8 @@ export class AgentSession {
 	}
 
 	constructor(config: AgentSessionConfig) {
+		const resourceBinding = pendingSessionResourceBindings.get(config);
+		pendingSessionResourceBindings.delete(config);
 		this.agent = config.agent;
 		this.sessionManager = config.sessionManager;
 		this.#bashSessionTarget = {
@@ -2651,6 +2741,9 @@ export class AgentSession {
 			destination: { kind: "current", manager: this.sessionManager },
 		};
 		this.settings = config.settings;
+		this.#resourceController = resourceBinding?.controller;
+		this.#appliedInstructionResourceFingerprint =
+			resourceBinding?.controller.current.resources.instructions.fingerprint;
 		this.#autoApprove = config.autoApprove === true;
 		// Power assertions are taken per turn (see #beginInFlight); nothing acquired here.
 		this.#evalKernelOwnerId = config.evalKernelOwnerId ?? `agent-session:${Snowflake.next()}`;
@@ -2699,6 +2792,7 @@ export class AgentSession {
 		this.#validateRetryFallbackChains();
 		this.#toolRegistry = config.toolRegistry ?? new Map();
 		this.#createVibeTools = config.createVibeTools;
+		this.#disposeVibeSessions = config.disposeVibeSessions;
 		this.#builtInToolNames = new Set(config.builtInToolNames ?? []);
 		this.#presentationPinnedToolNames = config.presentationPinnedToolNames;
 		this.#ensureWriteRegistered = config.ensureWriteRegistered;
@@ -2780,7 +2874,15 @@ export class AgentSession {
 			injectIdle: async messages => {
 				const first = messages[0];
 				if (!first) return;
-				await this.agent.prompt(messages.length === 1 ? first : messages);
+				const admission = await this.#beginInFlight();
+				try {
+					await this.#resourceAdmissionContext.run(admission, () =>
+						this.agent.prompt(messages.length === 1 ? first : messages),
+					);
+					await this.#waitForPostPromptRecovery();
+				} finally {
+					this.#endInFlight(admission);
+				}
 			},
 			scheduleIdleFlush: run => {
 				this.#schedulePostPromptTask(
@@ -2811,6 +2913,7 @@ export class AgentSession {
 		this.#rebuildSystemPrompt = config.rebuildSystemPrompt;
 		this.#getLocalCalendarDate = config.getLocalCalendarDate ?? formatLocalCalendarDate;
 		this.#getMcpServerInstructions = config.getMcpServerInstructions;
+		this.#buildMcpPromptCommands = config.buildMcpPromptCommands;
 		this.getXdevToolEntries = config.getXdevToolEntries ?? (() => []);
 		this.#xdevRegistry = config.xdevRegistry;
 		this.#mountedXdevToolNames = new Set(config.initialMountedXdevToolNames ?? []);
@@ -2897,6 +3000,17 @@ export class AgentSession {
 			if (this.#advisors.length > 0 && !this.#advisorRuntimeMatchesCurrentConfig()) this.#stopAdvisorRuntime();
 			this.#buildAdvisorRuntime(true);
 		});
+		if (resourceBinding) {
+			resourceBinding.controller.bindManifestApplication(async (manifest, affectedDomains) => {
+				resourceBinding.lifecycle?.before?.();
+				try {
+					await this.#applyResourceManifest(manifest, affectedDomains);
+					await resourceBinding.lifecycle?.applied?.(manifest, affectedDomains);
+				} finally {
+					resourceBinding.lifecycle?.after?.();
+				}
+			});
+		}
 	}
 	// -------------------------------------------------------------------------
 	// Advisor runtime lifecycle
@@ -2960,8 +3074,10 @@ export class AgentSession {
 	}
 
 	#resolveAdvisorRuntimeDescriptors(emitWarnings: boolean): AdvisorRuntimeDescriptor[] {
-		const legacy = !this.#advisorConfigs?.length;
-		const roster: AdvisorConfig[] = legacy ? [{ name: "default" }] : this.#advisorConfigs!;
+		const agentResources = this.#getAgentResources();
+		const configured = agentResources ? agentResources.advisorConfigs : this.#advisorConfigs;
+		const legacy = !configured?.length;
+		const roster: readonly AdvisorConfig[] = legacy ? [{ name: "default" }] : configured;
 		const descriptors: AdvisorRuntimeDescriptor[] = [];
 		const usedSlugs = new Set<string>();
 		for (const config of roster) {
@@ -3061,6 +3177,13 @@ export class AgentSession {
 		if (this.#advisors.length > 0) return true;
 		if (!this.#advisorEnabled) return false;
 		if (this.#agentKind !== "main" && !this.settings.get("advisor.subagents")) return false;
+		const agentResources = this.#getAgentResources();
+		const advisorContextPrompt = agentResources ? agentResources.advisorContextPrompt : this.#advisorContextPrompt;
+		const advisorWatchdogPrompt = agentResources ? agentResources.advisorWatchdogPrompt : this.#advisorWatchdogPrompt;
+		const advisorSharedInstructions = agentResources
+			? agentResources.advisorSharedInstructions
+			: this.#advisorSharedInstructions;
+		const advisorTools = agentResources ? agentResources.advisorTools : (this.#advisorTools ?? []);
 
 		// Rebuild the status map from scratch so removed/renamed advisors don't
 		// leave stale entries. #resolveAdvisorRuntimeDescriptors populates every
@@ -3097,16 +3220,16 @@ export class AgentSession {
 			const emissionGuard = new AdvisorEmissionGuard();
 			const adviseTool = new AdviseTool((note, severity) => this.#routeAdvice(advisorRef, note, severity));
 
-			// `#advisorWatchdogPrompt` already carries WATCHDOG.md + YAML shared
+			// The applied agent-resource snapshot carries shared and project
 			// instructions; `config.instructions` adds this advisor's specialization.
 			const systemPrompt = [advisorSystemPrompt];
-			if (this.#advisorContextPrompt) systemPrompt.push(this.#advisorContextPrompt);
-			if (this.#advisorWatchdogPrompt) systemPrompt.push(this.#advisorWatchdogPrompt);
-			if (this.#advisorSharedInstructions) systemPrompt.push(this.#advisorSharedInstructions);
+			if (advisorContextPrompt) systemPrompt.push(advisorContextPrompt);
+			if (advisorWatchdogPrompt) systemPrompt.push(advisorWatchdogPrompt);
+			if (advisorSharedInstructions) systemPrompt.push(advisorSharedInstructions);
 			if (config.instructions?.trim()) systemPrompt.push(config.instructions.trim());
 
 			const names = config.tools === undefined ? ADVISOR_DEFAULT_TOOL_NAMES : new Set(config.tools);
-			const tools = (this.#advisorTools ?? []).filter(t => names.has(t.name));
+			const tools = advisorTools.filter(tool => names.has(tool.name));
 			const advisorLoopTools: AgentTool<any>[] = [adviseTool, ...tools];
 			const advisorToolMap = new Map<string, AgentTool>();
 			const availableAdvisorToolNames = new Set<string>();
@@ -5157,14 +5280,16 @@ export class AgentSession {
 					this.#skipAgentContinue("should-continue-false", options);
 					return;
 				}
-				this.#beginInFlight();
+				const admission = await this.#beginInFlight();
 				try {
-					await this.#maybeRestoreRetryFallbackPrimary();
-					if (signal.aborted || this.#isDisposed) {
-						this.#skipAgentContinue("post-restore-unavailable", options);
-						return;
-					}
-					await this.agent.continue();
+					await this.#resourceAdmissionContext.run(admission, async () => {
+						await this.#maybeRestoreRetryFallbackPrimary();
+						if (signal.aborted || this.#isDisposed) {
+							this.#skipAgentContinue("post-restore-unavailable", options);
+							return;
+						}
+						await this.agent.continue();
+					});
 				} catch (error) {
 					logger.warn("agent.continue failed after scheduling", {
 						error: error instanceof Error ? error.message : String(error),
@@ -5172,7 +5297,7 @@ export class AgentSession {
 					});
 					options?.onError?.();
 				} finally {
-					this.#endInFlight();
+					this.#endInFlight(admission);
 				}
 			},
 			{
@@ -6673,8 +6798,247 @@ export class AgentSession {
 		return this.#isDisposed;
 	}
 
+	/**
+	 * Desired/applied reconciliation state for SDK and headless control surfaces.
+	 * This snapshot is compact and safe to serialize.
+	 */
+	get resourceStatus(): AgentSessionResourceStatus | undefined {
+		const controller = this.#resourceController;
+		if (!controller) return undefined;
+		const manifest = controller.current;
+		const runtimeStatus = controller.status;
+		const last = this.#lastResourceReloadResult;
+		const diagnosticDomains = new Map<SessionResourceDomain, string[]>();
+		for (const diagnostic of last?.diagnostics ?? []) {
+			if (diagnostic.severity === "info") continue;
+			const domain = diagnostic.domain;
+			if (!domain || !Object.hasOwn(manifest.resources, domain)) continue;
+			const typedDomain = domain as SessionResourceDomain;
+			const messages = diagnosticDomains.get(typedDomain) ?? [];
+			messages.push(diagnostic.message);
+			diagnosticDomains.set(typedDomain, messages);
+		}
+		const failedEveryDomain = last?.state === "failed" && diagnosticDomains.size === 0;
+		const domains = (Object.keys(manifest.resources) as SessionResourceDomain[]).map(domain => {
+			const current = runtimeStatus.get(domain);
+			const diagnosticMessages = diagnosticDomains.get(domain);
+			let state = current?.state ?? "current";
+			let lastError = current?.lastError;
+			if (failedEveryDomain || (last?.state === "failed" && diagnosticMessages)) {
+				state = "failed";
+				lastError =
+					diagnosticMessages?.join("; ") ?? last?.diagnostics.map(diagnostic => diagnostic.message).join("; ");
+			} else if (last?.state === "degraded" && diagnosticMessages) {
+				state = "degraded";
+				lastError = diagnosticMessages.join("; ");
+			}
+			return Object.freeze({
+				domain,
+				desiredRevision:
+					current?.desiredRevision ?? (failedEveryDomain ? controller.desiredRevision : manifest.desiredRevision),
+				appliedRevision: current?.appliedRevision ?? manifest.resources[domain].revision,
+				state,
+				...(lastError ? { lastError } : {}),
+			});
+		});
+		return Object.freeze({
+			desiredRevision: controller.desiredRevision,
+			appliedRevision: manifest.desiredRevision,
+			manifestId: manifest.id,
+			lastReloadState: last?.state ?? "not-run",
+			degraded: last?.state === "degraded" || domains.some(domain => domain.state === "degraded"),
+			domains: Object.freeze(domains),
+		});
+	}
+
+	/**
+	 * Apply a published resource generation to the mutable execution facade.
+	 * ResourceRuntime invokes this while new turn admission is gated, so every
+	 * subsequent turn observes one manifest generation across hooks, tools,
+	 * commands, prompts, providers, and UI callbacks.
+	 */
+	async #applyResourceManifest(
+		manifest: SessionResourceManifest,
+		affectedDomains?: readonly SessionResourceDomain[],
+	): Promise<void> {
+		const resources = manifest.effective;
+		const affected = affectedDomains ? new Set(affectedDomains) : undefined;
+		const includes = (domain: SessionResourceDomain): boolean => affected?.has(domain) ?? true;
+
+		if (
+			includes("instructions") &&
+			this.#appliedInstructionResourceFingerprint !== manifest.resources.instructions.fingerprint
+		) {
+			// A dependency-only affected domain retains its prior resource
+			// fingerprint. Do not reinstall that stale prompt snapshot over a
+			// prompt rebuilt from live MCP instructions or tool metadata.
+			this.#rebuildSystemPrompt = resources.instructions.rebuildSystemPrompt;
+			this.#baseSystemPrompt = [...resources.instructions.systemPrompt];
+			this.#baseSystemPromptBeforeMemoryPromotion = undefined;
+			this.#titleSystemPrompt = resources.instructions.titleSystemPrompt;
+			this.agent.setSystemPrompt(this.#baseSystemPrompt);
+			this.#appliedInstructionResourceFingerprint = manifest.resources.instructions.fingerprint;
+		}
+
+		if (includes("tools")) {
+			const previouslyEnabledTools = this.getEnabledToolNames();
+			const previousToolRegistry = this.#toolRegistry;
+			const previousBuiltInToolNames = this.#builtInToolNames;
+			const previousPresentationPinnedToolNames = this.#presentationPinnedToolNames;
+			const previousCreateVibeTools = this.#createVibeTools;
+			const previousXdevRegistry = this.#xdevRegistry;
+			const previousSetActiveToolNames = this.#setActiveToolNames;
+			const previousMountedXdevToolNames = this.#mountedXdevToolNames;
+			const previousActiveToolNames = this.getActiveToolNames();
+			const previousBaseSystemPrompt = this.#baseSystemPrompt;
+			const previousBaseSystemPromptBeforeMemoryPromotion = this.#baseSystemPromptBeforeMemoryPromotion;
+			const previousLastAppliedToolSignature = this.#lastAppliedToolSignature;
+			const previousPromptModelKey = this.#promptModelKey;
+			const previousAgentTools = [...this.agent.state.tools];
+
+			this.#toolRegistry = new Map(resources.tools.registry);
+			this.#builtInToolNames = new Set(resources.tools.builtInNames);
+			this.#presentationPinnedToolNames = resources.tools.requestedNames;
+			this.#createVibeTools = resources.tools.createVibeTools;
+			this.#xdevRegistry = resources.tools.xdevRegistry;
+			this.#setActiveToolNames = resources.tools.setActiveNames;
+			const nextEnabledTools = [
+				...new Set([
+					...previouslyEnabledTools.filter(name => this.#toolRegistry.has(name)),
+					...resources.tools.initialNames.filter(
+						name => !previousToolRegistry.has(name) && this.#toolRegistry.has(name),
+					),
+				]),
+			];
+			try {
+				await this.#applyActiveToolsByName(nextEnabledTools, true, resources);
+			} catch (error) {
+				this.#toolRegistry = previousToolRegistry;
+				this.#builtInToolNames = previousBuiltInToolNames;
+				this.#presentationPinnedToolNames = previousPresentationPinnedToolNames;
+				this.#createVibeTools = previousCreateVibeTools;
+				this.#xdevRegistry = previousXdevRegistry;
+				this.#setActiveToolNames = previousSetActiveToolNames;
+				this.#mountedXdevToolNames = previousMountedXdevToolNames;
+				this.#baseSystemPrompt = previousBaseSystemPrompt;
+				this.#baseSystemPromptBeforeMemoryPromotion = previousBaseSystemPromptBeforeMemoryPromotion;
+				this.#lastAppliedToolSignature = previousLastAppliedToolSignature;
+				this.#promptModelKey = previousPromptModelKey;
+				this.agent.setTools(previousAgentTools);
+				previousSetActiveToolNames?.(previousActiveToolNames);
+				throw error;
+			}
+		}
+
+		if (includes("extensions")) {
+			this.#extensionRunner = resources.extensions.runner;
+		}
+
+		if (includes("providers")) {
+			this.#modelRegistry = resources.providers.modelRegistry;
+			this.#serviceTierByFamily = { ...resources.providers.serviceTierByFamily };
+			const selectedModel = resources.providers.model;
+			const resolvedModel = selectedModel
+				? (this.#modelRegistry.find(selectedModel.provider, selectedModel.id) ?? selectedModel)
+				: undefined;
+			if (resolvedModel && !Bun.deepEquals(resolvedModel, this.model)) {
+				this.#setModelWithProviderSessionReset(resolvedModel);
+			}
+			if (resources.providers.thinkingLevel !== undefined) {
+				if (resources.providers.thinkingLevel === AUTO_THINKING) {
+					this.#autoThinking = true;
+					this.#thinkingLevel = resolveProvisionalAutoLevel(this.model);
+				} else {
+					this.#autoThinking = false;
+					this.#thinkingLevel = resources.providers.thinkingLevel;
+				}
+				this.#applyThinkingLevelToAgent(this.#thinkingLevel);
+			}
+		}
+
+		if (includes("skills")) {
+			this.#skills = [...resources.skills.items];
+			this.#skillWarnings = [...resources.skills.warnings];
+			this.#skillsReloadable = resources.skills.reloadable;
+			this.#skillsSettings = resources.skills.settings;
+		}
+
+		if (includes("commands")) {
+			this.#promptTemplates = [...resources.commands.promptTemplates];
+			this.#slashCommands = [...resources.commands.slashCommands];
+			this.#customCommands = [...resources.commands.customCommands];
+		}
+
+		if (includes("rules")) {
+			this.#ttsrManager = resources.rules.ttsrManager;
+		}
+
+		if (includes("agents")) {
+			this.#advisorConfigs = [...resources.agents.advisorConfigs];
+			this.#advisorTools = [...resources.agents.advisorTools];
+			this.#advisorWatchdogPrompt = resources.agents.advisorWatchdogPrompt;
+			this.#advisorContextPrompt = resources.agents.advisorContextPrompt;
+			this.#advisorSharedInstructions = resources.agents.advisorSharedInstructions;
+			if (this.#advisorEnabled) {
+				this.#stopAdvisorRuntime();
+				this.#buildAdvisorRuntime(true);
+			}
+		}
+
+		if (includes("mcp")) {
+			this.#getMcpServerInstructions = resources.mcp.getServerInstructions;
+			this.#disconnectOwnedMcpManager = resources.mcp.disconnectOwnedManager;
+		}
+
+		if (includes("ui")) {
+			// The UI/theme surface is borrowed from the active mode. Rebind the tool
+			// context to this generation, but never dispose process-global theme state.
+			resources.ui.rebindExtensionContext();
+		}
+
+		if (includes("commands")) {
+			this.#notifyCommandMetadataChanged();
+		}
+	}
+
 	markMovedFromEmptySessionFile(sessionFile: string): void {
 		this.#movedFromEmptySessionFile = path.resolve(sessionFile);
+	}
+
+	/**
+	 * Reject vibe work while this session is disposing or changing identity.
+	 * This check is synchronous so callers cannot enter a stale owner during
+	 * the async lifecycle hooks that surround a transition.
+	 */
+	assertVibeExecutionAllowed(): void {
+		if (this.#isDisposed) {
+			throw new Error("Vibe execution is unavailable after session disposal has begun.");
+		}
+		if (this.#vibeTransitionActive) {
+			throw new Error("Vibe execution is unavailable during a session identity transition.");
+		}
+	}
+
+	#beginVibeTransition(): () => void {
+		if (this.#vibeTransitionActive) {
+			throw new Error("Session identity transition already in progress.");
+		}
+		this.#vibeTransitionActive = true;
+		let released = false;
+		return () => {
+			if (released) return;
+			released = true;
+			this.#vibeTransitionActive = false;
+		};
+	}
+
+	async #runVibeTransition<T>(operation: () => Promise<T>): Promise<T> {
+		const release = this.#beginVibeTransition();
+		try {
+			return await operation();
+		} finally {
+			release();
+		}
 	}
 
 	/**
@@ -6690,6 +7054,8 @@ export class AgentSession {
 		this.#isDisposed = true;
 		this.#titleGenerationAbortController.abort();
 		this.#abortAutolearnCapture();
+		this.#mcpReloadAbortController.abort(new Error("Agent session was disposed during MCP reload"));
+		this.#resourceController?.beginDispose();
 		this.#flushPendingIrcAsides();
 		this.yieldQueue.clear();
 		this.agent.setAsideMessageProvider(undefined);
@@ -6716,15 +7082,18 @@ export class AgentSession {
 
 	async #doDispose(options: AgentSessionDisposeOptions = {}): Promise<void> {
 		this.beginDispose();
+		try {
+			await this.#disposeVibeSessionsForTransition(this.sessionManager.getSessionId());
+		} catch (error) {
+			logger.warn("Failed to dispose vibe sessions during session teardown", { error: String(error) });
+		}
 		this.#recordSessionExit(options.reason ?? "dispose");
 		this.#cancelExitRecorder?.();
 		this.#cancelExitRecorder = undefined;
 		try {
-			if (this.#extensionRunner?.hasHandlers("session_shutdown")) {
-				await this.#extensionRunner.emit({ type: "session_shutdown" });
-			}
+			await this.#extensionRunner?.deactivate();
 		} catch (error) {
-			logger.warn("Failed to emit session_shutdown event", { error: String(error) });
+			logger.warn("Failed to deactivate extension generation", { error: String(error) });
 		}
 		// Clear any timers extensions scheduled via `ctx.setInterval`/`ctx.setTimeout`
 		// so their background work does not outlive the session (issue #5664).
@@ -6761,9 +7130,6 @@ export class AgentSession {
 			const deliveryState = ownedAsyncManager.getDeliveryState();
 			if (drained === false && deliveryState) {
 				logger.warn("Async job completion deliveries still pending during dispose", { ...deliveryState });
-			}
-			if (AsyncJobManager.instance() === ownedAsyncManager) {
-				AsyncJobManager.setInstance(undefined);
 			}
 		}
 		const evalExecutionsSettled = await this.#prepareEvalExecutionsForDispose();
@@ -6805,6 +7171,13 @@ export class AgentSession {
 		// it so the final advisor turn is flushed before the process may exit.
 		await this.#advisorRecorderClosed;
 		this.#closeAllProviderSessions("dispose");
+		if (this.#resourceController) {
+			try {
+				await this.#resourceController.dispose();
+			} catch (error) {
+				logger.warn("Failed to dispose session resource runtime", { error: String(error) });
+			}
+		}
 		// Disconnect the MCP manager this session OWNS so its stdio servers are
 		// not orphaned at exit. Best-effort: a failure here must never throw out
 		// of dispose. Only owning (top-level) sessions provide this callback;
@@ -6976,10 +7349,6 @@ export class AgentSession {
 		return this.#retryAttempt;
 	}
 
-	#getActiveNonMCPToolNames(): string[] {
-		return this.getEnabledToolNames().filter(name => !isMCPToolName(name) && this.#toolRegistry.has(name));
-	}
-
 	/**
 	 * Get the names of currently active tools.
 	 * Returns the names of tools currently set on the agent.
@@ -7030,7 +7399,87 @@ export class AgentSession {
 
 	#wrapRuntimeTool(tool: AgentTool): AgentTool {
 		const wrapped = wrapToolWithMetaNotice(tool);
-		return this.#extensionRunner ? new ExtensionToolWrapper(wrapped, this.#extensionRunner) : wrapped;
+		const extensionRunner = this.#extensionRunner;
+		if (!extensionRunner) return wrapped;
+		return new ExtensionToolWrapper(wrapped, () => this.#extensionRunner ?? extensionRunner);
+	}
+
+	async #publishToolGeneration(options: {
+		sourceId: string;
+		tools: readonly AgentTool[];
+		remove: (key: string, sourceId: string) => boolean;
+		activateNames?: readonly string[];
+		removeBuiltInNames?: ReadonlySet<string>;
+		addBuiltInNames?: ReadonlySet<string>;
+		admit?: (manifest: SessionResourceManifest) => boolean;
+	}): Promise<boolean> {
+		const controller = this.#resourceController;
+		if (!controller) {
+			const registry = new Map(this.#toolRegistry);
+			for (const key of registry.keys()) {
+				if (options.remove(key, "")) registry.delete(key);
+			}
+			for (const tool of options.tools) registry.set(tool.name, tool);
+			this.#toolRegistry = registry;
+			const builtInNames = new Set(this.#builtInToolNames);
+			for (const name of options.removeBuiltInNames ?? []) builtInNames.delete(name);
+			for (const name of options.addBuiltInNames ?? []) builtInNames.add(name);
+			this.#builtInToolNames = builtInNames;
+			return true;
+		}
+
+		let accepted = false;
+		const result = await controller.update("tools", manifest => {
+			const current = manifest.effective.tools;
+			if (options.admit && !options.admit(manifest)) {
+				return {
+					value: current,
+					fingerprint: manifest.resources.tools.fingerprint,
+				};
+			}
+
+			const revision = manifest.resources.tools.revision + 1;
+			const store = ContributionStore.fromSnapshot(current.contributions, {
+				tool: highestPriorityLatestWins(),
+			});
+			store.removeWhere("tool", entry => options.remove(entry.key, entry.sourceId));
+			for (const tool of options.tools) {
+				store.add("tool", {
+					key: tool.name,
+					owner: controller.sessionScope,
+					sourceId: options.sourceId,
+					revision,
+					priority: SESSION_TOOL_CONTRIBUTION_PRIORITY.runtime,
+					value: tool,
+				});
+			}
+			const registry = new Map<string, AgentTool>();
+			for (const [name, resolution] of store.resolveAll("tool")) {
+				if (resolution.winner?.value) registry.set(name, resolution.winner.value);
+			}
+			const initialNames = current.initialNames.filter(name => registry.has(name));
+			for (const name of options.activateNames ?? []) {
+				if (registry.has(name) && !initialNames.includes(name)) initialNames.push(name);
+			}
+			const builtInNames = new Set(current.builtInNames);
+			for (const name of options.removeBuiltInNames ?? []) builtInNames.delete(name);
+			for (const name of options.addBuiltInNames ?? []) builtInNames.add(name);
+			accepted = true;
+			return {
+				value: {
+					...current,
+					registry,
+					contributions: store.getSnapshot(),
+					initialNames,
+					builtInNames,
+				},
+				fingerprint: `runtime-tools:${options.sourceId}:${revision}`,
+			};
+		});
+		if (result.state === "failed") {
+			throw new Error(result.diagnostics.map(diagnostic => diagnostic.message).join("; "));
+		}
+		return accepted;
 	}
 
 	/**
@@ -7050,22 +7499,34 @@ export class AgentSession {
 			throw new Error("Vibe tool names must be unique.");
 		}
 
-		for (const tool of tools) {
-			if (this.#toolRegistry.has(tool.name)) continue;
-			this.#toolRegistry.set(tool.name, this.#wrapRuntimeTool(tool));
-			this.#builtInToolNames.add(tool.name);
-			this.#installedVibeToolNames.add(tool.name);
-		}
-
+		const previousInstalledNames = new Set(this.#installedVibeToolNames);
+		const installedTools = tools
+			.filter(tool => !this.#toolRegistry.has(tool.name) || previousInstalledNames.has(tool.name))
+			.map(tool => this.#wrapRuntimeTool(tool));
+		const installedNames = new Set(installedTools.map(tool => tool.name));
+		const removeVibeContribution = (key: string, sourceId: string): boolean =>
+			sourceId === "runtime:vibe" || (sourceId === "" && previousInstalledNames.has(key));
+		await this.#publishToolGeneration({
+			sourceId: "runtime:vibe",
+			tools: installedTools,
+			remove: removeVibeContribution,
+			activateNames: vibeToolNames,
+			removeBuiltInNames: previousInstalledNames,
+			addBuiltInNames: installedNames,
+		});
+		this.#installedVibeToolNames = installedNames;
 		await this.#applyActiveToolsByName([...new Set([...baseToolNames, ...vibeToolNames])]);
 	}
 
 	/** Removes tools installed by {@link activateVibeTools} and activates `nextToolNames`. */
 	async deactivateVibeTools(nextToolNames: string[]): Promise<void> {
-		for (const name of this.#installedVibeToolNames) {
-			this.#toolRegistry.delete(name);
-			this.#builtInToolNames.delete(name);
-		}
+		const installedNames = new Set(this.#installedVibeToolNames);
+		await this.#publishToolGeneration({
+			sourceId: "runtime:vibe",
+			tools: [],
+			remove: (key, sourceId) => sourceId === "runtime:vibe" || (sourceId === "" && installedNames.has(key)),
+			removeBuiltInNames: installedNames,
+		});
 		this.#installedVibeToolNames.clear();
 		await this.#applyActiveToolsByName(nextToolNames);
 	}
@@ -7222,7 +7683,76 @@ export class AgentSession {
 		);
 	}
 
-	async #applyActiveToolsByName(toolNames: string[]): Promise<void> {
+	async #withResourceManifestAdmission<T>(
+		resources: SessionEffectiveResources | undefined,
+		operation: (resources: SessionEffectiveResources | undefined) => Promise<T>,
+	): Promise<T> {
+		const contextualAdmission = this.#resourceAdmissionContext.getStore();
+		if (resources === undefined && contextualAdmission && this.#activeResourceAdmissions.has(contextualAdmission)) {
+			return operation(contextualAdmission.manifest.effective);
+		}
+		const controller = this.#resourceController;
+		if (resources !== undefined || !controller) return operation(resources);
+		const admission = await controller.admit();
+		this.#activeResourceAdmissions.add(admission);
+		try {
+			return await this.#resourceAdmissionContext.run(admission, () => operation(admission.manifest.effective));
+		} finally {
+			this.#activeResourceAdmissions.delete(admission);
+			admission.release();
+		}
+	}
+
+	async #ensureWriteTransportRegistered(): Promise<boolean> {
+		if (this.#builtInToolNames.has("write")) return true;
+		const contextualAdmission = this.#resourceAdmissionContext.getStore();
+		if (contextualAdmission && this.#activeResourceAdmissions.has(contextualAdmission)) return false;
+		const available = (await this.#ensureWriteRegistered?.()) === true;
+		if (available) this.#builtInToolNames.add("write");
+		return available;
+	}
+
+	async #prepareWriteTransportForToolSelection(
+		toolNames: readonly string[],
+		runtimeSelection: ReadonlySet<string> | undefined = this.#runtimeSelectedToolNames,
+	): Promise<void> {
+		if (this.#builtInToolNames.has("write")) return;
+		const selectedTools = normalizeToolNames(toolNames).flatMap(name => {
+			const tool = this.#toolRegistry.get(name);
+			return tool ? [{ name, tool }] : [];
+		});
+		const xdevReadAvailable = this.#builtInToolNames.has("read") && selectedTools.some(({ name }) => name === "read");
+		const hasMountCandidate = selectedTools.some(
+			({ name, tool }) =>
+				this.#xdevRegistry !== undefined &&
+				xdevReadAvailable &&
+				this.#presentationPinnedToolNames?.has(name) !== true &&
+				runtimeSelection?.has(name) !== true &&
+				isMountableUnderXdev(tool),
+		);
+		const transportNeeded =
+			hasMountCandidate ||
+			selectedTools.some(({ tool }) => tool.deferrable === true) ||
+			this.#planModeState?.enabled === true;
+		if (transportNeeded) await this.#ensureWriteTransportRegistered();
+	}
+
+	async #applyActiveToolsByName(
+		toolNames: string[],
+		rebuildPrompt = true,
+		promptResources?: SessionEffectiveResources,
+	): Promise<void> {
+		await this.#prepareWriteTransportForToolSelection(toolNames);
+		await this.#withResourceManifestAdmission(promptResources, resources =>
+			this.#applyActiveToolsByNameFromManifest(toolNames, rebuildPrompt, resources),
+		);
+	}
+
+	async #applyActiveToolsByNameFromManifest(
+		toolNames: string[],
+		rebuildPrompt: boolean,
+		promptResources: SessionEffectiveResources | undefined,
+	): Promise<void> {
 		toolNames = normalizeToolNames(toolNames);
 		const selectedTools = toolNames.flatMap(name => {
 			const tool = this.#toolRegistry.get(name);
@@ -7241,7 +7771,7 @@ export class AgentSession {
 
 		let builtInWriteAvailable = this.#builtInToolNames.has("write");
 		if (mountCandidates.length > 0 && !builtInWriteAvailable) {
-			builtInWriteAvailable = (await this.#ensureWriteRegistered?.()) === true;
+			builtInWriteAvailable = await this.#ensureWriteTransportRegistered();
 			if (builtInWriteAvailable) this.#builtInToolNames.add("write");
 		}
 		const mountNames = builtInWriteAvailable ? new Set(mountCandidates.map(({ name }) => name)) : new Set<string>();
@@ -7261,7 +7791,7 @@ export class AgentSession {
 		const activeDeferrableTool = tools.some(tool => tool.deferrable === true);
 		const transportNeeded = mountedTools.length > 0 || activeDeferrableTool || this.#planModeState?.enabled === true;
 		if (transportNeeded && !builtInWriteAvailable) {
-			builtInWriteAvailable = (await this.#ensureWriteRegistered?.()) === true;
+			builtInWriteAvailable = await this.#ensureWriteTransportRegistered();
 			if (builtInWriteAvailable) this.#builtInToolNames.add("write");
 		}
 		if (transportNeeded && builtInWriteAvailable) {
@@ -7286,6 +7816,8 @@ export class AgentSession {
 			return tool ? [tool] : [];
 		});
 		const previousActiveToolNames = this.getActiveToolNames();
+		const previousAgentTools = [...this.agent.state.tools];
+		this.agent.setTools(tools);
 		this.#mountedXdevToolNames = new Set(mountedTools.map(tool => tool.name));
 		this.#xdevRegistry?.reconcile(mountedTools);
 		this.#setActiveToolNames?.(validToolNames);
@@ -7293,11 +7825,11 @@ export class AgentSession {
 		let rebuiltSystemPrompt: string[] | undefined;
 		let rebuiltSignature: string | undefined;
 		try {
-			if (this.#rebuildSystemPrompt) {
+			if (rebuildPrompt && this.#rebuildSystemPrompt) {
 				const signature = this.#computeAppliedToolSignature(validToolNames, tools);
 				if (signature !== this.#lastAppliedToolSignature) {
-					const built = await this.#rebuildSystemPrompt(validToolNames, this.#toolRegistry);
-					rebuiltSystemPrompt = built.systemPrompt;
+					const built = await this.#rebuildSystemPrompt(validToolNames, this.#toolRegistry, promptResources);
+					rebuiltSystemPrompt = [...built.systemPrompt];
 					rebuiltSignature = signature;
 				}
 			}
@@ -7305,11 +7837,11 @@ export class AgentSession {
 			this.#mountedXdevToolNames = previousMounted;
 			this.#xdevRegistry?.reconcile(previousMountedTools);
 			this.#setActiveToolNames?.(previousActiveToolNames);
+			this.agent.setTools(previousAgentTools);
 			throw error;
 		}
 
 		this.#notifyXdevMountDelta(previousMounted);
-		this.agent.setTools(tools);
 		if (rebuiltSystemPrompt && rebuiltSignature) {
 			if (this.#lastAppliedToolSignature !== undefined) this.#clearInheritedProviderPromptCacheKey();
 			this.#baseSystemPrompt = rebuiltSystemPrompt;
@@ -7396,15 +7928,24 @@ export class AgentSession {
 			cwd: this.sessionManager.getCwd(),
 			disabledExtensions: this.settings.get("disabledExtensions") ?? [],
 		});
+		const controller = this.#resourceController;
+		if (controller) {
+			const current = controller.current.effective.skills;
+			const result = await controller.replace("skills", {
+				...current,
+				items: discovered.skills,
+				warnings: discovered.warnings,
+				settings: skillsSettings,
+			});
+			if (result.state === "failed") {
+				throw new Error(result.diagnostics.map(diagnostic => diagnostic.message).join("; "));
+			}
+		}
 		this.#skills = discovered.skills;
 		this.#skillWarnings = discovered.warnings;
 		this.#skillsSettings = skillsSettings;
-
-		if (this.#agentKind === "main") {
-			setActiveSkills(this.#skills);
-		}
 		await this.refreshBaseSystemPrompt();
-		this.#notifyCommandMetadataChanged();
+		if (!controller) this.#notifyCommandMetadataChanged();
 	}
 
 	/**
@@ -7414,20 +7955,31 @@ export class AgentSession {
 	 * Changes take effect before the next model call.
 	 */
 	async setActiveToolsByName(toolNames: string[]): Promise<void> {
+		const normalized = normalizeToolNames(toolNames);
+		const prospectiveRuntimeSelection = new Set(normalized.filter(name => !this.#mountedXdevToolNames.has(name)));
+		await this.#prepareWriteTransportForToolSelection(normalized, prospectiveRuntimeSelection);
+		await this.#withResourceManifestAdmission(undefined, resources =>
+			this.#setActiveToolsByNameFromManifest(toolNames, resources),
+		);
+	}
+
+	async #setActiveToolsByNameFromManifest(
+		toolNames: string[],
+		promptResources: SessionEffectiveResources | undefined,
+	): Promise<void> {
 		const mounted = this.#mountedXdevToolNames;
 		const normalized = normalizeToolNames(toolNames);
 		const transportWriteActive =
 			this.#builtInToolNames.has("write") &&
-			this.getActiveToolNames().includes("write") &&
 			this.#presentationPinnedToolNames?.has("write") !== true &&
 			this.#runtimeSelectedToolNames?.has("write") !== true &&
 			(mounted.size > 0 || this.#planModeState?.enabled === true);
 		const previousRuntimeSelectedToolNames = this.#runtimeSelectedToolNames;
 		this.#runtimeSelectedToolNames = new Set(
-			normalized.filter(name => !mounted.has(name) && !(name === "write" && transportWriteActive)),
+			normalized.filter(name => !mounted.has(name) && (name !== "write" || !transportWriteActive)),
 		);
 		try {
-			await this.#applyActiveToolsByName(normalized);
+			await this.#applyActiveToolsByNameFromManifest(normalized, true, promptResources);
 		} catch (error) {
 			this.#runtimeSelectedToolNames = previousRuntimeSelectedToolNames;
 			throw error;
@@ -7436,12 +7988,18 @@ export class AgentSession {
 
 	/** Rebuild the base system prompt using the current active tool set. */
 	async refreshBaseSystemPrompt(): Promise<void> {
+		await this.#withResourceManifestAdmission(undefined, resources =>
+			this.#refreshBaseSystemPromptFromManifest(resources),
+		);
+	}
+
+	async #refreshBaseSystemPromptFromManifest(promptResources: SessionEffectiveResources | undefined): Promise<void> {
 		if (!this.#rebuildSystemPrompt) return;
 		const activeToolNames = this.getActiveToolNames();
 		this.#setActiveToolNames?.(activeToolNames);
 		const previousBaseSystemPrompt = this.#baseSystemPrompt;
-		const built = await this.#rebuildSystemPrompt(activeToolNames, this.#toolRegistry);
-		this.#baseSystemPrompt = built.systemPrompt;
+		const built = await this.#rebuildSystemPrompt(activeToolNames, this.#toolRegistry, promptResources);
+		this.#baseSystemPrompt = [...built.systemPrompt];
 		this.#baseSystemPromptBeforeMemoryPromotion = undefined;
 		if (
 			previousBaseSystemPrompt.length !== this.#baseSystemPrompt.length ||
@@ -7460,7 +8018,10 @@ export class AgentSession {
 		this.#lastAppliedToolSignature = this.#computeAppliedToolSignature(activeToolNames, activeTools);
 	}
 
-	async #buildSystemPromptForAgentStart(promptText: string): Promise<string[]> {
+	async #buildSystemPromptForAgentStart(
+		promptText: string,
+		promptResources?: SessionEffectiveResources,
+	): Promise<string[]> {
 		const backend = await resolveMemoryBackend(this.settings);
 		if (!backend.beforeAgentStartPrompt) return this.#baseSystemPrompt;
 
@@ -7470,7 +8031,7 @@ export class AgentSession {
 
 			const previousBaseSystemPrompt = this.#baseSystemPrompt;
 			try {
-				await this.refreshBaseSystemPrompt();
+				await this.#refreshBaseSystemPromptFromManifest(promptResources);
 			} catch (refreshErr) {
 				logger.debug("Memory backend prompt refresh after beforeAgentStartPrompt failed", {
 					backend: backend.id,
@@ -7567,25 +8128,247 @@ export class AgentSession {
 	}
 
 	/**
+	 * Replace the MCP manager exposed through this session's resource snapshot.
+	 * The caller retains lifecycle ownership of dynamically supplied managers.
+	 */
+	async replaceMCPManager(manager: MCPManager | undefined): Promise<void> {
+		const controller = this.#resourceController;
+		if (!controller) throw new Error("Session resource runtime is unavailable");
+		const current = controller.current.effective.mcp;
+		if (current.manager === manager) return;
+		const next: SessionMcpResources = manager
+			? {
+					ownership: "borrowed",
+					manager,
+					getServerInstructions: () => manager.getServerInstructions(),
+					disconnectOwnedManager: undefined,
+				}
+			: {
+					ownership: "absent",
+					manager: undefined,
+					getServerInstructions: undefined,
+					disconnectOwnedManager: undefined,
+				};
+		const previousPromptCommands = this.#mcpPromptCommands;
+		const result = await controller.replace("mcp", next, undefined, {
+			handoff: () => {
+				this.setMCPPromptCommands([]);
+			},
+			compensate: () => {
+				this.setMCPPromptCommands(previousPromptCommands);
+			},
+			abort: () => {
+				this.setMCPPromptCommands(previousPromptCommands);
+			},
+			retire: async previous => {
+				await previous.value.disconnectOwnedManager?.();
+			},
+		});
+		if (result.state === "failed") {
+			throw new Error(result.diagnostics.map(diagnostic => diagnostic.message).join("; "));
+		}
+	}
+
+	/**
+	 * Re-read MCP configuration and replace the connected tool generation for an
+	 * owned manager. Borrowed managers belong to a parent session and are left
+	 * untouched so a child reload cannot interrupt the parent's transports.
+	 *
+	 * Discovery and tool publication share one queue. This prevents deferred
+	 * startup discovery, `/mcp reload`, and canonical resource reloads from
+	 * disconnecting or publishing over one another.
+	 */
+	async reloadMCPResources(
+		signal?: AbortSignal,
+		options?: Pick<MCPDiscoverOptions, "onStatus"> & { readonly cwd?: string },
+	): Promise<MCPLoadResult | undefined> {
+		signal?.throwIfAborted();
+		const reloadSignal = signal
+			? AbortSignal.any([signal, this.#mcpReloadAbortController.signal])
+			: this.#mcpReloadAbortController.signal;
+		this.#mcpReloadPendingCount++;
+		const started = Promise.withResolvers<void>();
+		const operation = this.#mcpReloadTail.then(() => {
+			started.resolve();
+			reloadSignal.throwIfAborted();
+			return this.#reloadMCPResources(reloadSignal, options);
+		});
+		const tracked = operation.then(
+			result => {
+				this.#mcpReloadPendingCount--;
+				return result;
+			},
+			error => {
+				this.#mcpReloadPendingCount--;
+				throw error;
+			},
+		);
+		this.#mcpReloadTail = tracked.then(
+			() => undefined,
+			() => undefined,
+		);
+
+		// A queued caller may stop waiting promptly, but once its operation starts,
+		// cancellation cleanup remains part of the promise's observable contract.
+		const cancelled = Promise.withResolvers<never>();
+		const onAbort = (): void => {
+			try {
+				reloadSignal.throwIfAborted();
+			} catch (error) {
+				cancelled.reject(error);
+			}
+		};
+		reloadSignal.addEventListener("abort", onAbort, { once: true });
+		if (reloadSignal.aborted) onAbort();
+		try {
+			await Promise.race([started.promise, cancelled.promise]);
+		} finally {
+			reloadSignal.removeEventListener("abort", onAbort);
+		}
+		return tracked;
+	}
+
+	async #reloadMCPResources(
+		signal: AbortSignal,
+		options?: Pick<MCPDiscoverOptions, "onStatus"> & { readonly cwd?: string },
+	): Promise<MCPLoadResult | undefined> {
+		const controller = this.#resourceController;
+		if (!controller) return undefined;
+		const admission = await controller.admit(signal);
+		const resources = admission.manifest.effective.mcp;
+		const manager = resources.manager;
+		admission.release();
+		if (!manager || resources.ownership !== "owned") return undefined;
+		const cancellationReason = (): unknown =>
+			signal.reason ?? new Error("Agent session was disposed during MCP reload");
+		const throwIfCancelled = (): void => {
+			if (this.#isDisposed) throw cancellationReason();
+			signal.throwIfAborted();
+		};
+		const disconnectCancelledGeneration = async (error: unknown): Promise<never> => {
+			const cleanupErrors: unknown[] = [error];
+			try {
+				await manager.disconnectAll(signal);
+			} catch (disconnectError) {
+				cleanupErrors.push(disconnectError);
+			}
+			try {
+				await this.refreshMCPTools([], manager);
+				if (!this.#isDisposed) this.#refreshMCPPromptCommandsForManager(manager);
+			} catch (refreshError) {
+				cleanupErrors.push(refreshError);
+			}
+			if (cleanupErrors.length > 1) {
+				throw new AggregateError(cleanupErrors, "Failed to cancel MCP reload cleanly");
+			}
+			throw error;
+		};
+
+		let result: MCPLoadResult;
+		throwIfCancelled();
+		try {
+			result = await manager.rediscoverAndConnect(options?.cwd ?? this.sessionManager.getCwd(), {
+				enableProjectConfig: this.settings.get("mcp.enableProjectConfig") ?? true,
+				filterExa: true,
+				filterBrowser: this.settings.get("browser.enabled") ?? false,
+				...(signal ? { signal } : {}),
+				...(options?.onStatus ? { onStatus: options.onStatus } : {}),
+			});
+			throwIfCancelled();
+		} catch (error) {
+			if (this.#isDisposed || signal?.aborted) {
+				return disconnectCancelledGeneration(cancellationReason());
+			}
+			// rediscoverAndConnect disconnects the old generation first. Publish
+			// the now-empty manager state so stale tools cannot remain callable.
+			let failure: unknown = error;
+			try {
+				await this.refreshMCPTools(manager.getTools(), manager);
+				if (!this.#refreshMCPPromptCommandsForManager(manager)) return undefined;
+			} catch (refreshError) {
+				failure = new AggregateError([error, refreshError], "MCP rediscovery and tool refresh failed");
+			}
+			this.#lastResourceReloadResult = {
+				state: "degraded",
+				manifest: controller.current,
+				diagnostics: Object.freeze([
+					{
+						severity: "warning",
+						domain: "mcp",
+						message: failure instanceof Error ? failure.message : String(failure),
+						cause: failure,
+					},
+				]),
+			};
+			throw failure;
+		}
+
+		try {
+			await this.refreshMCPTools(result.tools, manager);
+			if (!this.#refreshMCPPromptCommandsForManager(manager)) return undefined;
+			throwIfCancelled();
+		} catch (error) {
+			if (this.#isDisposed || signal?.aborted) {
+				return disconnectCancelledGeneration(cancellationReason());
+			}
+			this.#lastResourceReloadResult = {
+				state: "degraded",
+				manifest: controller.current,
+				diagnostics: Object.freeze([
+					{
+						severity: "warning",
+						domain: "mcp",
+						message: error instanceof Error ? error.message : String(error),
+						cause: error,
+					},
+				]),
+			};
+			throw error;
+		}
+		const diagnostics = Array.from(result.errors, ([server, message]) => ({
+			severity: "warning" as const,
+			domain: "mcp",
+			message: `${server}: ${message}`,
+		}));
+		this.#lastResourceReloadResult = {
+			state: diagnostics.length > 0 ? "degraded" : "applied",
+			manifest: controller.current,
+			diagnostics: Object.freeze(diagnostics),
+		};
+		return result;
+	}
+
+	/**
 	 * Replace MCP tools in the registry and enable them immediately. Every
 	 * connected MCP tool becomes available (mounted under `xd://` when that
 	 * transport is active, else top-level). Lets `/mcp add/remove/reauth` take
 	 * effect without restarting the session.
 	 */
-	async refreshMCPTools(mcpTools: CustomTool[]): Promise<void> {
-		const existingNames = Array.from(this.#toolRegistry.keys());
-		const previousMcpTools = new Map(
-			existingNames.flatMap(name => {
-				const tool = this.#toolRegistry.get(name);
-				return isMCPToolName(name) && tool ? [[name, tool] as const] : [];
-			}),
-		);
-		for (const name of existingNames) {
-			if (isMCPToolName(name)) {
-				this.#toolRegistry.delete(name);
-			}
-		}
+	async refreshMCPTools(mcpTools: CustomTool[], expectedManager?: MCPManager): Promise<void> {
+		await this.#replaceMCPTools(mcpTools, expectedManager);
+	}
 
+	/** Publish a detached manager notification unless its reload generation was superseded. */
+	async refreshMCPToolsFromManagerNotification(mcpTools: CustomTool[], manager: MCPManager): Promise<void> {
+		if (this.#mcpReloadPendingCount > 0) {
+			await this.#mcpReloadTail;
+			if (manager.getTools() !== mcpTools) return;
+		}
+		await this.#replaceMCPTools(mcpTools, manager);
+	}
+
+	async #replaceMCPTools(mcpTools: CustomTool[], expectedManager?: MCPManager): Promise<boolean> {
+		if (this.#isDisposed) {
+			const registry = new Map(this.#toolRegistry);
+			for (const key of registry.keys()) {
+				if (isMCPToolName(key)) registry.delete(key);
+			}
+			this.#toolRegistry = registry;
+			const activeTools = this.agent.state.tools.filter(tool => !isMCPToolName(tool.name));
+			this.agent.setTools(activeTools);
+			this.#setActiveToolNames?.(activeTools.map(tool => tool.name));
+			return true;
+		}
 		const getCustomToolContext = (): CustomToolContext => ({
 			sessionManager: this.sessionManager,
 			modelRegistry: this.#modelRegistry,
@@ -7598,25 +8381,53 @@ export class AgentSession {
 			settings: this.settings,
 			localProtocolOptions: this.#localProtocolOptions(),
 		});
-
-		for (const customTool of mcpTools) {
-			const wrapped = wrapToolWithMetaNotice(CustomToolAdapter.wrap(customTool, getCustomToolContext) as AgentTool);
-			const finalTool = (
-				this.#extensionRunner ? new ExtensionToolWrapper(wrapped, this.#extensionRunner) : wrapped
-			) as AgentTool;
-			this.#toolRegistry.set(finalTool.name, finalTool);
-		}
-
-		// Every connected MCP tool is selected; centralized repartitioning owns
-		// presentation pins and write-transport activation/removal.
-		const nextActive = [...new Set([...this.#getActiveNonMCPToolNames(), ...mcpTools.map(tool => tool.name)])];
+		const tools = mcpTools.map(customTool =>
+			this.#wrapRuntimeTool(CustomToolAdapter.wrap(customTool, getCustomToolContext) as AgentTool),
+		);
+		const previousToolRegistry = this.#toolRegistry;
+		const previousBuiltInToolNames = this.#builtInToolNames;
+		const previousActiveToolNames = this.getEnabledToolNames();
+		const removeMcpContribution = (key: string, sourceId: string): boolean =>
+			sourceId === "mcp:runtime" ||
+			sourceId === "mcp:startup" ||
+			sourceId === "mcp:pending" ||
+			(sourceId === "" && isMCPToolName(key));
 		try {
+			const published = await this.#publishToolGeneration({
+				sourceId: "mcp:runtime",
+				tools,
+				remove: removeMcpContribution,
+				activateNames: tools.map(tool => tool.name),
+				...(expectedManager
+					? { admit: (manifest: SessionResourceManifest) => manifest.effective.mcp.manager === expectedManager }
+					: {}),
+			});
+			if (!published) return false;
+			const initialNames = this.#resourceController?.current.effective.tools.initialNames ?? previousActiveToolNames;
+			const nextMcpToolNames = new Set(tools.map(tool => tool.name));
+			const restoredShadowedNames = initialNames.filter(
+				name => isMCPToolName(name) && !nextMcpToolNames.has(name) && this.#toolRegistry.has(name),
+			);
+			const nextActive = [
+				...new Set([
+					...this.getEnabledToolNames().filter(name => !isMCPToolName(name) && this.#toolRegistry.has(name)),
+					...restoredShadowedNames,
+					...tools.map(tool => tool.name),
+				]),
+			];
 			await this.#applyActiveToolsByName(nextActive);
+			return true;
 		} catch (error) {
-			for (const name of this.#toolRegistry.keys()) {
-				if (isMCPToolName(name)) this.#toolRegistry.delete(name);
-			}
-			for (const [name, tool] of previousMcpTools) this.#toolRegistry.set(name, tool);
+			const registeredWrite =
+				this.#builtInToolNames.has("write") && !previousBuiltInToolNames.has("write")
+					? (this.#toolRegistry.get("write") ?? previousToolRegistry.get("write"))
+					: undefined;
+			const restoredRegistry = new Map(previousToolRegistry);
+			if (registeredWrite) restoredRegistry.set("write", registeredWrite);
+			this.#toolRegistry = restoredRegistry;
+			const restoredBuiltInToolNames = new Set(previousBuiltInToolNames);
+			if (registeredWrite) restoredBuiltInToolNames.add("write");
+			this.#builtInToolNames = restoredBuiltInToolNames;
 			throw error;
 		}
 	}
@@ -7638,42 +8449,54 @@ export class AgentSession {
 		}
 
 		const previousRpcHostToolNames = new Set(this.#rpcHostToolNames);
+		const previousToolRegistry = this.#toolRegistry;
+		const previousBuiltInToolNames = this.#builtInToolNames;
 		const previousActiveToolNames = this.getEnabledToolNames();
-		const previousRpcHostTools = new Map(
-			[...previousRpcHostToolNames].flatMap(name => {
-				const tool = this.#toolRegistry.get(name);
-				return tool ? [[name, tool] as const] : [];
-			}),
-		);
-		for (const name of previousRpcHostToolNames) {
-			this.#toolRegistry.delete(name);
-		}
-		this.#rpcHostToolNames.clear();
-
-		for (const tool of rpcTools) {
-			const metaWrapped = wrapToolWithMetaNotice(tool);
-			const finalTool = (
-				this.#extensionRunner ? new ExtensionToolWrapper(metaWrapped, this.#extensionRunner) : metaWrapped
-			) as AgentTool;
-			this.#toolRegistry.set(finalTool.name, finalTool);
-			this.#rpcHostToolNames.add(finalTool.name);
-		}
-
-		const activeNonRpcToolNames = previousActiveToolNames.filter(name => !previousRpcHostToolNames.has(name));
-		const preservedRpcToolNames = previousActiveToolNames.filter(
-			name => previousRpcHostToolNames.has(name) && this.#rpcHostToolNames.has(name),
-		);
-		const autoActivatedRpcToolNames = rpcTools
-			.filter(tool => !tool.hidden && !previousRpcHostToolNames.has(tool.name))
-			.map(tool => tool.name);
+		const tools = rpcTools.map(tool => this.#wrapRuntimeTool(tool));
+		const removeRpcContribution = (key: string, sourceId: string): boolean =>
+			sourceId === "rpc:host" || (sourceId === "" && previousRpcHostToolNames.has(key));
+		const visibleToolNames = rpcTools.filter(tool => !tool.hidden).map(tool => tool.name);
 		try {
+			await this.#publishToolGeneration({
+				sourceId: "rpc:host",
+				tools,
+				remove: removeRpcContribution,
+				activateNames: visibleToolNames,
+			});
+			const initialNames = this.#resourceController?.current.effective.tools.initialNames ?? previousActiveToolNames;
+			this.#rpcHostToolNames = uniqueToolNames;
+
+			const restoredShadowedNames = initialNames.filter(
+				name => previousRpcHostToolNames.has(name) && !uniqueToolNames.has(name) && this.#toolRegistry.has(name),
+			);
+			const preservedActiveToolNames = this.getEnabledToolNames().filter(
+				name => !previousRpcHostToolNames.has(name) && this.#toolRegistry.has(name),
+			);
+			const previouslyActiveRpcToolNames = new Set(
+				previousActiveToolNames.filter(name => previousRpcHostToolNames.has(name)),
+			);
+			const activeRpcToolNames = rpcTools
+				.filter(
+					tool =>
+						!tool.hidden &&
+						(!previousRpcHostToolNames.has(tool.name) || previouslyActiveRpcToolNames.has(tool.name)),
+				)
+				.map(tool => tool.name);
 			await this.#applyActiveToolsByName(
-				Array.from(new Set([...activeNonRpcToolNames, ...preservedRpcToolNames, ...autoActivatedRpcToolNames])),
+				Array.from(new Set([...preservedActiveToolNames, ...restoredShadowedNames, ...activeRpcToolNames])),
 			);
 		} catch (error) {
-			for (const name of this.#rpcHostToolNames) this.#toolRegistry.delete(name);
+			const registeredWrite =
+				this.#builtInToolNames.has("write") && !previousBuiltInToolNames.has("write")
+					? (this.#toolRegistry.get("write") ?? previousToolRegistry.get("write"))
+					: undefined;
+			const restoredRegistry = new Map(previousToolRegistry);
+			if (registeredWrite) restoredRegistry.set("write", registeredWrite);
+			this.#toolRegistry = restoredRegistry;
+			const restoredBuiltInToolNames = new Set(previousBuiltInToolNames);
+			if (registeredWrite) restoredBuiltInToolNames.add("write");
+			this.#builtInToolNames = restoredBuiltInToolNames;
 			this.#rpcHostToolNames = previousRpcHostToolNames;
-			for (const [name, tool] of previousRpcHostTools) this.#toolRegistry.set(name, tool);
 			throw error;
 		}
 	}
@@ -8163,24 +8986,73 @@ export class AgentSession {
 		return undefined;
 	}
 
-	get promptTemplates(): ReadonlyArray<PromptTemplate> {
-		return this.#promptTemplates;
+	#getCommandResources(): SessionCommandResources | undefined {
+		return this.#resourceController?.current.effective.commands;
 	}
 
-	/** Replace file-based slash commands used for prompt expansion. */
-	setSlashCommands(slashCommands: FileSlashCommand[]): void {
-		this.#slashCommands = [...slashCommands];
+	#getAgentResources(): SessionAgentResources | undefined {
+		return this.#resourceController?.current.effective.agents;
+	}
+
+	#getSkillResources(): SessionSkillResources | undefined {
+		return this.#resourceController?.current.effective.skills;
+	}
+
+	#getRuleResources(): SessionRuleResources | undefined {
+		return this.#resourceController?.current.effective.rules;
+	}
+
+	get promptTemplates(): ReadonlyArray<PromptTemplate> {
+		return this.#getCommandResources()?.promptTemplates ?? this.#promptTemplates;
+	}
+	/** Currently applied file-based slash commands for expansion and metadata. */
+	get slashCommands(): ReadonlyArray<FileSlashCommand> {
+		return this.#getCommandResources()?.slashCommands ?? this.#slashCommands;
+	}
+
+	/** Replace file-based slash commands through the session resource runtime. */
+	async setSlashCommands(slashCommands: FileSlashCommand[]): Promise<void> {
+		const next = [...slashCommands];
+		const controller = this.#resourceController;
+		if (controller) {
+			const commands = controller.current.effective.commands;
+			const result = await controller.replace("commands", { ...commands, slashCommands: next });
+			if (result.state === "failed") {
+				throw new Error(result.diagnostics.map(diagnostic => diagnostic.message).join("; "));
+			}
+		}
+		this.#slashCommands = next;
 	}
 
 	/** Custom commands (TypeScript slash commands and MCP prompts) */
 	get customCommands(): ReadonlyArray<LoadedCustomCommand> {
-		if (this.#mcpPromptCommands.length === 0) return this.#customCommands;
-		return [...this.#customCommands, ...this.#mcpPromptCommands];
+		const customCommands = this.#getCommandResources()?.customCommands ?? this.#customCommands;
+		if (this.#mcpPromptCommands.length === 0) return customCommands;
+		return [...customCommands, ...this.#mcpPromptCommands];
 	}
 
 	/** MCP prompt commands only, for command-list metadata. */
 	get mcpPromptCommands(): ReadonlyArray<LoadedCustomCommand> {
 		return this.#mcpPromptCommands;
+	}
+
+	#refreshMCPPromptCommandsForManager(manager: MCPManager): boolean {
+		const resources = this.#resourceController?.current.effective.mcp;
+		if (resources?.ownership !== "owned" || resources.manager !== manager) return false;
+		this.setMCPPromptCommands(this.#buildMcpPromptCommands?.(manager) ?? []);
+		return true;
+	}
+
+	/**
+	 * Refresh prompt-backed commands after the current MCP reload transaction
+	 * settles. Detached server prompt discovery uses this path so it cannot
+	 * publish command metadata ahead of the corresponding tool generation.
+	 */
+	refreshMCPPromptCommands(manager: MCPManager): Promise<boolean> {
+		if (this.#mcpReloadPendingCount === 0) {
+			return Promise.resolve(this.#refreshMCPPromptCommandsForManager(manager));
+		}
+		return this.#mcpReloadTail.then(() => this.#refreshMCPPromptCommandsForManager(manager));
 	}
 
 	/** Update the MCP prompt commands list. Called when server prompts are (re)loaded. */
@@ -8496,12 +9368,12 @@ export class AgentSession {
 			// Try file-based slash commands (markdown files from commands/ directories)
 			// Only if text still starts with "/" (wasn't transformed by custom command)
 			if (text.startsWith("/")) {
-				text = expandSlashCommand(text, this.#slashCommands);
+				text = expandSlashCommand(text, [...(this.#getCommandResources()?.slashCommands ?? this.#slashCommands)]);
 			}
 		}
 
 		// Expand file-based prompt templates if requested
-		const expandedText = expandPromptTemplates ? expandPromptTemplate(text, [...this.#promptTemplates]) : text;
+		const expandedText = expandPromptTemplates ? expandPromptTemplate(text, [...this.promptTemplates]) : text;
 
 		// Magic keywords ("ultrathink", "orchestrate"): append hidden system notices after the
 		// user's message that steer this turn. User-authored prompts only — synthetic /
@@ -8665,196 +9537,205 @@ export class AgentSession {
 			acceptTerminalEmptyStop?: boolean;
 		},
 	): Promise<void> {
-		this.#beginInFlight();
+		const admission = await this.#beginInFlight();
 		const generation = this.#promptGeneration;
 		try {
-			// Flush any pending bash messages before the new prompt
-			await this.#flushPendingBashMessages();
-			this.#flushPendingPythonMessages();
-			this.#flushPendingIrcAsides();
+			await this.#resourceAdmissionContext.run(admission, async () => {
+				// Flush any pending bash messages before the new prompt
+				await this.#flushPendingBashMessages();
+				this.#flushPendingPythonMessages();
+				this.#flushPendingIrcAsides();
 
-			// Reset todo reminder count on new user prompt
-			this.#todoReminderCount = 0;
-			this.#todoReminderAwaitingProgress = false;
-			this.#mutationsSinceLastTodoTouch = 0;
-			this.#midRunNudgeCount = 0;
-			this.#resetPromptMaintenanceState();
-			this.#acceptTerminalEmptyStopForPrompt = options?.acceptTerminalEmptyStop === true;
+				// Reset todo reminder count on new user prompt
+				this.#todoReminderCount = 0;
+				this.#todoReminderAwaitingProgress = false;
+				this.#mutationsSinceLastTodoTouch = 0;
+				this.#midRunNudgeCount = 0;
+				this.#resetPromptMaintenanceState();
+				this.#acceptTerminalEmptyStopForPrompt = options?.acceptTerminalEmptyStop === true;
 
-			await this.#maybeRestoreRetryFallbackPrimary();
+				await this.#maybeRestoreRetryFallbackPrimary();
 
-			// Validate model
-			if (!this.model) {
-				throw new Error(
-					"No model selected.\n\n" +
-						`Use /login, set an API key environment variable, or create ${getAgentDbPath()}\n\n` +
-						"Then use /model to select a model.",
-				);
-			}
-
-			// Validate API key
-			const apiKey = await this.#modelRegistry.getApiKey(this.model, this.sessionId);
-			if (!apiKey) {
-				throw new Error(
-					`No API key found for ${this.model.provider}.\n\n` +
-						`Use /login, set an API key environment variable, or create ${getAgentDbPath()}`,
-				);
-			}
-
-			// Check if we need to compact before sending (catches aborted responses). Run
-			// inline (allowDefer=false) so the handoff/maintenance fully settles before this
-			// prompt's agent loop starts — otherwise a deferred handoff would fire on the
-			// next microtask alongside the new turn.
-			const lastAssistant = this.#findLastAssistantMessage();
-			if (lastAssistant && !options?.skipCompactionCheck) {
-				await this.#checkCompaction(lastAssistant, false, false, false);
-			}
-
-			await this.#armPlanYoloIfNeeded();
-
-			// Build messages array (session context, eager todo prelude, then active prompt message)
-			const messages: AgentMessage[] = [];
-			const planReferenceMessage = await this.#buildPlanReferenceMessage?.();
-			if (planReferenceMessage) {
-				messages.push(planReferenceMessage);
-			}
-			const planModeMessage = await this.#buildPlanModeMessage();
-			if (planModeMessage) {
-				messages.push(planModeMessage);
-			}
-			const goalModeMessage = this.#buildGoalModeMessage();
-			if (goalModeMessage) {
-				messages.push(goalModeMessage);
-			}
-			const vibeModeMessage = this.#buildVibeModeMessage();
-			if (vibeModeMessage) {
-				messages.push(vibeModeMessage);
-			}
-			if (options?.prependMessages) {
-				messages.push(...options.prependMessages);
-			}
-
-			// Early bail-out: if a newer abort/prompt cycle started during setup,
-			// return before mutating shared state (nextTurn messages, system prompt).
-			if (this.#promptGeneration !== generation) {
-				return;
-			}
-
-			// A pending xd:// delta accompanies the next user-authored prompt,
-			// never an agent-initiated continuation.
-			const xdevMountNotice = isUserQueuedMessage(message) ? this.#takePendingXdevMountNotice() : undefined;
-			if (xdevMountNotice) {
-				messages.push(xdevMountNotice);
-			}
-			messages.push(message);
-			// Inject any pending "nextTurn" messages as context alongside the user message
-			for (const msg of this.#pendingNextTurnMessages) {
-				messages.push(msg);
-			}
-			this.#pendingNextTurnMessages = [];
-
-			// Auto-read @filepath mentions
-			const fileMentions = extractFileMentions(expandedText);
-			if (fileMentions.length > 0) {
-				const fileMentionMessages = await generateFileMentionMessages(fileMentions, this.sessionManager.getCwd(), {
-					autoResizeImages: this.settings.get("images.autoResize"),
-					useHashLines: resolveFileDisplayMode(this).hashLines,
-					snapshotStore: getFileSnapshotStore(this),
-				});
-				for (const fileMentionMessage of fileMentionMessages) {
-					messages.push(await this.#normalizeAgentMessageImages(fileMentionMessage));
-				}
-			}
-
-			const beforeAgentStartSystemPrompt = await this.#buildSystemPromptForAgentStart(expandedText);
-
-			// Emit before_agent_start extension event
-			if (this.#extensionRunner) {
-				const result = await this.#extensionRunner.emitBeforeAgentStart(
-					expandedText,
-					options?.images,
-					beforeAgentStartSystemPrompt,
-				);
-				if (result?.messages) {
-					const promptAttribution: "user" | "agent" | undefined =
-						"attribution" in message ? message.attribution : undefined;
-					for (const msg of result.messages) {
-						const normalized = normalizeCustomMessagePayload(msg);
-						const hasExplicitAttribution =
-							msg !== null &&
-							typeof msg === "object" &&
-							!Array.isArray(msg) &&
-							(msg.attribution === "user" || msg.attribution === "agent");
-						messages.push(
-							await this.#normalizeAgentMessageImages({
-								role: "custom",
-								customType: normalized.customType,
-								content: normalized.content,
-								display: normalized.display,
-								details: normalized.details,
-								attribution: hasExplicitAttribution
-									? normalized.attribution
-									: (promptAttribution ?? (message.role === "user" ? "user" : "agent")),
-								timestamp: Date.now(),
-							}),
-						);
-					}
+				// Validate model
+				if (!this.model) {
+					throw new Error(
+						"No model selected.\n\n" +
+							`Use /login, set an API key environment variable, or create ${getAgentDbPath()}\n\n` +
+							"Then use /model to select a model.",
+					);
 				}
 
-				if (result?.systemPrompt !== undefined) {
-					this.agent.setSystemPrompt(result.systemPrompt);
-				} else {
-					this.agent.setSystemPrompt(beforeAgentStartSystemPrompt);
+				// Validate API key
+				const apiKey = await this.#modelRegistry.getApiKey(this.model, this.sessionId);
+				if (!apiKey) {
+					throw new Error(
+						`No API key found for ${this.model.provider}.\n\n` +
+							`Use /login, set an API key environment variable, or create ${getAgentDbPath()}`,
+					);
 				}
-			} else {
-				this.agent.setSystemPrompt(beforeAgentStartSystemPrompt);
-			}
 
-			// Bail out if a newer abort/prompt cycle has started since we began setup
-			if (this.#promptGeneration !== generation) {
-				return;
-			}
+				// Check if we need to compact before sending (catches aborted responses). Run
+				// inline (allowDefer=false) so the handoff/maintenance fully settles before this
+				// prompt's agent loop starts — otherwise a deferred handoff would fire on the
+				// next microtask alongside the new turn.
+				const lastAssistant = this.#findLastAssistantMessage();
+				if (lastAssistant && !options?.skipCompactionCheck) {
+					await this.#checkCompaction(lastAssistant, false, false, false);
+				}
 
-			// Auto thinking: classify this real user turn and set the effective level
-			// before the model request. Synthetic/tool-continuation turns (developer/
-			// custom roles) and non-auto sessions are skipped. Never blocks the turn —
-			// failures fall back to a concrete level inside the helper.
-			if (this.#autoThinking && message.role === "user") {
-				await this.#applyAutoThinkingLevel(expandedText, generation);
+				await this.#armPlanYoloIfNeeded(admission?.manifest.effective);
+
+				// Build messages array (session context, eager todo prelude, then active prompt message)
+				const messages: AgentMessage[] = [];
+				const planReferenceMessage = await this.#buildPlanReferenceMessage?.();
+				if (planReferenceMessage) {
+					messages.push(planReferenceMessage);
+				}
+				const planModeMessage = await this.#buildPlanModeMessage();
+				if (planModeMessage) {
+					messages.push(planModeMessage);
+				}
+				const goalModeMessage = this.#buildGoalModeMessage();
+				if (goalModeMessage) {
+					messages.push(goalModeMessage);
+				}
+				const vibeModeMessage = this.#buildVibeModeMessage();
+				if (vibeModeMessage) {
+					messages.push(vibeModeMessage);
+				}
+				if (options?.prependMessages) {
+					messages.push(...options.prependMessages);
+				}
+
+				// Early bail-out: if a newer abort/prompt cycle started during setup,
+				// return before mutating shared state (nextTurn messages, system prompt).
 				if (this.#promptGeneration !== generation) {
 					return;
 				}
-			}
 
-			await this.#runPrePromptCompactionIfNeeded(messages);
-			if (this.#promptGeneration !== generation) {
-				return;
-			}
+				// A pending xd:// delta accompanies the next user-authored prompt,
+				// never an agent-initiated continuation.
+				const xdevMountNotice = isUserQueuedMessage(message) ? this.#takePendingXdevMountNotice() : undefined;
+				if (xdevMountNotice) {
+					messages.push(xdevMountNotice);
+				}
+				messages.push(message);
+				// Inject any pending "nextTurn" messages as context alongside the user message
+				for (const msg of this.#pendingNextTurnMessages) {
+					messages.push(msg);
+				}
+				this.#pendingNextTurnMessages = [];
 
-			const agentPromptOptions = options?.toolChoice ? { toolChoice: options.toolChoice } : undefined;
-			const nonMessageTokens = computeNonMessageTokens(this);
-			const contextWindow = this.model?.contextWindow ?? 0;
-			const breakdown = this.getContextBreakdown({ contextWindow, pendingMessages: messages });
-			const promptTokens =
-				breakdown?.usedTokens ??
-				nonMessageTokens +
-					this.messages.reduce((sum, msg) => sum + estimateTokens(msg), 0) +
-					messages.reduce((sum, msg) => sum + estimateTokens(msg), 0);
-			this.#setPendingContextSnapshot({
-				promptTokens,
-				nonMessageTokens,
-				cutoffCount: this.messages.length + messages.length,
+				// Auto-read @filepath mentions
+				const fileMentions = extractFileMentions(expandedText);
+				if (fileMentions.length > 0) {
+					const fileMentionMessages = await generateFileMentionMessages(
+						fileMentions,
+						this.sessionManager.getCwd(),
+						{
+							autoResizeImages: this.settings.get("images.autoResize"),
+							useHashLines: resolveFileDisplayMode(this).hashLines,
+							snapshotStore: getFileSnapshotStore(this),
+						},
+					);
+					for (const fileMentionMessage of fileMentionMessages) {
+						messages.push(await this.#normalizeAgentMessageImages(fileMentionMessage));
+					}
+				}
+
+				const beforeAgentStartSystemPrompt = await this.#buildSystemPromptForAgentStart(
+					expandedText,
+					admission?.manifest.effective,
+				);
+
+				// Emit before_agent_start extension event
+				if (this.#extensionRunner) {
+					const result = await this.#extensionRunner.emitBeforeAgentStart(
+						expandedText,
+						options?.images,
+						beforeAgentStartSystemPrompt,
+					);
+					if (result?.messages) {
+						const promptAttribution: "user" | "agent" | undefined =
+							"attribution" in message ? message.attribution : undefined;
+						for (const msg of result.messages) {
+							const normalized = normalizeCustomMessagePayload(msg);
+							const hasExplicitAttribution =
+								msg !== null &&
+								typeof msg === "object" &&
+								!Array.isArray(msg) &&
+								(msg.attribution === "user" || msg.attribution === "agent");
+							messages.push(
+								await this.#normalizeAgentMessageImages({
+									role: "custom",
+									customType: normalized.customType,
+									content: normalized.content,
+									display: normalized.display,
+									details: normalized.details,
+									attribution: hasExplicitAttribution
+										? normalized.attribution
+										: (promptAttribution ?? (message.role === "user" ? "user" : "agent")),
+									timestamp: Date.now(),
+								}),
+							);
+						}
+					}
+
+					if (result?.systemPrompt !== undefined) {
+						this.agent.setSystemPrompt(result.systemPrompt);
+					} else {
+						this.agent.setSystemPrompt(beforeAgentStartSystemPrompt);
+					}
+				} else {
+					this.agent.setSystemPrompt(beforeAgentStartSystemPrompt);
+				}
+
+				// Bail out if a newer abort/prompt cycle has started since we began setup
+				if (this.#promptGeneration !== generation) {
+					return;
+				}
+
+				// Auto thinking: classify this real user turn and set the effective level
+				// before the model request. Synthetic/tool-continuation turns (developer/
+				// custom roles) and non-auto sessions are skipped. Never blocks the turn —
+				// failures fall back to a concrete level inside the helper.
+				if (this.#autoThinking && message.role === "user") {
+					await this.#applyAutoThinkingLevel(expandedText, generation);
+					if (this.#promptGeneration !== generation) {
+						return;
+					}
+				}
+
+				await this.#runPrePromptCompactionIfNeeded(messages);
+				if (this.#promptGeneration !== generation) {
+					return;
+				}
+
+				const agentPromptOptions = options?.toolChoice ? { toolChoice: options.toolChoice } : undefined;
+				const nonMessageTokens = computeNonMessageTokens(this);
+				const contextWindow = this.model?.contextWindow ?? 0;
+				const breakdown = this.getContextBreakdown({ contextWindow, pendingMessages: messages });
+				const promptTokens =
+					breakdown?.usedTokens ??
+					nonMessageTokens +
+						this.messages.reduce((sum, msg) => sum + estimateTokens(msg), 0) +
+						messages.reduce((sum, msg) => sum + estimateTokens(msg), 0);
+				this.#setPendingContextSnapshot({
+					promptTokens,
+					nonMessageTokens,
+					cutoffCount: this.messages.length + messages.length,
+				});
+				try {
+					await this.#promptAgentWithIdleRetry(messages, agentPromptOptions);
+				} finally {
+					this.#setPendingContextSnapshot(undefined);
+				}
+				if (!options?.skipPostPromptRecoveryWait) {
+					await this.#waitForPostPromptRecovery(generation);
+				}
 			});
-			try {
-				await this.#promptAgentWithIdleRetry(messages, agentPromptOptions);
-			} finally {
-				this.#setPendingContextSnapshot(undefined);
-			}
-			if (!options?.skipPostPromptRecoveryWait) {
-				await this.#waitForPostPromptRecovery(generation);
-			}
 		} finally {
-			this.#endInFlight();
+			this.#endInFlight(admission);
 		}
 	}
 
@@ -8862,25 +9743,25 @@ export class AgentSession {
 	 * Try to execute an extension command. Returns true if command was found and executed.
 	 */
 	async #tryExecuteExtensionCommand(text: string): Promise<boolean> {
-		if (!this.#extensionRunner) return false;
-
+		const runner = this.#extensionRunner;
+		if (!runner) return false;
 		// Parse command name and args
 		const spaceIndex = text.indexOf(" ");
 		const commandName = spaceIndex === -1 ? text.slice(1) : text.slice(1, spaceIndex);
 		const args = spaceIndex === -1 ? "" : text.slice(spaceIndex + 1);
 
-		const command = this.#extensionRunner.getCommand(commandName);
+		const command = runner.getCommand(commandName);
 		if (!command) return false;
 
 		// Get command context from extension runner (includes session control methods)
-		const ctx = this.#extensionRunner.createCommandContext();
+		const ctx = runner.createCommandContext();
 
 		try {
 			await command.handler(args, ctx);
 			return true;
 		} catch (err) {
 			// Emit error via extension runner
-			this.#extensionRunner.emitError({
+			runner.emitError({
 				extensionPath: `command:${commandName}`,
 				event: "command",
 				error: err instanceof Error ? err.message : String(err),
@@ -8945,6 +9826,9 @@ export class AgentSession {
 				return { cancelled: !success };
 			},
 			reload: async () => {
+				if (this.isStreaming) {
+					throw new Error("Cannot reload session resources while the agent is running");
+				}
 				await this.reload();
 			},
 			getSystemPrompt: () => this.systemPrompt,
@@ -8967,46 +9851,89 @@ export class AgentSession {
 	 * If the command returns void, returns empty string to indicate it was handled.
 	 */
 	async #tryExecuteCustomCommand(text: string): Promise<string | null> {
-		if (this.#customCommands.length === 0 && this.#mcpPromptCommands.length === 0) return null;
-
-		// Parse command name and args
 		const spaceIndex = text.indexOf(" ");
 		const commandName = spaceIndex === -1 ? text.slice(1) : text.slice(1, spaceIndex);
 		const argsString = spaceIndex === -1 ? "" : text.slice(spaceIndex + 1);
-
-		// Find matching command
-		const loaded =
-			this.#customCommands.find(c => c.command.name === commandName) ??
-			this.#mcpPromptCommands.find(c => c.command.name === commandName);
-		if (!loaded) return null;
-
-		// Get command context from extension runner (includes session control methods)
-		const baseCtx = this.#createCommandContext();
-		const ctx = {
-			...baseCtx,
-			hasQueuedMessages: baseCtx.hasPendingMessages,
-		} as unknown as HookCommandContext;
-
-		try {
-			const args = parseCommandArgs(argsString);
-			const result = await loaded.command.execute(args, ctx);
-			// If result is a string, it's a prompt to send to LLM
-			// If void/undefined, command handled everything
-			return result ?? "";
-		} catch (err) {
-			// Emit error via extension runner
-			if (this.#extensionRunner) {
-				this.#extensionRunner.emitError({
-					extensionPath: `custom-command:${commandName}`,
-					event: "command",
-					error: err instanceof Error ? err.message : String(err),
-				});
-			} else {
-				const message = err instanceof Error ? err.message : String(err);
-				logger.error("Custom command failed", { commandName, error: message });
+		const createPrepared = (loaded: LoadedCustomCommand) => {
+			const baseContext = this.#createCommandContext();
+			return {
+				loaded,
+				commandName,
+				argsString,
+				context: {
+					...baseContext,
+					hasQueuedMessages: baseContext.hasPendingMessages,
+				} as unknown as HookCommandContext,
+			};
+		};
+		const executePrepared = async (prepared: {
+			readonly loaded: LoadedCustomCommand;
+			readonly commandName: string;
+			readonly argsString: string;
+			readonly context: HookCommandContext;
+		}): Promise<string> => {
+			try {
+				const args = parseCommandArgs(prepared.argsString);
+				const result = await prepared.loaded.command.execute(args, prepared.context);
+				return result ?? "";
+			} catch (error) {
+				if (this.#extensionRunner) {
+					this.#extensionRunner.emitError({
+						extensionPath: `custom-command:${prepared.commandName}`,
+						event: "command",
+						error: error instanceof Error ? error.message : String(error),
+					});
+				} else {
+					const message = error instanceof Error ? error.message : String(error);
+					logger.error("Custom command failed", { commandName: prepared.commandName, error: message });
+				}
+				return "";
 			}
-			return ""; // Command was handled (with error)
+		};
+
+		const admission = this.#resourceController ? await this.#resourceController.admit() : undefined;
+		let prepared:
+			| {
+					readonly loaded: LoadedCustomCommand;
+					readonly commandName: string;
+					readonly argsString: string;
+					readonly context: HookCommandContext;
+			  }
+			| undefined;
+		let isMcpPrompt = false;
+		try {
+			const customCommands = admission?.manifest.effective.commands.customCommands ?? this.#customCommands;
+			if (customCommands.length === 0 && this.#mcpPromptCommands.length === 0) return null;
+			const loaded =
+				customCommands.find(command => command.command.name === commandName) ??
+				this.#mcpPromptCommands.find(command => command.command.name === commandName);
+			if (!loaded) return null;
+			prepared = createPrepared(loaded);
+			isMcpPrompt = this.#mcpPromptCommands.includes(loaded);
+		} finally {
+			// Arbitrary extension commands may invoke context.reload(). Release their
+			// generation after selection so they cannot self-deadlock a transaction.
+			// MCP prompt commands are reselected under a dedicated MCP operation below.
+			admission?.release();
 		}
+		if (!prepared) return null;
+		if (!isMcpPrompt) return await executePrepared(prepared);
+
+		const operation = this.#mcpReloadTail.then(async () => {
+			const commandAdmission = this.#resourceController ? await this.#resourceController.admit() : undefined;
+			try {
+				const loaded = this.#mcpPromptCommands.find(command => command.command.name === commandName);
+				if (!loaded) return "";
+				return await executePrepared(createPrepared(loaded));
+			} finally {
+				commandAdmission?.release();
+			}
+		});
+		this.#mcpReloadTail = operation.then(
+			() => undefined,
+			() => undefined,
+		);
+		return await operation;
 	}
 
 	/**
@@ -9017,7 +9944,7 @@ export class AgentSession {
 			this.#throwIfExtensionCommand(text);
 		}
 
-		const expandedText = expandPromptTemplate(text, [...this.#promptTemplates]);
+		const expandedText = expandPromptTemplate(text, [...this.promptTemplates]);
 		await this.#queueUserMessage(expandedText, images, "steer");
 	}
 
@@ -9034,7 +9961,7 @@ export class AgentSession {
 		}
 
 		const expandedText =
-			options?.expandPromptTemplates === false ? text : expandPromptTemplate(text, [...this.#promptTemplates]);
+			options?.expandPromptTemplates === false ? text : expandPromptTemplate(text, [...this.promptTemplates]);
 		if (!options?.synthetic) {
 			await this.#queueUserMessage(expandedText, images, "followUp");
 			return;
@@ -9244,18 +10171,20 @@ export class AgentSession {
 		message: CustomMessage,
 		options?: { acceptTerminalEmptyStop?: boolean },
 	): Promise<void> {
-		this.#beginInFlight();
+		const admission = await this.#beginInFlight();
 		try {
-			const acceptTerminalEmptyStop = options?.acceptTerminalEmptyStop === true;
-			if (acceptTerminalEmptyStop) {
-				this.#resetPromptMaintenanceState();
-			}
-			this.#acceptTerminalEmptyStopForPrompt = acceptTerminalEmptyStop;
-			await this.agent.prompt(message);
-			await this.#waitForPostPromptRecovery();
+			await this.#resourceAdmissionContext.run(admission, async () => {
+				const acceptTerminalEmptyStop = options?.acceptTerminalEmptyStop === true;
+				if (acceptTerminalEmptyStop) {
+					this.#resetPromptMaintenanceState();
+				}
+				this.#acceptTerminalEmptyStopForPrompt = acceptTerminalEmptyStop;
+				await this.agent.prompt(message);
+				await this.#waitForPostPromptRecovery();
+			});
 		} finally {
 			this.#acceptTerminalEmptyStopForPrompt = false;
-			this.#endInFlight();
+			this.#endInFlight(admission);
 		}
 	}
 
@@ -9523,17 +10452,44 @@ export class AgentSession {
 	}
 
 	get skillsSettings(): SkillsSettings | undefined {
-		return this.#skillsSettings;
+		return this.#getSkillResources()?.settings ?? this.#skillsSettings;
 	}
 
 	/** Skills loaded by SDK (empty if --no-skills or skills: [] was passed) */
 	get skills(): readonly Skill[] {
-		return this.#skills;
+		return this.#getSkillResources()?.items ?? this.#skills;
 	}
 
 	/** Skill loading warnings captured by SDK */
 	get skillWarnings(): readonly SkillWarning[] {
-		return this.#skillWarnings;
+		return this.#getSkillResources()?.warnings ?? this.#skillWarnings;
+	}
+
+	/** Raw rules loaded for this session and forwarded to child sessions. */
+	get rules(): readonly Rule[] {
+		return this.#getRuleResources()?.all ?? [];
+	}
+
+	/** Rules addressable through rule:// after bucketing and TTSR filtering. */
+	get internalUrlRules(): readonly Rule[] {
+		const resources = this.#getRuleResources();
+		if (!resources) return [];
+		return [...resources.rulebook, ...resources.alwaysApply, ...resources.ttsrManager.getRules()];
+	}
+
+	get mcpManager() {
+		return this.#resourceController?.current.effective.mcp.manager;
+	}
+
+	getInternalUrlResolveContext(): ResolveContext {
+		return {
+			cwd: this.sessionManager.getCwd(),
+			settings: this.settings,
+			localProtocolOptions: this.#localProtocolOptions(),
+			skills: this.skills,
+			rules: this.internalUrlRules,
+			mcpManager: this.mcpManager,
+		};
 	}
 
 	getTodoPhases(): TodoPhase[] {
@@ -9738,6 +10694,10 @@ export class AgentSession {
 		}
 	}
 
+	async #disposeVibeSessionsForTransition(oldSessionId = this.sessionManager.getSessionId()): Promise<void> {
+		await this.#disposeVibeSessions?.(oldSessionId);
+	}
+
 	/**
 	 * Start a new session, optionally with initial messages and parent tracking.
 	 * Clears all messages and starts a new session.
@@ -9746,6 +10706,9 @@ export class AgentSession {
 	 * @returns true if completed, false if cancelled by hook
 	 */
 	async newSession(options?: NewSessionOptions): Promise<boolean> {
+		return this.#runVibeTransition(() => this.#newSession(options));
+	}
+	async #newSession(options?: NewSessionOptions): Promise<boolean> {
 		const previousSessionFile = this.sessionFile;
 
 		// Emit session_before_switch event with reason "new" (can be cancelled)
@@ -9759,6 +10722,8 @@ export class AgentSession {
 				return false;
 			}
 		}
+
+		await this.#disposeVibeSessionsForTransition();
 
 		this.#disconnectFromAgent();
 		await this.abort();
@@ -9845,8 +10810,11 @@ export class AgentSession {
 	 * @returns true if completed, false if cancelled by hook or not persisting
 	 */
 	async fork(): Promise<boolean> {
+		return this.#runVibeTransition(() => this.#fork());
+	}
+	async #fork(): Promise<boolean> {
 		const previousSessionFile = this.sessionFile;
-
+		const previousSessionId = this.sessionManager.getSessionId();
 		// Emit session_before_switch event with reason "fork" (can be cancelled)
 		if (this.#extensionRunner?.hasHandlers("session_before_switch")) {
 			const result = (await this.#extensionRunner.emit({
@@ -9858,6 +10826,7 @@ export class AgentSession {
 				return false;
 			}
 		}
+		await this.#disposeVibeSessionsForTransition(previousSessionId);
 
 		await this.#flushPendingBashMessages();
 		// Flush current session to ensure all entries are written
@@ -11140,6 +12109,10 @@ export class AgentSession {
 	 * @returns The handoff document text, or undefined if cancelled/failed
 	 */
 	async handoff(customInstructions?: string, options?: SessionHandoffOptions): Promise<HandoffResult | undefined> {
+		return this.#runVibeTransition(() => this.#handoff(customInstructions, options));
+	}
+	async #handoff(customInstructions?: string, options?: SessionHandoffOptions): Promise<HandoffResult | undefined> {
+		const previousSessionId = this.sessionManager.getSessionId();
 		const entries = this.sessionManager.getBranch();
 		const messageCount = entries.filter(e => e.type === "message").length;
 
@@ -11259,6 +12232,10 @@ export class AgentSession {
 					options?.onSwitchCancelled?.();
 					return undefined;
 				}
+			}
+			await this.#disposeVibeSessionsForTransition(previousSessionId);
+			if (handoffSignal.aborted) {
+				throw new Error("Handoff cancelled");
 			}
 			await this.#flushPendingBashMessages();
 			await this.sessionManager.flush();
@@ -16265,15 +17242,115 @@ export class AgentSession {
 	// =========================================================================
 
 	/**
-	 * Reload the current session from disk.
-	 *
-	 * Intended for extension commands and headless modes to re-read the current session
-	 * file and re-emit session_switch hooks.
+	 * Rediscover and atomically reconcile session resources. This works for
+	 * in-memory sessions and returns the manifest/status diagnostics to headless
+	 * control surfaces.
+	 */
+	async reloadResources(
+		domains?: readonly SessionResourceDomain[],
+		signal?: AbortSignal,
+	): Promise<SessionResourceReloadResult | undefined> {
+		const controller = this.#resourceController;
+		if (!controller) return undefined;
+		const result = await controller.reload(domains, signal);
+		this.#lastResourceReloadResult = result;
+		return result;
+	}
+
+	/**
+	 * Canonical plugin reload entry point shared by TUI, ACP, RPC, SDK, and
+	 * extension control surfaces. It owns cache invalidation, resource
+	 * reconciliation, and MCP reconnection so callers cannot accidentally refresh
+	 * only their command metadata while leaving the live session generation stale.
+	 */
+	async reloadPluginResources(signal?: AbortSignal): Promise<SessionResourceReloadResult | undefined> {
+		const execute = async (): Promise<SessionResourceReloadResult | undefined> => {
+			signal?.throwIfAborted();
+			const cwd = this.sessionManager.getCwd();
+			const projectPath = await resolveActiveProjectRegistryPath(cwd);
+			clearPluginRootsAndCaches(projectPath ? [projectPath] : undefined);
+			resetCapabilities();
+
+			const result = await this.reloadResources(undefined, signal);
+			if (!result || result.state === "failed") return result;
+
+			let mcpResult: MCPLoadResult | undefined;
+			let mcpFailure: unknown;
+			try {
+				mcpResult = await this.reloadMCPResources(signal);
+			} catch (error) {
+				mcpFailure = error;
+			}
+
+			const diagnostics = [...result.diagnostics];
+			if (mcpFailure !== undefined) {
+				diagnostics.push({
+					severity: "warning",
+					domain: "mcp",
+					message: mcpFailure instanceof Error ? mcpFailure.message : String(mcpFailure),
+					cause: mcpFailure,
+				});
+			}
+			if (mcpResult) {
+				for (const [server, message] of mcpResult.errors) {
+					diagnostics.push({
+						severity: "warning",
+						domain: "mcp",
+						message: `${server}: ${message}`,
+					});
+				}
+			}
+
+			const hasMcpWarnings = mcpFailure !== undefined || (mcpResult?.errors.size ?? 0) > 0;
+			const state = hasMcpWarnings
+				? "degraded"
+				: mcpResult && result.state === "unchanged"
+					? "applied"
+					: result.state;
+			const finalResult: SessionResourceReloadResult = {
+				state,
+				manifest: this.#resourceController?.current ?? result.manifest,
+				diagnostics: Object.freeze(diagnostics),
+			};
+			this.#lastResourceReloadResult = finalResult;
+			return finalResult;
+		};
+
+		const inheritedToken = this.#pluginReloadContext.getStore();
+		if (inheritedToken && this.#activePluginReloadTokens.has(inheritedToken)) {
+			return await execute();
+		}
+
+		const token = Symbol("plugin-reload");
+		const operation = this.#pluginReloadTail.then(() =>
+			this.#pluginReloadContext.run(token, async () => {
+				this.#activePluginReloadTokens.add(token);
+				try {
+					return await execute();
+				} finally {
+					this.#activePluginReloadTokens.delete(token);
+				}
+			}),
+		);
+		this.#pluginReloadTail = operation.then(
+			() => undefined,
+			() => undefined,
+		);
+		return await operation;
+	}
+
+	/**
+	 * Reconcile the current resource generation, then reload the transcript from
+	 * disk when this session has one. Extension and headless callers share this
+	 * entry point; in-memory sessions still receive resource updates.
 	 */
 	async reload(): Promise<void> {
+		const result = await this.reloadPluginResources();
+		if (result?.state === "failed") {
+			throw new Error(result.diagnostics.map(diagnostic => diagnostic.message).join("; "));
+		}
 		const sessionFile = this.sessionFile;
-		if (!sessionFile) return;
-		await this.switchSession(sessionFile);
+		if (sessionFile) await this.switchSession(sessionFile);
 	}
 
 	/**
@@ -16283,10 +17360,15 @@ export class AgentSession {
 	 * @returns true if switch completed, false if cancelled by hook
 	 */
 	async switchSession(sessionPath: string): Promise<boolean> {
+		return this.#runVibeTransition(() => this.#switchSession(sessionPath));
+	}
+	async #switchSession(sessionPath: string): Promise<boolean> {
 		const previousSessionFile = this.sessionManager.getSessionFile();
+		const previousSessionId = this.sessionManager.getSessionId();
 		const switchingToDifferentSession = previousSessionFile
 			? path.resolve(previousSessionFile) !== path.resolve(sessionPath)
 			: true;
+		let vibeSessionsDisposed = switchingToDifferentSession;
 		// Emit session_before_switch event (can be cancelled)
 		if (this.#extensionRunner?.hasHandlers("session_before_switch")) {
 			const result = (await this.#extensionRunner.emit({
@@ -16298,6 +17380,9 @@ export class AgentSession {
 			if (result?.cancel) {
 				return false;
 			}
+		}
+		if (switchingToDifferentSession) {
+			await this.#disposeVibeSessionsForTransition(previousSessionId);
 		}
 
 		this.#disconnectFromAgent();
@@ -16352,6 +17437,10 @@ export class AgentSession {
 
 		try {
 			await this.sessionManager.setSessionFile(sessionPath);
+			if (!vibeSessionsDisposed && this.sessionManager.getSessionId() !== previousSessionId) {
+				await this.#disposeVibeSessionsForTransition(previousSessionId);
+				vibeSessionsDisposed = true;
+			}
 			this.#markBashSessionTransition(bashTransition);
 			if (switchingToDifferentSession) {
 				this.#freshProviderSessionId = undefined;
@@ -16536,7 +17625,14 @@ export class AgentSession {
 		selectedText: string;
 		cancelled: boolean;
 	}> {
+		return this.#runVibeTransition(() => this.#branch(entryId));
+	}
+	async #branch(entryId: string): Promise<{
+		selectedText: string;
+		cancelled: boolean;
+	}> {
 		const previousSessionFile = this.sessionFile;
+		const previousSessionId = this.sessionManager.getSessionId();
 		const selectedEntry = this.sessionManager.getEntry(entryId);
 
 		if (selectedEntry?.type !== "message" || selectedEntry.message.role !== "user") {
@@ -16559,6 +17655,7 @@ export class AgentSession {
 			}
 			skipConversationRestore = result?.skipConversationRestore ?? false;
 		}
+		await this.#disposeVibeSessionsForTransition(previousSessionId);
 
 		// Clear pending messages (bound to old session state)
 		this.#pendingNextTurnMessages = [];
@@ -16617,7 +17714,14 @@ export class AgentSession {
 		question: string,
 		assistantMessage: AssistantMessage,
 	): Promise<{ cancelled: boolean; sessionFile: string | undefined }> {
+		return this.#runVibeTransition(() => this.#branchFromBtw(question, assistantMessage));
+	}
+	async #branchFromBtw(
+		question: string,
+		assistantMessage: AssistantMessage,
+	): Promise<{ cancelled: boolean; sessionFile: string | undefined }> {
 		const previousSessionFile = this.sessionFile;
+		const previousSessionId = this.sessionManager.getSessionId();
 		if (!this.sessionManager.getSessionFile()) {
 			throw new Error("Cannot branch /btw: session is not persisted");
 		}
@@ -16658,6 +17762,7 @@ export class AgentSession {
 		) {
 			throw new Error("Cannot branch /btw while session maintenance or user work is still running");
 		}
+		await this.#disposeVibeSessionsForTransition(previousSessionId);
 
 		this.#pendingNextTurnMessages = [];
 		this.#scheduledHiddenNextTurnGeneration = undefined;
@@ -17581,8 +18686,21 @@ export class AgentSession {
 	 *
 	 * @returns the number of advisors active after the rebuild.
 	 */
-	applyAdvisorConfigs(advisors: AdvisorConfig[], sharedInstructions: string | undefined): number {
-		this.#advisorConfigs = advisors;
+	async applyAdvisorConfigs(advisors: AdvisorConfig[], sharedInstructions: string | undefined): Promise<number> {
+		const nextAdvisors = [...advisors];
+		const controller = this.#resourceController;
+		if (controller) {
+			const resources = controller.current.effective.agents;
+			const result = await controller.replace("agents", {
+				...resources,
+				advisorConfigs: nextAdvisors,
+				advisorSharedInstructions: sharedInstructions,
+			});
+			if (result.state === "failed") {
+				throw new Error(result.diagnostics.map(diagnostic => diagnostic.message).join("; "));
+			}
+		}
+		this.#advisorConfigs = nextAdvisors;
 		this.#advisorSharedInstructions = sharedInstructions;
 		if (!this.#advisorEnabled) return 0;
 		this.#stopAdvisorRuntime();
@@ -17614,7 +18732,9 @@ export class AgentSession {
 	 * no servers) is absent.
 	 */
 	getAdvisorAvailableToolNames(): string[] {
-		return (this.#advisorTools ?? []).map(tool => tool.name);
+		const resources = this.#getAgentResources();
+		const tools = resources ? resources.advisorTools : (this.#advisorTools ?? []);
+		return tools.map(tool => tool.name);
 	}
 
 	/**

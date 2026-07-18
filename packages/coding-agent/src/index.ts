@@ -36,6 +36,7 @@ export * from "./modes";
 export * from "./modes/components";
 // Theme utilities for custom tools
 export * from "./modes/theme/theme";
+export * from "./runtime";
 // SDK for programmatic usage
 export * from "./sdk";
 export * from "./session/agent-session";
@@ -51,6 +52,8 @@ export * from "./session/session-listing";
 export * from "./session/session-loader";
 export * from "./session/session-manager";
 export * from "./session/session-migrations";
+export * from "./session/session-resource-contributions";
+export * from "./session/session-resource-runtime";
 export * from "./session/session-storage";
 export * from "./session/sql-session-storage";
 export * from "./task/executor";

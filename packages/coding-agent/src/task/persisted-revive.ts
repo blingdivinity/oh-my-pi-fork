@@ -2,7 +2,6 @@ import * as fs from "node:fs/promises";
 
 import type { ModelRegistry } from "../config/model-registry";
 import type { Settings } from "../config/settings";
-import { MCPManager } from "../mcp/manager";
 import type { PersistedSubagentReviverFactory } from "../registry/agent-lifecycle";
 import { AgentRegistry, MAIN_AGENT_ID } from "../registry/agent-registry";
 import { createAgentSession } from "../sdk";
@@ -79,10 +78,9 @@ export function createPersistedSubagentReviverFactory(
 			});
 			const artifactManager = ctx.session.sessionManager.getArtifactManager();
 			if (artifactManager) reopened.adoptArtifactManager(artifactManager);
-			// A restricted persisted contract must not consult process-global MCP
-			// state: same-name MCP tools are untrusted capability sources.
+			// A restricted persisted contract must not inherit MCP capabilities.
 			const restrictToolNames = init.restrictToolNames === true;
-			const mcpManager = restrictToolNames ? undefined : MCPManager.instance();
+			const mcpManager = restrictToolNames ? undefined : ctx.session.mcpManager;
 			const mcpProxyTools = mcpManager ? createMCPProxyTools(mcpManager) : [];
 			const { session } = await createAgentSession({
 				cwd: ctx.session.sessionManager.getCwd(),
@@ -109,6 +107,7 @@ export function createPersistedSubagentReviverFactory(
 				spawns: init.spawns ?? "",
 				hasUI: false,
 				enableLsp: restrictToolNames ? false : ctx.enableLsp,
+				asyncJobManager: ctx.session.asyncJobManager,
 				...(restrictToolNames
 					? {
 							enableIrc: false,

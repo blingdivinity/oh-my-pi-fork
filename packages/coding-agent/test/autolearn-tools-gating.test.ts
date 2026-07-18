@@ -4,7 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { getManagedSkillsDir } from "@oh-my-pi/pi-coding-agent/autolearn/managed-skills";
 import { type SettingPath, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
-import { resetActiveSkillsForTests, type Skill, setActiveSkills } from "@oh-my-pi/pi-coding-agent/extensibility/skills";
+import type { Skill } from "@oh-my-pi/pi-coding-agent/extensibility/skills";
 import type { HindsightSessionState } from "@oh-my-pi/pi-coding-agent/hindsight/state";
 import type { MnemopiSessionState } from "@oh-my-pi/pi-coding-agent/mnemopi/state";
 import { createTools, type ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
@@ -119,11 +119,11 @@ describe("manage_skill execute", () => {
 	afterEach(async () => {
 		spyOn(os, "homedir").mockRestore();
 		setAgentDir(originalAgentDir);
-		resetActiveSkillsForTests();
 		await removeWithRetries(tempHome);
 	});
 
-	const tool = () => ManageSkillTool.createIf(makeSession({ "autolearn.enabled": true }))!;
+	const tool = (skills: readonly Skill[] = []) =>
+		ManageSkillTool.createIf(makeSession({ "autolearn.enabled": true }, { skills }))!;
 
 	it("create writes the managed SKILL.md; delete removes it", async () => {
 		const file = path.join(getManagedSkillsDir(), "demo", "SKILL.md");
@@ -163,9 +163,8 @@ describe("manage_skill execute", () => {
 				level: "user",
 			},
 		};
-		setActiveSkills([authored]);
 
-		const result = await tool().execute("c", {
+		const result = await tool([authored]).execute("c", {
 			action: "create",
 			name: "demo",
 			description: "When to demo.",
@@ -180,6 +179,24 @@ describe("manage_skill execute", () => {
 		// Nothing was written, so the managed skill can never surface.
 		expect(await Bun.file(path.join(getManagedSkillsDir(), "demo", "SKILL.md")).exists()).toBe(false);
 	});
+
+	it("refuses create when the session skill snapshot is unavailable", async () => {
+		const unavailableTool = ManageSkillTool.createIf(makeSession({ "autolearn.enabled": true }))!;
+		const result = await unavailableTool.execute("missing-snapshot", {
+			action: "create",
+			name: "unsafe",
+			description: "When to use this skill.",
+			body: "# Unsafe",
+		});
+
+		expect(result.isError).toBe(true);
+		expect(result.details).toEqual({
+			action: "create",
+			name: "unsafe",
+			skillSnapshotUnavailable: true,
+		});
+		expect(await Bun.file(path.join(getManagedSkillsDir(), "unsafe", "SKILL.md")).exists()).toBe(false);
+	});
 });
 
 describe("learn execute", () => {
@@ -187,7 +204,7 @@ describe("learn execute", () => {
 	let remembered: string[];
 	let originalAgentDir: string;
 
-	function learnSession(): ToolSession {
+	function learnSession(includeSkillSnapshot = true): ToolSession {
 		const fakeState = {
 			sessionId: "sess-1",
 			session: { sessionManager: { getCwd: () => "/tmp/work" } },
@@ -198,7 +215,10 @@ describe("learn execute", () => {
 		};
 		return makeSession(
 			{ "autolearn.enabled": true, "memory.backend": "mnemopi" },
-			{ getMnemopiSessionState: () => fakeState as unknown as MnemopiSessionState },
+			{
+				getMnemopiSessionState: () => fakeState as unknown as MnemopiSessionState,
+				...(includeSkillSnapshot ? { skills: [] } : {}),
+			},
 		);
 	}
 
@@ -241,6 +261,18 @@ describe("learn execute", () => {
 		).rejects.toThrow(/Lesson stored, but the managed skill could not be written/);
 		// The memory half still ran.
 		expect(remembered).toHaveLength(1);
+	});
+
+	it("stores the lesson but refuses skill creation without a session skill snapshot", async () => {
+		const result = await new LearnTool(learnSession(false)).execute("missing-snapshot", {
+			memory: "Keep this lesson.",
+			skill: { action: "create", name: "unsafe", description: "When to use this skill.", body: "# Unsafe" },
+		});
+
+		expect(remembered).toEqual(["Keep this lesson."]);
+		expect(result.isError).toBe(true);
+		expect(result.details).toEqual({ skill: null, skillSnapshotUnavailable: true });
+		expect(await Bun.file(path.join(getManagedSkillsDir(), "unsafe", "SKILL.md")).exists()).toBe(false);
 	});
 
 	it("reports Hindsight lessons as queued rather than stored", async () => {

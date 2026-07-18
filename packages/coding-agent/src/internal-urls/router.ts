@@ -1,9 +1,9 @@
 /**
  * Internal URL router for internal protocols (`agent://`, `artifact://`, `history://`, `issue://`, `local://`, `mcp://`, `memory://`, `omp://`, `pr://`, `rule://`, `skill://`, `ssh://`, `vault://`, and `xd://`).
  *
- * One process-global router with one handler per scheme. Access via
- * `InternalUrlRouter.instance()`. Handlers are stateless; per-session and
- * shared state lives in `./state.ts`.
+ * One shared router with one stateless handler per scheme. Access via
+ * `InternalUrlRouter.instance()` and pass session-bound resources in
+ * `ResolveContext`.
  */
 import { AgentProtocolHandler } from "./agent-protocol";
 import { ArtifactProtocolHandler } from "./artifact-protocol";

@@ -24,13 +24,14 @@ import { logger, TempDir } from "@oh-my-pi/pi-utils";
 import { type } from "arktype";
 import { ModelRegistry } from "../src/config/model-registry";
 import { resetSettingsForTest, Settings } from "../src/config/settings";
-import { loadExtensions } from "../src/extensibility/extensions/loader";
+import { ExtensionRuntime, loadExtensionFromFactory, loadExtensions } from "../src/extensibility/extensions/loader";
 import { ExtensionRunner } from "../src/extensibility/extensions/runner";
 import { InteractiveMode } from "../src/modes/interactive-mode";
 import { initTheme } from "../src/modes/theme/theme";
 import { AgentSession } from "../src/session/agent-session";
 import { AuthStorage } from "../src/session/auth-storage";
 import { SessionManager } from "../src/session/session-manager";
+import { EventBus } from "../src/utils/event-bus";
 
 function makeTool(name: string): AgentTool {
 	return {
@@ -117,7 +118,7 @@ describe("extension autocomplete provider API (#4919)", () => {
 		resetSettingsForTest();
 	});
 
-	function createHarness(): { mode: InteractiveMode; session: AgentSession } {
+	function createHarness(extensionRunner?: ExtensionRunner): { mode: InteractiveMode; session: AgentSession } {
 		const manager = SessionManager.create(tempDir.path(), path.join(tempDir.path(), `active-${Bun.nanoseconds()}`));
 		const created = new AgentSession({
 			agent: new Agent({
@@ -134,6 +135,7 @@ describe("extension autocomplete provider API (#4919)", () => {
 			modelRegistry: registry,
 			toolRegistry: new Map(tools.map(tool => [tool.name, tool])),
 			promptTemplates: [],
+			extensionRunner,
 		});
 		const createdMode = new InteractiveMode(created, "test");
 		session = created;
@@ -226,6 +228,26 @@ export default function (pi) {
 		const values = chained?.items.map(item => item.value) ?? [];
 		expect(values).toContain("##fff-first");
 		expect(values).toContain("##fff-second");
+	});
+
+	it("routes extension command reloads through the interactive generation cutover", async () => {
+		const runtime = new ExtensionRuntime();
+		const loaded = await loadExtensionFromFactory(() => {}, tempDir.path(), new EventBus(), runtime);
+		const runner = new ExtensionRunner([loaded], runtime, tempDir.path(), SessionManager.inMemory(), registry);
+		const created = createHarness(runner);
+		const reloadPluginState = vi.spyOn(created.mode, "reloadPluginState").mockResolvedValue(undefined);
+		const directSessionReload = vi
+			.spyOn(created.session, "reload")
+			.mockRejectedValue(new Error("bypassed interactive cutover"));
+		vi.spyOn(created.mode, "renderInitialMessages").mockImplementation(() => {});
+		vi.spyOn(created.mode, "reloadTodos").mockResolvedValue();
+		vi.spyOn(created.mode, "showStatus").mockImplementation(() => {});
+		await created.mode.initHooksAndCustomTools();
+
+		await runner.createCommandContext().reload();
+
+		expect(reloadPluginState).toHaveBeenCalledTimes(1);
+		expect(directSessionReload).not.toHaveBeenCalled();
 	});
 
 	it("skips broken factories without losing core autocomplete or healthy wrappers", async () => {

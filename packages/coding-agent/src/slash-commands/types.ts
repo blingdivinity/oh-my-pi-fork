@@ -2,6 +2,7 @@ import type { Settings } from "../config/settings";
 import type { InteractiveModeContext } from "../modes/types";
 import type { AgentSession } from "../session/agent-session";
 import type { SessionManager } from "../session/session-manager";
+import type { SessionResourceReloadResult } from "../session/session-resource-runtime";
 
 /** Declarative subcommand definition for commands like /mcp. */
 export interface SubcommandDef {
@@ -69,7 +70,7 @@ export interface SlashCommandRuntime {
 	 * `/move`, and `/marketplace`/`/plugins` mutations so the session sees a
 	 * consistent view after plugin or project-scope changes.
 	 */
-	reloadPlugins: () => Promise<void>;
+	reloadPlugins: () => Promise<SessionResourceReloadResult | undefined>;
 	notifyTitleChanged?: () => Promise<void> | void;
 	notifyConfigChanged?: () => Promise<void> | void;
 }

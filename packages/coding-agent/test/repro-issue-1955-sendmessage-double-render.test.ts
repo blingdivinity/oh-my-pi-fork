@@ -76,6 +76,7 @@ function createHarness(): Harness {
 		) => {
 			capturedActions = a;
 		},
+		activate: async () => {},
 		onError: () => {},
 		emit: async () => undefined,
 		getMessageRenderer: () => undefined,

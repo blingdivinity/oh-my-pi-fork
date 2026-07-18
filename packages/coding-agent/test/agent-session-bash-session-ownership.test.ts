@@ -50,6 +50,7 @@ describe("AgentSession bash session ownership", () => {
 		sessionManager: SessionManager = SessionManager.inMemory(tempDir.path()),
 		extensionRunner?: ExtensionRunner,
 		responseContent: () => string[] = () => ["Done"],
+		disposeVibeSessions?: (ownerSessionId: string) => Promise<void>,
 	): AgentSession {
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
 		if (!model) throw new Error("Expected claude-sonnet-4-5 model to exist");
@@ -66,6 +67,7 @@ describe("AgentSession bash session ownership", () => {
 			settings: Settings.isolated({ "compaction.enabled": false }),
 			modelRegistry,
 			extensionRunner,
+			disposeVibeSessions,
 		});
 		return session;
 	}
@@ -89,6 +91,213 @@ describe("AgentSession bash session ownership", () => {
 		if (!sessionFile) throw new Error("Expected persisted session file");
 		return sessionFile;
 	}
+
+	it("awaits old-session vibe disposal before changing session identity", async () => {
+		const cleanupStarted = Promise.withResolvers<string>();
+		const releaseCleanup = Promise.withResolvers<void>();
+		createSession(undefined, undefined, undefined, async ownerSessionId => {
+			cleanupStarted.resolve(ownerSessionId);
+			await releaseCleanup.promise;
+		});
+		const oldSessionId = session.sessionId;
+
+		const transition = session.newSession();
+		expect(await cleanupStarted.promise).toBe(oldSessionId);
+		expect(session.sessionId).toBe(oldSessionId);
+
+		releaseCleanup.resolve();
+		expect(await transition).toBe(true);
+		expect(session.sessionId).not.toBe(oldSessionId);
+	});
+
+	it("awaits vibe disposal before fork changes the session identity", async () => {
+		const cleanupStarted = Promise.withResolvers<string>();
+		const releaseCleanup = Promise.withResolvers<void>();
+		const sessionDir = path.join(tempDir.path(), "sessions");
+		createSession(SessionManager.create(tempDir.path(), sessionDir), undefined, undefined, async ownerSessionId => {
+			cleanupStarted.resolve(ownerSessionId);
+			await releaseCleanup.promise;
+		});
+		await seedPersistedSession();
+		const oldSessionId = session.sessionId;
+
+		const transition = session.fork();
+		expect(await cleanupStarted.promise).toBe(oldSessionId);
+		expect(session.sessionId).toBe(oldSessionId);
+
+		releaseCleanup.resolve();
+		expect(await transition).toBe(true);
+		expect(session.sessionId).not.toBe(oldSessionId);
+	});
+
+	it("keeps the old identity when vibe disposal fails", async () => {
+		const disposeVibeSessions = vi.fn(async () => {
+			throw new Error("vibe cleanup failed");
+		});
+		const sessionDir = path.join(tempDir.path(), "sessions");
+		createSession(SessionManager.create(tempDir.path(), sessionDir), undefined, undefined, disposeVibeSessions);
+		await seedPersistedSession();
+		const oldSessionId = session.sessionId;
+
+		await expect(session.fork()).rejects.toThrow("vibe cleanup failed");
+		expect(disposeVibeSessions).toHaveBeenCalledWith(oldSessionId);
+		expect(session.sessionId).toBe(oldSessionId);
+	});
+
+	it("awaits vibe disposal before switching to a different session", async () => {
+		const cleanupStarted = Promise.withResolvers<string>();
+		const releaseCleanup = Promise.withResolvers<void>();
+		const sessionDir = path.join(tempDir.path(), "sessions");
+		createSession(SessionManager.create(tempDir.path(), sessionDir), undefined, undefined, async ownerSessionId => {
+			cleanupStarted.resolve(ownerSessionId);
+			await releaseCleanup.promise;
+		});
+		await seedPersistedSession();
+		const oldSessionId = session.sessionId;
+		const targetManager = SessionManager.create(tempDir.path(), sessionDir);
+		targetManager.appendMessage({ role: "user", content: "target", timestamp: Date.now() });
+		targetManager.appendMessage(createAssistantMessage("target reply"));
+		await targetManager.ensureOnDisk();
+		const targetFile = targetManager.getSessionFile();
+		if (!targetFile) throw new Error("Expected target session file");
+		await targetManager.close();
+
+		const transition = session.switchSession(targetFile);
+		expect(await cleanupStarted.promise).toBe(oldSessionId);
+		expect(session.sessionId).toBe(oldSessionId);
+
+		releaseCleanup.resolve();
+		expect(await transition).toBe(true);
+		expect(session.sessionId).not.toBe(oldSessionId);
+	});
+
+	it("awaits vibe disposal before branching from a user entry", async () => {
+		const cleanupStarted = Promise.withResolvers<string>();
+		const releaseCleanup = Promise.withResolvers<void>();
+		const sessionDir = path.join(tempDir.path(), "sessions");
+		createSession(SessionManager.create(tempDir.path(), sessionDir), undefined, undefined, async ownerSessionId => {
+			cleanupStarted.resolve(ownerSessionId);
+			await releaseCleanup.promise;
+		});
+		await seedPersistedSession();
+		const userEntry = session.sessionManager
+			.getEntries()
+			.find(entry => entry.type === "message" && entry.message.role === "user");
+		if (!userEntry) throw new Error("Expected user entry for branch");
+		const oldSessionId = session.sessionId;
+
+		const transition = session.branch(userEntry.id);
+		expect(await cleanupStarted.promise).toBe(oldSessionId);
+		expect(session.sessionId).toBe(oldSessionId);
+
+		releaseCleanup.resolve();
+		expect((await transition).cancelled).toBe(false);
+		expect(session.sessionId).not.toBe(oldSessionId);
+	});
+
+	it("awaits vibe disposal before branching from /btw", async () => {
+		const cleanupStarted = Promise.withResolvers<string>();
+		const releaseCleanup = Promise.withResolvers<void>();
+		const sessionDir = path.join(tempDir.path(), "sessions");
+		createSession(SessionManager.create(tempDir.path(), sessionDir), undefined, undefined, async ownerSessionId => {
+			cleanupStarted.resolve(ownerSessionId);
+			await releaseCleanup.promise;
+		});
+		await seedPersistedSession();
+		const assistantMessage = session.getLastAssistantMessage();
+		if (!assistantMessage) throw new Error("Expected assistant message for /btw branch");
+		const oldSessionId = session.sessionId;
+
+		const transition = session.branchFromBtw("btw question", assistantMessage);
+		expect(await cleanupStarted.promise).toBe(oldSessionId);
+		expect(session.sessionId).toBe(oldSessionId);
+
+		releaseCleanup.resolve();
+		expect((await transition).cancelled).toBe(false);
+		expect(session.sessionId).not.toBe(oldSessionId);
+	});
+
+	it("does not dispose vibe sessions when reloading the same session file", async () => {
+		const disposeVibeSessions = vi.fn(async () => {});
+		const sessionDir = path.join(tempDir.path(), "sessions");
+		createSession(SessionManager.create(tempDir.path(), sessionDir), undefined, undefined, disposeVibeSessions);
+		const sessionFile = await seedPersistedSession();
+
+		expect(await session.switchSession(sessionFile)).toBe(true);
+		expect(disposeVibeSessions).not.toHaveBeenCalled();
+	});
+
+	it("does not dispose vibe sessions when a transition is cancelled", async () => {
+		const extensionRunner = {
+			hasHandlers: vi.fn(() => true),
+			emit: vi.fn().mockResolvedValue({ cancel: true }),
+		} as unknown as ExtensionRunner;
+		const disposeVibeSessions = vi.fn(async () => {});
+		createSession(undefined, extensionRunner, undefined, disposeVibeSessions);
+
+		expect(await session.newSession()).toBe(false);
+		expect(disposeVibeSessions).not.toHaveBeenCalled();
+	});
+
+	it("fences vibe work before transition hooks and rejects overlap", async () => {
+		const hookStarted = Promise.withResolvers<void>();
+		const releaseHook = Promise.withResolvers<void>();
+		const extensionRunner = {
+			hasHandlers: vi.fn((eventType: string) => eventType === "session_before_switch"),
+			emit: vi.fn(async (event: { type: string }) => {
+				if (event.type === "session_before_switch") {
+					hookStarted.resolve();
+					await releaseHook.promise;
+				}
+				return undefined;
+			}),
+		} as unknown as ExtensionRunner;
+		createSession(undefined, extensionRunner);
+
+		const transition = session.newSession();
+		await hookStarted.promise;
+		expect(() => session.assertVibeExecutionAllowed()).toThrow("identity transition");
+		await expect(session.newSession()).rejects.toThrow("already in progress");
+
+		releaseHook.resolve();
+		expect(await transition).toBe(true);
+		expect(session.assertVibeExecutionAllowed()).toBeUndefined();
+	});
+
+	it("releases the vibe fence after a cancelled or failed transition", async () => {
+		const cancelledRunner = {
+			hasHandlers: vi.fn(() => true),
+			emit: vi.fn().mockResolvedValue({ cancel: true }),
+		} as unknown as ExtensionRunner;
+		createSession(undefined, cancelledRunner);
+		expect(await session.newSession()).toBe(false);
+		expect(session.assertVibeExecutionAllowed()).toBeUndefined();
+
+		await session.dispose();
+
+		const failedRunner = {
+			hasHandlers: vi.fn(() => true),
+			emit: vi.fn().mockRejectedValue(new Error("hook failed")),
+		} as unknown as ExtensionRunner;
+		createSession(undefined, failedRunner);
+		await expect(session.newSession()).rejects.toThrow("hook failed");
+		expect(session.assertVibeExecutionAllowed()).toBeUndefined();
+	});
+
+	it("disposes the current vibe owner exactly once after fencing admissions", async () => {
+		const disposeVibeSessions = vi.fn(async (ownerSessionId: string) => {
+			expect(ownerSessionId).toBe(session.sessionId);
+		});
+		createSession(undefined, undefined, undefined, disposeVibeSessions);
+		const ownerSessionId = session.sessionId;
+
+		await session.dispose();
+		await session.dispose();
+
+		expect(disposeVibeSessions).toHaveBeenCalledTimes(1);
+		expect(disposeVibeSessions).toHaveBeenCalledWith(ownerSessionId);
+		expect(() => session.assertVibeExecutionAllowed()).toThrow("disposal has begun");
+	});
 
 	it("does not flush a pending bash result into a replacement session", async () => {
 		createSession();
@@ -203,67 +412,68 @@ describe("AgentSession bash session ownership", () => {
 		).toBe(true);
 	});
 
-	it.each(["new", "switch", "branch"] as const)(
-		"records a late bash result in its original session after %s",
-		async transition => {
-			const sessionDir = path.join(tempDir.path(), "sessions");
-			const { completion, emitUserBash, extensionRunner } = createGatedBashRunner();
-			createSession(SessionManager.create(tempDir.path(), sessionDir), extensionRunner);
-			const oldSessionFile = await seedPersistedSession();
-			const oldSessionId = session.sessionId;
+	it.each([
+		"new",
+		"switch",
+		"branch",
+	] as const)("records a late bash result in its original session after %s", async transition => {
+		const sessionDir = path.join(tempDir.path(), "sessions");
+		const { completion, emitUserBash, extensionRunner } = createGatedBashRunner();
+		createSession(SessionManager.create(tempDir.path(), sessionDir), extensionRunner);
+		const oldSessionFile = await seedPersistedSession();
+		const oldSessionId = session.sessionId;
 
-			const bashPromise = session.executeBash("old-session-command");
-			expect(emitUserBash).toHaveBeenCalledTimes(1);
+		const bashPromise = session.executeBash("old-session-command");
+		expect(emitUserBash).toHaveBeenCalledTimes(1);
 
-			switch (transition) {
-				case "new":
-					await session.newSession();
-					break;
-				case "switch": {
-					const targetManager = SessionManager.create(tempDir.path(), sessionDir);
-					targetManager.appendMessage({ role: "user", content: "target", timestamp: Date.now() });
-					targetManager.appendMessage(createAssistantMessage("target reply"));
-					await targetManager.ensureOnDisk();
-					const targetFile = targetManager.getSessionFile();
-					if (!targetFile) throw new Error("Expected target session file");
-					await targetManager.close();
-					await session.switchSession(targetFile);
-					break;
-				}
-				case "branch": {
-					const userEntry = session.sessionManager
-						.getEntries()
-						.find(entry => entry.type === "message" && entry.message.role === "user");
-					if (!userEntry) throw new Error("Expected user entry for branch");
-					await session.branch(userEntry.id);
-					break;
-				}
+		switch (transition) {
+			case "new":
+				await session.newSession();
+				break;
+			case "switch": {
+				const targetManager = SessionManager.create(tempDir.path(), sessionDir);
+				targetManager.appendMessage({ role: "user", content: "target", timestamp: Date.now() });
+				targetManager.appendMessage(createAssistantMessage("target reply"));
+				await targetManager.ensureOnDisk();
+				const targetFile = targetManager.getSessionFile();
+				if (!targetFile) throw new Error("Expected target session file");
+				await targetManager.close();
+				await session.switchSession(targetFile);
+				break;
 			}
+			case "branch": {
+				const userEntry = session.sessionManager
+					.getEntries()
+					.find(entry => entry.type === "message" && entry.message.role === "user");
+				if (!userEntry) throw new Error("Expected user entry for branch");
+				await session.branch(userEntry.id);
+				break;
+			}
+		}
 
-			expect(session.sessionId).not.toBe(oldSessionId);
-			completion.resolve({ result: bashResult });
-			await bashPromise;
+		expect(session.sessionId).not.toBe(oldSessionId);
+		completion.resolve({ result: bashResult });
+		await bashPromise;
 
-			expect(
-				session.messages.some(
-					message => message.role === "bashExecution" && message.command === "old-session-command",
-				),
-			).toBe(false);
+		expect(
+			session.messages.some(
+				message => message.role === "bashExecution" && message.command === "old-session-command",
+			),
+		).toBe(false);
 
-			const oldSession = await SessionManager.open(oldSessionFile, sessionDir, undefined, {
-				initialCwd: tempDir.path(),
-				suppressBreadcrumb: true,
-			});
-			additionalManagers.push(oldSession);
-			const oldMessages = oldSession.getBranch().flatMap(entry => (entry.type === "message" ? [entry.message] : []));
-			expect(oldMessages.slice(-3).map(message => message.role)).toEqual(["user", "assistant", "bashExecution"]);
-			expect(oldMessages.at(-1)).toMatchObject({
-				role: "bashExecution",
-				command: "old-session-command",
-				output: "old-output",
-			});
-		},
-	);
+		const oldSession = await SessionManager.open(oldSessionFile, sessionDir, undefined, {
+			initialCwd: tempDir.path(),
+			suppressBreadcrumb: true,
+		});
+		additionalManagers.push(oldSession);
+		const oldMessages = oldSession.getBranch().flatMap(entry => (entry.type === "message" ? [entry.message] : []));
+		expect(oldMessages.slice(-3).map(message => message.role)).toEqual(["user", "assistant", "bashExecution"]);
+		expect(oldMessages.at(-1)).toMatchObject({
+			role: "bashExecution",
+			command: "old-session-command",
+			output: "old-output",
+		});
+	});
 
 	it("stores minimized bash output with the originating session", async () => {
 		const sessionDir = path.join(tempDir.path(), "sessions");

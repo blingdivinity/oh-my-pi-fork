@@ -514,6 +514,14 @@
       "types": "./src/secrets/*.ts",
       "import": "./src/secrets/*.ts"
     },
+    "./runtime": {
+      "types": "./src/runtime/index.ts",
+      "import": "./src/runtime/index.ts"
+    },
+    "./runtime/*": {
+      "types": "./src/runtime/*.ts",
+      "import": "./src/runtime/*.ts"
+    },
     "./session/*": {
       "types": "./src/session/*.ts",
       "import": "./src/session/*.ts"

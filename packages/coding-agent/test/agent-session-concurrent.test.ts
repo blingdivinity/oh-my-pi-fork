@@ -68,7 +68,6 @@ describe("AgentSession concurrent prompt guard", () => {
 			removeSyncWithRetries(tempDir);
 		}
 		vi.restoreAllMocks();
-		AsyncJobManager.resetForTests();
 	});
 
 	async function createSession(settingsOverrides?: Partial<Record<SettingPath, unknown>>) {
@@ -931,7 +930,6 @@ describe("AgentSession concurrent prompt guard", () => {
 				);
 			},
 		});
-		AsyncJobManager.setInstance(asyncJobManager);
 
 		session = new AgentSession({
 			agent,
@@ -1002,7 +1000,6 @@ describe("AgentSession concurrent prompt guard", () => {
 				delivered.push(jobId);
 			},
 		});
-		AsyncJobManager.setInstance(asyncJobManager);
 
 		const agentA = new Agent({
 			getApiKey: () => "test-key",

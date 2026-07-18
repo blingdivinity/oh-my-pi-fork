@@ -21,7 +21,6 @@ import type { AsyncJob, AsyncJobManager } from "../async/job-manager";
 import { resolveAgentModelPatterns } from "../config/model-resolver";
 import type { LocalProtocolOptions } from "../internal-urls";
 import { registerArtifactsDir } from "../internal-urls/registry-helpers";
-import { MCPManager } from "../mcp/manager";
 import vibeTurnResultTemplate from "../prompts/tools/vibe-turn-result.md" with { type: "text" };
 import { AgentLifecycleManager } from "../registry/agent-lifecycle";
 import { AgentRegistry, MAIN_AGENT_ID } from "../registry/agent-registry";
@@ -80,6 +79,7 @@ interface VibeTurn {
 
 interface VibeRecord {
 	id: string;
+	executorId: string;
 	cli: VibeCli;
 	ownerId: string;
 	agent: AgentDefinition;
@@ -106,6 +106,10 @@ interface VibeRecord {
 	queue: string[];
 	turnCount: number;
 	killed: boolean;
+}
+
+function executorIdFor(ownerId: string, visibleId: string): string {
+	return `vibe-${encodeURIComponent(ownerId)}-${visibleId}`;
 }
 
 /**
@@ -188,10 +192,21 @@ function mergeTrace(turn: VibeTurn, progress: AgentProgress): void {
 export class VibeTurnError extends Error {}
 
 /**
- * Process-global registry of vibe worker sessions, scoped per owner agent id
- * (same convention as AsyncJobManager owner filters). The interactive mode
- * kills an owner's sessions on vibe-mode exit via {@link killAll}.
+ * Process-global registry of vibe worker sessions, scoped per logical tool
+ * session. The interactive mode kills a session's workers on vibe-mode exit
+ * via {@link killAll}.
  */
+function requireVibeOwner(id: string | null | undefined): string {
+	if (typeof id !== "string" || id.trim().length === 0) {
+		throw new ToolError("Vibe sessions require a stable session identity.");
+	}
+	return id.trim();
+}
+
+export function resolveVibeOwner(session: ToolSession): string {
+	return requireVibeOwner(session.getSessionId?.());
+}
+
 export class VibeSessionRegistry {
 	static #global: VibeSessionRegistry | undefined;
 
@@ -207,7 +222,11 @@ export class VibeSessionRegistry {
 		VibeSessionRegistry.#global = undefined;
 	}
 
-	readonly #records = new Map<string, VibeRecord>();
+	#assertAllowed(session: ToolSession): void {
+		session.assertVibeExecutionAllowed?.();
+	}
+
+	readonly #records = new Map<string, Map<string, VibeRecord>>();
 
 	#manager(session: ToolSession): AsyncJobManager {
 		const manager = session.asyncJobManager;
@@ -218,9 +237,9 @@ export class VibeSessionRegistry {
 	}
 
 	#record(owner: string, id: string): VibeRecord {
-		const record = this.#records.get(id.trim());
-		if (!record || record.ownerId !== owner) {
-			const roster = this.listIds(owner);
+		const record = this.#records.get(owner)?.get(id.trim());
+		if (!record) {
+			const roster = this.#listIds(owner);
 			throw new ToolError(
 				`Unknown vibe session "${id}".${roster.length > 0 ? ` Active sessions: ${roster.join(", ")}` : " No sessions — spawn one with vibe_spawn."}`,
 			);
@@ -228,12 +247,18 @@ export class VibeSessionRegistry {
 		return record;
 	}
 
-	listIds(owner: string): string[] {
+	#listIds(owner: string): string[] {
 		const ids: string[] = [];
-		for (const record of this.#records.values()) {
-			if (record.ownerId === owner && record.state !== "dead") ids.push(record.id);
+		for (const record of this.#records.get(owner)?.values() ?? []) {
+			if (record.state !== "dead") ids.push(record.id);
 		}
 		return ids;
+	}
+
+	listIds(session: ToolSession): string[] {
+		this.#assertAllowed(session);
+
+		return this.#listIds(resolveVibeOwner(session));
 	}
 
 	/**
@@ -242,14 +267,14 @@ export class VibeSessionRegistry {
 	 * tool, and streamed text tail. All strings are one-line sanitized here so
 	 * renderers can print them verbatim.
 	 */
-	screens(owner: string, ids?: string[]): VibeScreenSnapshot[] {
+	screens(session: ToolSession, ids?: string[]): VibeScreenSnapshot[] {
+		this.#assertAllowed(session);
+
+		const owner = resolveVibeOwner(session);
 		const wanted = ids?.length ? new Set(ids.map(id => id.trim())) : undefined;
-		const records: VibeRecord[] = [];
-		for (const record of this.#records.values()) {
-			if (record.ownerId !== owner) continue;
-			if (wanted && !wanted.has(record.id)) continue;
-			records.push(record);
-		}
+		const records = [...(this.#records.get(owner)?.values() ?? [])].filter(
+			record => !wanted || wanted.has(record.id),
+		);
 		// Stable TV-wall ordering: spawn order, not activity order.
 		records.sort((a, b) => a.createdAt - b.createdAt);
 		return records.map(record => ({
@@ -277,7 +302,9 @@ export class VibeSessionRegistry {
 
 	/** Spawn a persistent worker session and start its first turn in the background. */
 	async spawn(session: ToolSession, args: { cli: VibeCli; name?: string; prompt: string }): Promise<VibeSpawnOutcome> {
-		const owner = session.getAgentId?.() ?? MAIN_AGENT_ID;
+		this.#assertAllowed(session);
+
+		const owner = resolveVibeOwner(session);
 		const manager = this.#manager(session);
 		const agentName = VIBE_CLI_AGENT[args.cli];
 		const agent = getBundledAgent(agentName);
@@ -299,9 +326,15 @@ export class VibeSessionRegistry {
 		}
 		const requestedName = args.name?.replace(/[^A-Za-z0-9_-]+/g, "").slice(0, 48);
 		const id = await session.agentOutputManager.allocate(requestedName || generateTaskName());
+		this.#assertAllowed(session);
+		const currentOwner = resolveVibeOwner(session);
+		if (currentOwner !== owner) {
+			throw new ToolError("Vibe session identity changed while spawning.");
+		}
 
 		const record: VibeRecord = {
 			id,
+			executorId: executorIdFor(owner, id),
 			cli: args.cli,
 			ownerId: owner,
 			agent,
@@ -313,13 +346,16 @@ export class VibeSessionRegistry {
 			turnCount: 0,
 			killed: false,
 		};
-		this.#records.set(id, record);
+		const ownerRecords = this.#records.get(owner) ?? new Map<string, VibeRecord>();
+		ownerRecords.set(id, record);
+		this.#records.set(owner, ownerRecords);
 
 		try {
 			const jobId = this.#registerTurnJob(session, manager, record, args.prompt, { first: true });
 			return { id, jobId };
 		} catch (error) {
-			this.#records.delete(id);
+			ownerRecords.delete(id);
+			if (ownerRecords.size === 0) this.#records.delete(owner);
 			throw error;
 		}
 	}
@@ -330,7 +366,9 @@ export class VibeSessionRegistry {
 	 * background turn immediately.
 	 */
 	async send(session: ToolSession, args: { session: string; message: string }): Promise<VibeSendOutcome> {
-		const owner = session.getAgentId?.() ?? MAIN_AGENT_ID;
+		this.#assertAllowed(session);
+
+		const owner = resolveVibeOwner(session);
 		const record = this.#record(owner, args.session);
 		if (record.state === "dead") {
 			throw new ToolError(`Vibe session "${record.id}" is dead. Spawn a new one with vibe_spawn.`);
@@ -339,7 +377,7 @@ export class VibeSessionRegistry {
 		if (!message) throw new ToolError("Message must not be empty.");
 
 		if (record.turn) {
-			const live = AgentRegistry.global().get(record.id)?.session;
+			const live = AgentRegistry.global().get(record.executorId)?.session;
 			if (live?.isStreaming) {
 				await live.steer(message);
 				record.lastActivityAt = Date.now();
@@ -365,14 +403,16 @@ export class VibeSessionRegistry {
 		session: ToolSession,
 		args: { sessions?: string[]; timeoutMs?: number; signal?: AbortSignal },
 	): Promise<VibeWaitOutcome> {
-		const owner = session.getAgentId?.() ?? MAIN_AGENT_ID;
+		this.#assertAllowed(session);
+		const owner = resolveVibeOwner(session);
 		const manager = this.#manager(session);
 		// Named sessions are watched regardless of state (a just-settled turn is
 		// reported from its retained job); the no-args form watches every
 		// session with a turn actually in flight.
+		const ownerRecords = this.#records.get(owner);
 		const watched = args.sessions?.length
 			? args.sessions.map(id => this.#record(owner, id))
-			: [...this.#records.values()].filter(record => record.ownerId === owner && record.turn !== undefined);
+			: [...(ownerRecords?.values() ?? [])].filter(record => record.turn !== undefined);
 
 		// Snapshot each watched turn's job at entry: #finishTurn installs a
 		// queued follow-up turn inside the settling job's callback (before that
@@ -442,16 +482,18 @@ export class VibeSessionRegistry {
 
 	/** Terminate a worker: cancel its in-flight turn and dispose + unregister its session. */
 	async kill(session: ToolSession, id: string): Promise<VibeKillOutcome> {
-		const owner = session.getAgentId?.() ?? MAIN_AGENT_ID;
+		this.#assertAllowed(session);
+		const owner = resolveVibeOwner(session);
 		const record = this.#record(owner, id);
 		return this.#killRecord(record, session.asyncJobManager);
 	}
 
-	/** Kill every session belonging to `owner` (vibe-mode exit / teardown). Returns the number killed. */
-	async killAll(owner: string, manager?: AsyncJobManager): Promise<number> {
+	/** Kill every session belonging to a session id (vibe-mode exit / teardown). */
+	async killAll(ownerSessionId: string | null | undefined, manager?: AsyncJobManager): Promise<number> {
+		const owner = requireVibeOwner(ownerSessionId);
 		let killed = 0;
-		for (const record of this.#records.values()) {
-			if (record.ownerId !== owner || record.state === "dead") continue;
+		for (const record of this.#records.get(owner)?.values() ?? []) {
+			if (record.state === "dead") continue;
 			await this.#killRecord(record, manager);
 			killed++;
 		}
@@ -469,7 +511,7 @@ export class VibeSessionRegistry {
 		record.lastActivityAt = Date.now();
 		record.lastActivity = "killed";
 		try {
-			await AgentLifecycleManager.global().release(record.id);
+			await AgentLifecycleManager.global().release(record.executorId);
 		} catch (error) {
 			logger.warn("vibe: failed to release worker session", {
 				id: record.id,
@@ -503,7 +545,7 @@ export class VibeSessionRegistry {
 			assignment: message,
 			description: `vibe ${record.cli} session`,
 			index: 0,
-			id: record.id,
+			id: record.executorId,
 			taskDepth: session.taskDepth ?? 0,
 			detached: true,
 			modelOverride: record.modelOverride,
@@ -519,12 +561,13 @@ export class VibeSessionRegistry {
 			authStorage: session.authStorage,
 			modelRegistry: session.modelRegistry,
 			settings: session.settings,
-			mcpManager: session.mcpManager ?? MCPManager.instance(),
+			mcpManager: session.mcpManager,
+			asyncJobManager: session.asyncJobManager,
 			contextFiles: session.contextFiles?.filter(file => path.basename(file.path).toLowerCase() !== "agents.md"),
 			skills: [...(session.skills ?? [])],
 			workspaceTree: session.workspaceTree,
 			promptTemplates: session.promptTemplates,
-			rules: session.rules,
+			rules: session.rules ? [...session.rules] : undefined,
 			preloadedExtensionPaths: session.extensionPaths,
 			preloadedCustomToolPaths: session.customToolPaths,
 			localProtocolOptions,
@@ -583,7 +626,7 @@ export class VibeSessionRegistry {
 					const result = options.first
 						? await runSubprocess(await this.#buildSpawnOptions(session, record, message, signal, onProgress))
 						: await runSubagentFollowUpTurn({
-								id: record.id,
+								id: record.executorId,
 								agent: record.agent,
 								message,
 								description: `vibe ${record.cli} session`,
@@ -603,7 +646,7 @@ export class VibeSessionRegistry {
 					);
 				}
 			},
-			{ id: `${record.id}-t${turnIndex}`, agentId: record.id, ownerId: record.ownerId },
+			{ id: `${record.executorId}-t${turnIndex}`, agentId: record.executorId, ownerId: record.ownerId },
 		);
 		turn.jobId = jobId;
 		record.turn = turn;
@@ -622,7 +665,7 @@ export class VibeSessionRegistry {
 		}
 		// A spawn that failed before its session ever registered leaves nothing
 		// to continue — mark the record dead so sends fail with clear guidance.
-		record.state = AgentRegistry.global().get(record.id) ? "idle" : "dead";
+		record.state = AgentRegistry.global().get(record.executorId) ? "idle" : "dead";
 		if (record.state === "dead" || record.queue.length === 0) return;
 		const nextMessage = record.queue.splice(0, record.queue.length).join("\n\n");
 		try {
