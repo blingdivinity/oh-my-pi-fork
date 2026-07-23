@@ -13,6 +13,7 @@ import {
 import { Loader, Markdown, padding, Spacer, Text, visibleWidth } from "@oh-my-pi/pi-tui";
 import { formatDuration, Snowflake, sanitizeText } from "@oh-my-pi/pi-utils";
 import { shouldEnableAppendOnlyContext } from "../../config/append-only-context-mode";
+import { type BashResult, isPersistentShellCdCommand } from "../../exec/bash-executor";
 import { type LoadedCustomShare, loadCustomShare } from "../../export/custom-share";
 import { shareSession } from "../../export/share";
 import type { CompactOptions } from "../../extensibility/extensions/types";
@@ -1107,6 +1108,12 @@ export class CommandController {
 
 	async handleBashCommand(command: string, excludeFromContext = false): Promise<void> {
 		const isDeferred = this.ctx.session.isStreaming;
+		const shouldPersistCwd = isPersistentShellCdCommand(command);
+		if (isDeferred && shouldPersistCwd) {
+			this.ctx.showWarning("Wait for the current response to finish or abort it before changing directories.");
+			return;
+		}
+
 		this.ctx.bashComponent = new BashExecutionComponent(command, this.ctx.ui, excludeFromContext);
 
 		if (isDeferred) {
@@ -1127,13 +1134,21 @@ export class CommandController {
 				},
 				{ excludeFromContext, useUserShell: true },
 			);
-
 			if (this.ctx.bashComponent) {
 				const meta = outputMeta().truncationFromSummary(result, { direction: "tail" }).get();
 				this.ctx.bashComponent.setComplete(result.exitCode, result.cancelled, {
 					output: result.output,
 					truncation: meta?.truncation,
 				});
+			}
+			try {
+				if (shouldPersistCwd) await this.#applyBashResultCwd(result);
+			} catch (error) {
+				this.ctx.showError(
+					`Bash command completed, but OMP failed to update its working directory: ${
+						error instanceof Error ? error.message : "Unknown error"
+					}`,
+				);
 			}
 		} catch (error) {
 			if (this.ctx.bashComponent) {
@@ -1144,6 +1159,31 @@ export class CommandController {
 
 		this.ctx.bashComponent = undefined;
 		this.ctx.ui.requestRender();
+	}
+
+	async #moveInteractiveCwd(resolvedPath: string): Promise<void> {
+		await this.ctx.sessionManager.moveTo(resolvedPath);
+		await this.ctx.applyCwdChange(resolvedPath);
+		this.ctx.updateEditorBorderColor();
+		await this.ctx.reloadTodos();
+	}
+
+	async #applyBashResultCwd(result: BashResult): Promise<void> {
+		if (result.cancelled || result.exitCode !== 0 || !result.workingDir) return;
+		if (!path.isAbsolute(result.workingDir)) return;
+
+		const resolvedPath = path.resolve(result.workingDir);
+		if (resolvedPath === path.resolve(this.ctx.sessionManager.getCwd())) return;
+
+		let isDirectory = false;
+		try {
+			isDirectory = (await fs.stat(resolvedPath)).isDirectory();
+		} catch {
+			isDirectory = false;
+		}
+		if (!isDirectory) return;
+
+		await this.#moveInteractiveCwd(resolvedPath);
 	}
 
 	async handlePythonCommand(code: string, excludeFromContext = false): Promise<void> {
@@ -1278,7 +1318,7 @@ export class CommandController {
 
 			compactingLoader.stop();
 			this.ctx.statusContainer.disposeChildren();
-			this.ctx.rebuildChatFromMessages();
+			this.ctx.rebuildChatFromMessages({ reuseSettledComponents: true });
 
 			this.ctx.statusLine.invalidate();
 			// Same as the auto-compaction rebuild: a collapsed transcript is an
@@ -1824,17 +1864,34 @@ export function renderUsageReports(
 			for (const line of resetAccountLines) lines.push(uiTheme.fg("dim", line));
 		}
 
+		// Order account columns ONCE per provider (worst-first), then apply that
+		// same order to every window group. Sorting each group independently by
+		// its own used fraction (issue #6067) desynchronized the columns: an
+		// account exhausted on its 5h window but light on the weekly window would
+		// land in different column positions on each row, so the positional
+		// `account N` labels denoted different credentials per row and an
+		// exhausted limit appeared under a sibling that still had quota.
+		const accountRank = new Map<UsageReport, number>();
+		providerReports.forEach((report, position) => {
+			const worst = report.limits.reduce((max, limit) => {
+				const fraction = resolveUsedFraction(limit) ?? -1;
+				return fraction > max ? fraction : max;
+			}, -1);
+			// Encode worst-first primary key with the stable position as tiebreak
+			// so accounts tied on pressure keep their discovery order.
+			accountRank.set(report, -worst * 1000 + position);
+		});
+
 		const renderableGroups = Array.from(limitGroups.values()).map(group => {
 			const entries = group.limits.map((limit, index) => ({
 				limit,
 				report: group.reports[index],
-				fraction: resolveUsedFraction(limit),
 				index,
 			}));
 			entries.sort((a, b) => {
-				const aFraction = a.fraction ?? -1;
-				const bFraction = b.fraction ?? -1;
-				if (aFraction !== bFraction) return bFraction - aFraction;
+				const aRank = accountRank.get(a.report) ?? a.index;
+				const bRank = accountRank.get(b.report) ?? b.index;
+				if (aRank !== bRank) return aRank - bRank;
 				return a.index - b.index;
 			});
 			const sortedLimits = entries.map(entry => entry.limit);

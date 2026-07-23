@@ -22,6 +22,7 @@ import type { ToolSession } from "..";
 import type { Theme } from "../modes/theme/theme";
 import subagentUserPromptTemplate from "../prompts/system/subagent-user-prompt.md" with { type: "text" };
 import taskDescriptionTemplate from "../prompts/tools/task.md" with { type: "text" };
+import taskAsyncContractTemplate from "../prompts/tools/task-async-contract.md" with { type: "text" };
 import taskSummaryTemplate from "../prompts/tools/task-summary.md" with { type: "text" };
 import { truncateForPrompt } from "../tools/approval";
 import { isIrcEnabled } from "../tools/hub";
@@ -520,6 +521,17 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 	readonly summary = "Spawn subagents to complete delegated tasks";
 	readonly strict = false;
 	readonly loadMode = "essential";
+	// Arktype validates model calls against the active wire schema, but the flat
+	// single-spawn schema carries `"+": "delete"`: a batch `{ context, tasks[] }`
+	// payload has those keys stripped, then fails on the now-missing `task` with
+	// the misleading `task must be a string (was missing)`. That preempts the
+	// tool's own actionable shape checks (`validateShapeParams` /
+	// `validateSpawnParams`), which never run. Lenient validation forwards the
+	// raw args to `execute()` on any arktype failure so those checks surface the
+	// real reason ("enable task.batch, or use the flat `task` shape"). Valid
+	// calls still normalize through arktype; `execute()` resolves `agent`
+	// defaults independently, so the success path is unchanged.
+	readonly lenientArgValidation = true;
 	readonly renderResult = renderResult;
 	// Suppress the streaming call preview once a (partial or final) result exists
 	// so the task renders as ONE block that transitions in place — not a pending
@@ -895,14 +907,16 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			failedSchedules.length > 0
 				? ` Failed to schedule ${failedSchedules.length} spawn${failedSchedules.length === 1 ? "" : "s"}: ${failedSchedules.join("; ")}.`
 				: "";
-		const coordinationHint =
+		const coordinationHint = [
 			started.length === 1
 				? ircEnabled
 					? `DM \`${started[0].agentId}\` via \`hub\` send to coordinate while it runs; use \`hub\` only to inspect (\`jobs\`), wait, or cancel a stuck task.`
 					: `Use \`hub\` to inspect (\`jobs\`), wait, or cancel a stuck task.`
 				: ircEnabled
 					? `DM these ids via \`hub\` send to coordinate while they run; use \`hub\` only to inspect (\`jobs\`), wait, or cancel a stuck task.`
-					: `Use \`hub\` to inspect (\`jobs\`), wait, or cancel a stuck task by id.`;
+					: `Use \`hub\` to inspect (\`jobs\`), wait, or cancel a stuck task by id.`,
+			taskAsyncContractTemplate.trim(),
+		].join("\n");
 
 		if (syncSpawns.length === 0) {
 			if (spawns.length === 1) {
@@ -916,7 +930,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						content: [
 							{
 								type: "text",
-								text: `Spawned agent \`${agentId}\` (job \`${jobId}\`). The result will be delivered when it yields. ${coordinationHint}`,
+								text: `Spawned agent \`${agentId}\` (job \`${jobId}\`). Its result auto-delivers on yield unless a settled \`hub jobs\`/\`wait\` snapshot consumes it first. ${coordinationHint}`,
 							},
 						],
 						details: buildAsyncDetails(),
@@ -933,7 +947,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 					content: [
 						{
 							type: "text",
-							text: `Spawned ${started.length} background agents using ${agentLabel}.${scheduleFailureSummary} Each result will be delivered when that agent yields.\n${startedListing}\n${coordinationHint}`,
+							text: `Spawned ${started.length} background agents using ${agentLabel}.${scheduleFailureSummary} Each result auto-delivers on yield unless a settled \`hub jobs\`/\`wait\` snapshot consumes it first.\n${startedListing}\n${coordinationHint}`,
 						},
 					],
 					details: buildAsyncDetails(),
@@ -998,7 +1012,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 
 		const spawnedSummary =
 			started.length > 0
-				? `Spawned ${started.length} background agent${started.length === 1 ? "" : "s"}.${scheduleFailureSummary} Each result will be delivered when that agent yields.\n${started.map(({ agentId, jobId }) => `- \`${agentId}\` (job \`${jobId}\`)`).join("\n")}\n${coordinationHint}`
+				? `Spawned ${started.length} background agent${started.length === 1 ? "" : "s"}.${scheduleFailureSummary} Each result auto-delivers on yield unless a settled \`hub jobs\`/\`wait\` snapshot consumes it first.\n${started.map(({ agentId, jobId }) => `- \`${agentId}\` (job \`${jobId}\`)`).join("\n")}\n${coordinationHint}`
 				: scheduleFailureSummary.trim();
 		const text = [merged.contentParts.join("\n\n"), spawnedSummary]
 			.filter(section => section.trim().length > 0)
@@ -1079,12 +1093,41 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				try {
 					markRunning();
 					progress.status = "running";
-					await reportProgress(`Running background task ${agentId}...`);
+					await reportProgress(
+						`Running background task ${agentId}...`,
+						buildDetails() as unknown as Record<string, unknown>,
+					);
+					const forwardSyncProgress: AgentToolUpdateCallback<TaskToolDetails> = async update => {
+						const nextProgress = update.details?.progress?.[0];
+						if (nextProgress) {
+							// The job body owns status and identity (id/index/agent);
+							// copy only the live metrics the subagent streams so the
+							// polling row reflects the resolved model, reasoning level,
+							// and running counters without reverting the "running"
+							// status back to the subagent's initial "pending" snapshot.
+							progress.resolvedModel = nextProgress.resolvedModel;
+							progress.tokens = nextProgress.tokens;
+							progress.requests = nextProgress.requests;
+							progress.contextTokens = nextProgress.contextTokens;
+							progress.contextWindow = nextProgress.contextWindow;
+							progress.cost = nextProgress.cost;
+							progress.toolCount = nextProgress.toolCount;
+							progress.currentTool = nextProgress.currentTool;
+							progress.lastIntent = nextProgress.lastIntent;
+							progress.recentTools = nextProgress.recentTools.slice();
+							progress.recentOutput = nextProgress.recentOutput.slice();
+							progress.retryState = nextProgress.retryState;
+							progress.retryFailure = nextProgress.retryFailure;
+						}
+						const updateText =
+							update.content.find(part => part.type === "text")?.text ?? `Running background task ${agentId}...`;
+						await reportProgress(updateText, buildDetails() as unknown as Record<string, unknown>);
+					};
 					const result = await this.#executeSync(
 						toolCallId,
 						spawnParams,
 						runSignal,
-						undefined,
+						forwardSyncProgress,
 						agentId,
 						progress.index,
 						true,
@@ -1105,11 +1148,16 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 					progress.extractedToolData = singleResult?.extractedToolData;
 					progress.retryFailure = singleResult?.retryFailure;
 					progress.retryState = undefined;
+					if (singleResult?.resolvedModel) {
+						progress.resolvedModel = singleResult.resolvedModel;
+					} else {
+						delete progress.resolvedModel;
+					}
 					onSettled?.(resultFailed);
 					const statusText = resultFailed
 						? `Background task ${agentId} failed.`
 						: `Background task ${agentId} complete.`;
-					await reportProgress(statusText);
+					await reportProgress(statusText, buildDetails() as unknown as Record<string, unknown>);
 					const deliveryText = `${finalText}${buildFollowUpHint(singleResult?.aborted === true)}`;
 					if (resultFailed) {
 						// Mark the job itself failed; the failed agent stays interrogable.
@@ -1124,7 +1172,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 					progress.durationMs = Math.max(0, Date.now() - startedAt);
 					onSettled?.(true);
 					const statusText = `Background task ${agentId} failed.`;
-					await reportProgress(statusText);
+					await reportProgress(statusText, buildDetails() as unknown as Record<string, unknown>);
 					const message = error instanceof Error ? error.message : String(error);
 					const hint = AgentRegistry.global().get(agentId) ? buildFollowUpHint(false) : "";
 					throw new TaskJobError(`${message}${hint}`);

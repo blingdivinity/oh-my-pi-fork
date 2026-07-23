@@ -32,6 +32,7 @@ import { type AgentDefinition, type AgentProgress, oneLineLabel, type SingleResu
 import type { ToolSession } from "../tools";
 import { formatDuration } from "../tools/render-utils";
 import { ToolError } from "../tools/tool-errors";
+import { calculateTokensPerSecond } from "../utils/token-rate";
 
 /** The two worker CLI flavors the director drives. */
 export type VibeCli = "fast" | "good";
@@ -226,6 +227,29 @@ export class VibeSessionRegistry {
 		session.assertVibeExecutionAllowed?.();
 	}
 
+	/**
+	 * Insert a bare worker record without the spawn/job machinery. Test-only —
+	 * lets {@link aggregateVibeWorkerTokensPerSecond} be exercised against a
+	 * fake roster + AgentRegistry session without driving a real turn.
+	 */
+	registerRecordForTests(record: { id: string; cli?: VibeCli; ownerId: string; state?: VibeSessionState }): void {
+		const ownerRecords = this.#records.get(record.ownerId) ?? new Map<string, VibeRecord>();
+		ownerRecords.set(record.id, {
+			id: record.id,
+			executorId: record.id,
+			cli: record.cli ?? "fast",
+			ownerId: record.ownerId,
+			agent: getBundledAgent("sonic")!,
+			state: record.state ?? "running",
+			createdAt: Date.now(),
+			lastActivityAt: Date.now(),
+			queue: [],
+			turnCount: 0,
+			killed: false,
+		});
+		this.#records.set(record.ownerId, ownerRecords);
+	}
+
 	readonly #records = new Map<string, Map<string, VibeRecord>>();
 
 	#manager(session: ToolSession): AsyncJobManager {
@@ -253,6 +277,24 @@ export class VibeSessionRegistry {
 			if (record.state !== "dead") ids.push(record.id);
 		}
 		return ids;
+	}
+
+	/** Aggregate streaming token throughput for one session-scoped owner roster. */
+	aggregateTokensPerSecond(ownerId: string): number | null {
+		let total = 0;
+		let any = false;
+		const registry = AgentRegistry.global();
+		for (const record of this.#records.get(ownerId)?.values() ?? []) {
+			if (record.state === "dead") continue;
+			const workerSession = registry.get(record.executorId)?.session;
+			if (!workerSession?.isStreaming) continue;
+			const rate = calculateTokensPerSecond(workerSession.state.messages, true);
+			if (rate !== null) {
+				total += rate;
+				any = true;
+			}
+		}
+		return any ? total : null;
 	}
 
 	listIds(session: ToolSession): string[] {
@@ -750,4 +792,19 @@ export class VibeSessionRegistry {
 		if (failed) throw new VibeTurnError(text);
 		return text;
 	}
+}
+
+/**
+ * Aggregate tok/s across every live vibe worker session owned by `ownerId`.
+ * Returns null when no workers are streaming (so callers can fall back to
+ * their own rate unchanged). The director is often idle while workers stream,
+ * so without this aggregation the status-line tok/s badge would show a stale
+ * value while parallel work is actively generating tokens.
+ *
+ * Reads each worker's last assistant message via {@link calculateTokensPerSecond}
+ * — the same leaf calculator the main status line uses — so worker rates are
+ * computed identically to the main session's rate.
+ */
+export function aggregateVibeWorkerTokensPerSecond(ownerId: string): number | null {
+	return VibeSessionRegistry.global().aggregateTokensPerSecond(ownerId);
 }

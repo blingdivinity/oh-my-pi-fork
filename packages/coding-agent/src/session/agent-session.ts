@@ -31,6 +31,8 @@ import {
 	type AgentMessage,
 	type AgentState,
 	type AgentTool,
+	type AgentToolCall,
+	type AgentToolContext,
 	type AgentToolResult,
 	type AgentTurnEndContext,
 	AppendOnlyContextManager,
@@ -38,6 +40,7 @@ import {
 	type CompactionSummaryMessage,
 	countTokens,
 	createToolScopedAbortReason,
+	isSyntheticToolResultMessage,
 	resolveTelemetry,
 	type StreamFn,
 	TERMINAL_TOOL_RESULT_ABORT_REASON,
@@ -64,6 +67,7 @@ import {
 	estimateTokens,
 	generateBranchSummary,
 	generateHandoffFromContext,
+	invalidateMessageCache,
 	prepareCompaction,
 	renderHandoffPrompt,
 	resolveBudgetReserveTokens,
@@ -105,6 +109,7 @@ import type {
 	TextContent,
 	ToolCall,
 	ToolChoice,
+	ToolResultMessage,
 	Usage,
 	UsageReport,
 } from "@oh-my-pi/pi-ai";
@@ -122,6 +127,7 @@ import {
 } from "@oh-my-pi/pi-ai";
 import * as AIError from "@oh-my-pi/pi-ai/error";
 import { resetOpenAICodexHistoryAfterCompaction } from "@oh-my-pi/pi-ai/providers/openai-codex-responses";
+import { kCursorExecResolved } from "@oh-my-pi/pi-ai/utils/block-symbols";
 import { toolWireSchema } from "@oh-my-pi/pi-ai/utils/schema";
 import { GeminiHeaderRunDetector, isGeminiThinkingModel } from "@oh-my-pi/pi-ai/utils/thinking-loop";
 import { type RepeatedToolCallDetection, ToolCallLoopGuard } from "@oh-my-pi/pi-ai/utils/tool-call-loop-guard";
@@ -138,6 +144,7 @@ import {
 	getInstallId,
 	isBunTestRuntime,
 	isEnoent,
+	isInteractiveHost,
 	logger,
 	postmortem,
 	prompt,
@@ -264,7 +271,7 @@ import {
 	estimateToolSchemaTokens,
 } from "../modes/utils/context-usage";
 import { containsWorkflow, renderWorkflowNotice } from "../modes/workflow";
-import { resolveApprovedPlan } from "../plan-mode/approved-plan";
+import { type PlanApprovalDetails, resolveApprovedPlan } from "../plan-mode/approved-plan";
 import { createPlanReadMatcher } from "../plan-mode/plan-protection";
 import type { PlanModeState } from "../plan-mode/state";
 import advisorSystemPrompt from "../prompts/advisor/system.md" with { type: "text" };
@@ -304,6 +311,7 @@ import type { ReconcileState } from "../runtime/runtime-manifest";
 import {
 	deobfuscateAssistantContent,
 	deobfuscateSessionContext,
+	deobfuscateToolArguments,
 	obfuscateMessages,
 	obfuscateProviderContext,
 	type SecretObfuscator,
@@ -322,6 +330,7 @@ import {
 } from "../thinking";
 import { formatTitleConversationContext, type TitleConversationTurn } from "../tiny/message-preproc";
 import { shutdownTinyTitleClient } from "../tiny/title-client";
+import { type AskToolDetails, type AskToolInput, recoverAskQuestions } from "../tools/ask";
 import { assertEditableFile } from "../tools/auto-generated-guard";
 import { releaseTabsForOwner } from "../tools/browser/tab-supervisor";
 import { isMCPToolName, normalizeToolNames } from "../tools/builtin-names";
@@ -907,6 +916,16 @@ export interface PlanYolo {
 // Types
 // ============================================================================
 
+/** Identifies a retry fallback chain already entered during startup model resolution. */
+export interface InitialRetryFallbackState {
+	/** Role whose configured primary was unavailable. */
+	role: string;
+	/** Configured primary selector retained for restoration when it becomes available. */
+	originalSelector: string;
+	/** Thinking selector configured for the unavailable primary. */
+	originalThinkingLevel: ConfiguredThinkingLevel | undefined;
+}
+
 export interface AgentSessionConfig {
 	agent: Agent;
 	sessionManager: SessionManager;
@@ -917,6 +936,8 @@ export interface AgentSessionConfig {
 	scopedModels?: Array<{ model: Model; thinkingLevel?: ThinkingLevel }>;
 	/** Initial session thinking selector. */
 	thinkingLevel?: ConfiguredThinkingLevel;
+	/** Retry chain ownership when startup selected one of its fallback entries. */
+	initialRetryFallback?: InitialRetryFallbackState;
 	/** Prewalk from the starting model to a fast/cheap target at the first edit/write once the todo list exists. */
 	prewalk?: Prewalk;
 	/** Force read-only plan mode at start, auto-approve on the model's first
@@ -1744,6 +1765,25 @@ function isAdvisorCard(message: AgentMessage): message is CustomMessage {
 	return message.role === "custom" && message.customType === "advisor";
 }
 
+/**
+ * Emit a warn-level log for a turn that ended in a provider error so recurring
+ * stream failures are diagnosable from the main log alone. The `agent_end`
+ * routing trace is debug-only and omits the error fields; without this a
+ * session dying on provider errors leaves only `stopReason:"error"` debug lines
+ * and the real cause lives solely in the session transcript (issue #6177).
+ * No-op for any non-error stop reason.
+ */
+export function logProviderTurnError(msg: AssistantMessage): void {
+	if (msg.stopReason !== "error") return;
+	logger.warn("agent turn ended with provider error", {
+		provider: msg.provider,
+		model: msg.model,
+		errorMessage: msg.errorMessage,
+		errorStatus: msg.errorStatus,
+		errorId: msg.errorId,
+	});
+}
+
 function isTerminalTextAssistantAnswer(message: AgentMessage | undefined): message is AssistantMessage {
 	if (message?.role !== "assistant" || message.stopReason !== "stop") return false;
 	let hasText = false;
@@ -1961,6 +2001,8 @@ export class AgentSession {
 	 *  suppresses advisor concern/blocker auto-resume until the user next resumes.
 	 *  Advisor advice is still recorded into the transcript, just not auto-run. */
 	#advisorAutoResumeSuppressed = false;
+	/** Print-mode sessions preserve advisor notes without starting hidden primary turns. */
+	#preserveAdvisorAdvice = false;
 	#advisorPrimaryTurnsCompleted = 0;
 	#advisorInterruptImmuneTurnStart: number | undefined;
 	#planModeState: PlanModeState | undefined;
@@ -2113,6 +2155,8 @@ export class AgentSession {
 	#turnIndex = 0;
 	#messageEndPersistenceTail: Promise<void> = Promise.resolve();
 	#pendingMessageEndPersistence = new Map<string, Promise<void>>();
+	/** Async lifecycle handlers for visible advisor cards emitted outside the primary loop. */
+	#pendingAdvisorCardEvents = new Set<Promise<void>>();
 	#persistedMessageKeys: { anchor: string; keys: Set<string> } | undefined;
 
 	#skills: Skill[];
@@ -2612,7 +2656,13 @@ export class AgentSession {
 		const isPlanNudge = (m: AgentMessage): boolean =>
 			m.role === "custom" && m.customType === PREWALK_PLAN_MESSAGE_TYPE;
 		for (let i = liveMessages.length - 1; i >= 0; i--) {
-			if (isPlanNudge(liveMessages[i])) liveMessages.splice(i, 1);
+			if (isPlanNudge(liveMessages[i])) {
+				// Interior removal on the live array: drop the scrubbed message from
+				// the convert/estimate caches so the next convert can't reuse a prefix
+				// that still carries its fragment (the array shrinks in place).
+				invalidateMessageCache(liveMessages[i]);
+				liveMessages.splice(i, 1);
+			}
 		}
 		const stateMessages = this.agent.state.messages;
 		const filtered = stateMessages.filter(m => !isPlanNudge(m));
@@ -2642,6 +2692,24 @@ export class AgentSession {
 		this.setPlanProposalHandler(title => this.#approvePlanYoloProposal(title));
 	}
 
+	/** Validate the active plan artifact and shape an `xd://propose` result for review-mode hosts. */
+	async preparePlanForReview(title: string): Promise<AgentToolResult<PlanApprovalDetails>> {
+		const state = this.getPlanModeState();
+		if (!state?.enabled) {
+			throw new ToolError("Plan mode is not active.");
+		}
+		const { planFilePath, title: resolvedTitle } = await resolveApprovedPlan({
+			suppliedTitle: title,
+			statePlanFilePath: state.planFilePath,
+			readPlan: url => this.#readPlanFile(url),
+			listPlanFiles: () => this.#listPlanFiles(),
+		});
+		return {
+			content: [{ type: "text", text: "Plan ready for review." }],
+			details: { planFilePath, title: resolvedTitle, planExists: true },
+		};
+	}
+
 	/**
 	 * Plan-proposal handler while PlanYolo's plan phase is active. Auto-approves
 	 * the instant the model writes the plan slug/title to `xd://propose` — no
@@ -2662,8 +2730,8 @@ export class AgentSession {
 		const { planFilePath, title: resolvedTitle } = await resolveApprovedPlan({
 			suppliedTitle: title,
 			statePlanFilePath: state.planFilePath,
-			readPlan: url => this.#readPlanYoloFile(url),
-			listPlanFiles: () => this.#listPlanYoloFiles(),
+			readPlan: url => this.#readPlanFile(url),
+			listPlanFiles: () => this.#listPlanFiles(),
 		});
 		this.setPlanModeState(undefined);
 		const previousTools = this.#planYoloPreviousTools;
@@ -2698,7 +2766,7 @@ export class AgentSession {
 		};
 	}
 
-	async #readPlanYoloFile(planFilePath: string): Promise<string | null> {
+	async #readPlanFile(planFilePath: string): Promise<string | null> {
 		const resolvedPath = planFilePath.startsWith("local:")
 			? resolveLocalUrlToPath(normalizeLocalScheme(planFilePath), this.#localProtocolOptions())
 			: resolveToCwd(planFilePath, this.sessionManager.getCwd());
@@ -2712,7 +2780,7 @@ export class AgentSession {
 
 	/** `local://` URLs of plan files in the session-local root, newest first —
 	 *  a fallback for `resolveApprovedPlan` when the agent dropped `extra.title`. */
-	async #listPlanYoloFiles(): Promise<string[]> {
+	async #listPlanFiles(): Promise<string[]> {
 		const localRoot = resolveLocalUrlToPath("local://", this.#localProtocolOptions());
 		try {
 			const entries = await fs.promises.readdir(localRoot, { withFileTypes: true });
@@ -2759,6 +2827,13 @@ export class AgentSession {
 			this.#thinkingLevel = resolveProvisionalAutoLevel(this.model);
 		} else {
 			this.#thinkingLevel = config.thinkingLevel;
+		}
+		if (config.initialRetryFallback) {
+			this.#activeRetryFallback = {
+				...config.initialRetryFallback,
+				lastAppliedFallbackThinkingLevel: this.configuredThinkingLevel(),
+				pinned: false,
+			};
 		}
 		if (config.prewalk) {
 			this.#prewalk = config.prewalk;
@@ -3487,6 +3562,7 @@ export class AgentSession {
 		const channel = resolveAdvisorDeliveryChannel({
 			severity,
 			autoResumeSuppressed: this.#advisorAutoResumeSuppressed,
+			preserveOnly: this.#preserveAdvisorAdvice,
 			// Key on the live agent-core loop, not session `isStreaming` (which also
 			// counts `#promptInFlightCount` during post-turn unwind). Only a running
 			// loop consumes a steer at its next boundary.
@@ -4286,30 +4362,58 @@ export class AgentSession {
 		return queued;
 	}
 
+	/**
+	 * Orders subscriber fan-out across concurrent `#emitSessionEvent` calls.
+	 * Extension emits only await when the event type has handlers, so an event
+	 * with no handlers could otherwise overtake an earlier event still inside
+	 * its extension emit — an instant refusal delivered its assistant
+	 * `message_end` to the TUI before its own `message_start`, skipping the
+	 * turn-ending error render entirely.
+	 */
+	#subscriberEmitGate: Promise<void> = Promise.resolve();
+
 	async #emitSessionEvent(event: AgentSessionEvent): Promise<void> {
 		if (event.type === "message_update") {
 			this.#emit(event);
 			void this.#queueExtensionEvent(event);
 			return;
 		}
-		await this.#emitExtensionEvent(event);
-		// Hold the wire-level agent_end until in-flight prompts unwind. Subscribers
-		// (rpc-mode, ACP, Cursor) treat agent_end as the "session is idle" signal;
-		// emitting while #promptInFlightCount > 0 lets a client fire its next
-		// `prompt` into a session that still reports isStreaming === true. Flush
-		// happens in #endInFlight / #resetInFlight. A later agent_end (e.g. from
-		// an auto-compaction turn that starts before the original prompt unwinds)
-		// supersedes the pending one, which is what subscribers want — they only
-		// care about the final settle.
-		if (event.type === "agent_end" && this.#promptInFlightCount > 0) {
-			this.#pendingAgentEndEmit = event;
-			return;
+		// Take a FIFO ticket before the extension emit: extension deliveries for
+		// consecutive events still run concurrently, but subscriber fan-out waits
+		// for every earlier event's fan-out (or deferral) to happen first.
+		const previousGate = this.#subscriberEmitGate;
+		const { promise: gate, resolve: releaseGate } = Promise.withResolvers<void>();
+		this.#subscriberEmitGate = gate;
+		try {
+			await this.#emitExtensionEvent(event);
+			await previousGate;
+			// Hold the wire-level agent_end until in-flight prompts unwind. Subscribers
+			// (rpc-mode, ACP, Cursor) treat agent_end as the "session is idle" signal;
+			// emitting while #promptInFlightCount > 0 lets a client fire its next
+			// `prompt` into a session that still reports isStreaming === true. Flush
+			// happens in #endInFlight / #resetInFlight. A later agent_end (e.g. from
+			// an auto-compaction turn that starts before the original prompt unwinds)
+			// supersedes the pending one, which is what subscribers want — they only
+			// care about the final settle.
+			if (event.type === "agent_end" && this.#promptInFlightCount > 0) {
+				this.#pendingAgentEndEmit = event;
+				return;
+			}
+			this.#emit(event);
+		} finally {
+			releaseGate();
 		}
-		this.#emit(event);
 	}
 
 	// Track last assistant message for auto-compaction check
 	#lastAssistantMessage: AssistantMessage | undefined = undefined;
+	/**
+	 * Classifier-refusal turn pruned from active context at settle (#3591).
+	 * Retained until the next run starts so post-settle readers
+	 * ({@link getLastAssistantMessage}: print mode, task executor) still see
+	 * the terminal error instead of a silently successful-looking state.
+	 */
+	#prunedTerminalRefusal: AssistantMessage | undefined = undefined;
 
 	/** Internal handler for agent events - shared by subscribe and reconnect.
 	 *
@@ -4327,7 +4431,12 @@ export class AgentSession {
 	 * everything it schedules — settles. */
 	#handleAgentEvent = async (event: AgentEvent): Promise<void> => {
 		if (event.type !== "agent_end") {
-			return this.#processAgentEvent(event);
+			const processing = this.#processAgentEvent(event);
+			if ((event.type === "message_start" || event.type === "message_end") && isAdvisorCard(event.message)) {
+				this.#pendingAdvisorCardEvents.add(processing);
+				void processing.finally(() => this.#pendingAdvisorCardEvents.delete(processing)).catch(() => {});
+			}
+			return processing;
 		}
 		const { promise, resolve } = Promise.withResolvers<void>();
 		this.#trackPostPromptTask(promise);
@@ -4569,6 +4678,11 @@ export class AgentSession {
 	}
 
 	#processAgentEvent = async (event: AgentEvent): Promise<void> => {
+		// A fresh run supersedes the previously settled (and pruned) refusal
+		// turn: state-based lookups take over again.
+		if (event.type === "agent_start") {
+			this.#prunedTerminalRefusal = undefined;
+		}
 		// Step the mid-run todo counter synchronously, BEFORE any await in this
 		// handler. The agent loop's next-turn `getAsideMessages` poll can run
 		// before queued microtasks drain, so `#takeMidRunTodoNudge` MUST see the
@@ -4587,6 +4701,19 @@ export class AgentSession {
 			} else if (!isError && MID_RUN_TODO_NUDGE_MUTATING_TOOLS[toolName]) {
 				this.#mutationsSinceLastTodoTouch++;
 			}
+			// A tool actually ran. Clear the post-reminder suppression synchronously
+			// too: the settle check (`#checkTodoCompletion` in agent_end maintenance)
+			// can otherwise read the stale flag when a tool result and the terminal
+			// stop land in the same tick, swallowing the earned re-escalation.
+			this.#todoReminderAwaitingProgress = false;
+		}
+		// Track the settled assistant turn synchronously as well: agent_end
+		// maintenance reads `#lastAssistantMessage`, and when a turn's events all
+		// land in one tick its handler can run before this handler's post-emit
+		// bookkeeping — leaving maintenance looking at the previous (e.g.
+		// toolUse) assistant message and skipping settle-only work.
+		if (event.type === "message_end" && event.message.role === "assistant") {
+			this.#lastAssistantMessage = event.message;
 		}
 		// Plan-mode internal transition: stamp `SILENT_ABORT_MARKER` on the
 		// persisted message BEFORE the obfuscator's display-side copy below.
@@ -4793,9 +4920,7 @@ export class AgentSession {
 			}
 			// Other message types (bashExecution, compactionSummary, branchSummary) are persisted elsewhere
 
-			// Track assistant message for auto-compaction (checked on agent_end)
 			if (event.message.role === "assistant") {
-				this.#lastAssistantMessage = event.message;
 				const assistantMsg = event.message as AssistantMessage;
 				// Fold this turn's timing into per-model perf aggregates (drives the
 				// /models TPS/TTFT display). Errored turns measure nothing; aborted
@@ -4865,18 +4990,15 @@ export class AgentSession {
 				const details = isRecord(event.message.details) ? event.message.details : undefined;
 				const semanticResult = semanticToolResult(toolName, event.message);
 				const semanticDetails = isRecord(semanticResult?.details) ? semanticResult.details : undefined;
-				// A tool actually ran. Clear the post-reminder suppression: the agent did
-				// productive work in response to the prior nudge, so the next text-only stop
-				// is allowed to escalate to the next reminder if todos remain incomplete.
-				this.#todoReminderAwaitingProgress = false;
 				// Invalidate streaming edit cache when edit tool completes to prevent stale data
 				const editedPath = details ? getStringProperty(details, "path") : undefined;
 				if (toolName === "edit" && editedPath) {
 					this.#invalidateFileCacheForPath(editedPath);
 				}
+				// TodoTool commits its state during execute. Replaying the result after
+				// awaited event fan-out can overwrite a newer call from the same batch.
 				const phases = details?.phases;
 				if (toolName === "todo" && !isError && details && Array.isArray(phases) && phases.every(isTodoPhase)) {
-					this.setTodoPhases(phases);
 					if (this.#isTodoInitResult(details, toolCallId)) {
 						this.#scheduleReplanTitleRefresh();
 					}
@@ -4975,6 +5097,12 @@ export class AgentSession {
 				});
 			};
 			maintenanceRoute("entered");
+
+			// Surface provider stream failures in the main log. The routing trace
+			// above is debug-only and drops the error fields, so a session dying
+			// repeatedly on provider errors otherwise leaves no actionable trace
+			// outside the session transcript (issue #6177).
+			logProviderTurnError(msg);
 
 			// Invalidate GitHub Copilot credentials on auth failure so stale tokens
 			// aren't reused on the next request
@@ -5094,8 +5222,12 @@ export class AgentSession {
 					return;
 				}
 			}
-			if (this.#isRetryableError(msg)) {
-				const didRetry = await this.#handleRetryableError(msg);
+			const resumeCursorStreamStall = this.#canResumeCursorStreamStall(msg);
+			if (resumeCursorStreamStall || this.#isRetryableError(msg)) {
+				const didRetry = await this.#handleRetryableError(
+					msg,
+					resumeCursorStreamStall ? { preserveFailedTurn: true } : undefined,
+				);
 				if (didRetry) {
 					await emitAgentEndNotification({ willContinue: true });
 					return;
@@ -5114,11 +5246,24 @@ export class AgentSession {
 			}
 			// Classifier refusals are persisted-skipped above; also prune the trailing
 			// stub from active context so the next turn's prompt does not replay it.
+			// Keep a reference for post-settle readers (print mode, task executor via
+			// getLastAssistantMessage) — pruning made the terminal error invisible to
+			// anything inspecting agent state after prompt() resolved.
 			// Fall through to the standard error tail so `session_stop` hooks (block,
 			// continue, telemetry) still fire — matching the pre-fix flow for
 			// `stopReason === "error"`.
 			if (this.#isClassifierRefusal(msg)) {
+				this.#prunedTerminalRefusal = msg;
 				this.#removeAssistantMessageFromActiveContext(msg);
+			} else if (!AIError.isContextOverflow(msg, this.model?.contextWindow ?? 0)) {
+				// No retry, fallback, or compaction continuation fired: this errored
+				// turn ends the run. #persistSessionMessageIfMissing dropped it as an
+				// empty error turn, so record it here — otherwise the JSONL stops at
+				// the last tool result and the provider's errorMessage is lost (#6249).
+				// Idempotent and a no-op for non-empty turns. Content-less overflow
+				// rejections stay live-UI only per the auto-compaction progress guard:
+				// persisting one would replay an empty assistant turn on reload.
+				await this.#persistTerminalEmptyErrorTurn(msg);
 			}
 			this.#resolveRetry();
 
@@ -6439,6 +6584,10 @@ export class AgentSession {
 		messages: AgentMessage[],
 		lastAssistantMessage = this.getLastAssistantMessage(),
 	): Promise<boolean> {
+		if (this.#abortInProgress || this.#isDisposed) {
+			this.#resetSessionStopContinuationState();
+			return false;
+		}
 		if (this.#agentKind === "sub" || !this.#extensionRunner?.hasHandlers("session_stop")) {
 			return false;
 		}
@@ -7080,6 +7229,77 @@ export class AgentSession {
 		return this.#disposeCall;
 	}
 
+	async #disposeOwnedAsyncJobs(): Promise<void> {
+		this.#cancelOwnAsyncJobs();
+		const manager = this.#ownedAsyncJobManager;
+		if (!manager) return;
+
+		const drained = await manager.dispose({ timeoutMs: 3_000 });
+		const deliveryState = manager.getDeliveryState();
+		if (drained === false && deliveryState) {
+			logger.warn("Async job completion deliveries still pending during dispose", { ...deliveryState });
+		}
+	}
+
+	async #disposeEvalKernels(): Promise<void> {
+		const settled = await this.#prepareEvalExecutionsForDispose();
+		if (!settled) {
+			logger.warn("Detaching retained eval-kernel ownership during dispose while eval execution is still active");
+		}
+
+		const results = await Promise.allSettled([
+			disposeKernelSessionsByOwner(this.#evalKernelOwnerId),
+			disposeRubyKernelSessionsByOwner(this.#evalKernelOwnerId),
+			disposeJuliaKernelSessionsByOwner(this.#evalKernelOwnerId),
+		]);
+		const errors: unknown[] = [];
+		for (const result of results) {
+			if (result.status === "rejected") errors.push(result.reason);
+		}
+		if (errors.length > 0) throw new AggregateError(errors, "Failed to dispose one or more eval kernels");
+	}
+
+	async #releaseOwnedBrowserTabs(ownerId: string | undefined): Promise<void> {
+		if (!ownerId) return;
+		try {
+			const released = await withTimeout(
+				releaseTabsForOwner(ownerId, { kill: true }),
+				3_000,
+				"Timed out releasing owned browser tabs during dispose",
+			);
+			if (released > 0) {
+				logger.debug("Released owned browser tabs during dispose", { ownerId, released });
+			}
+		} catch (error) {
+			logger.warn("Failed to release owned browser tabs during dispose", { error: String(error) });
+		}
+	}
+
+	async #disconnectOwnedMcp(): Promise<void> {
+		if (!this.#disconnectOwnedMcpManager) return;
+		try {
+			await withTimeout(
+				this.#disconnectOwnedMcpManager(),
+				3_000,
+				"Timed out disconnecting owned MCP manager during dispose",
+			);
+		} catch (error) {
+			logger.warn("Failed to disconnect owned MCP manager during dispose", { error: String(error) });
+		}
+	}
+
+	async #disposeMnemopi(
+		state: MnemopiSessionState | undefined,
+		consolidateTimeoutMs: number | undefined,
+	): Promise<void> {
+		try {
+			await state?.dispose({ timeoutMs: consolidateTimeoutMs });
+		} finally {
+			// Consolidation may embed final memories, so terminate its worker only afterward.
+			await shutdownMnemopiEmbedClient();
+		}
+	}
+
 	async #doDispose(options: AgentSessionDisposeOptions = {}): Promise<void> {
 		this.beginDispose();
 		try {
@@ -7095,128 +7315,50 @@ export class AgentSession {
 		} catch (error) {
 			logger.warn("Failed to deactivate extension generation", { error: String(error) });
 		}
-		// Clear any timers extensions scheduled via `ctx.setInterval`/`ctx.setTimeout`
-		// so their background work does not outlive the session (issue #5664).
-		// Optional-called: hosts and tests may inject partial runner facades that
-		// implement only the dispatch surface.
-		this.#extensionRunner?.clearManagedTimers?.();
+
+		// Stop fallback extension timers before aborting deferred work they could enqueue.
 		this.#fallbackExtensionTimers?.clearAll();
-		// Abort post-prompt work so the drain below can complete. Without this, a
-		// deferred-handoff task that has already advanced into
-		// `await this.handoff(...) → generateHandoff(...)` keeps awaiting a live LLM stream
-		// — Promise.allSettled() in #cancelPostPromptTasks then waits forever, freezing
-		// /exit and Ctrl+C-double-tap. The post-prompt task's own AbortSignal does not
-		// propagate into the inner handoff/compaction controllers, so we abort them
-		// explicitly. agent.abort() is needed for an agent.continue() that may have
-		// raced the deferred handoff (its streaming loop is awaited by the wrapper IIFE).
-		//
-		// Tool work (bash/eval/python) is NOT aborted here — those have their own
-		// dispose paths and shared kernels are contractually allowed to survive a
-		// session's dispose.
 		this.abortRetry();
 		this.abortCompaction();
 		const postPromptDrain = this.#cancelPostPromptTasks();
 		this.agent.abort();
-		await postPromptDrain;
+		try {
+			await withTimeout(postPromptDrain, 5_000, "Timed out draining post-prompt tasks during dispose");
+		} catch (error) {
+			logger.warn("Post-prompt tasks still draining at dispose deadline", { error: String(error) });
+		}
 		await this.#drainAutolearnCapture();
-		// Cancel jobs this agent registered so a subagent's teardown doesn't
-		// leak its background bash/task work into the parent's manager. Only
-		// the session that owns the manager goes on to dispose it (which itself
-		// nukes any leftover jobs and pending deliveries).
-		this.#cancelOwnAsyncJobs();
-		const ownedAsyncManager = this.#ownedAsyncJobManager;
-		if (ownedAsyncManager) {
-			const drained = await ownedAsyncManager.dispose({ timeoutMs: 3_000 });
-			const deliveryState = ownedAsyncManager.getDeliveryState();
-			if (drained === false && deliveryState) {
-				logger.warn("Async job completion deliveries still pending during dispose", { ...deliveryState });
+
+		const hindsightState = this.getHindsightSessionState();
+		const mnemopiState = setMnemopiSessionState(this, undefined);
+		const advisorRecorderClosed = this.#advisorRecorderClosed;
+		const results = await Promise.allSettled([
+			this.#disposeOwnedAsyncJobs(),
+			this.#disposeEvalKernels(),
+			this.#releaseOwnedBrowserTabs(this.sessionManager.getSessionId()),
+			shutdownTinyTitleClient(),
+			this.#resourceController ? this.#resourceController.dispose() : this.#disconnectOwnedMcp(),
+			advisorRecorderClosed,
+			hindsightState?.flushRetainQueue() ?? Promise.resolve(),
+			this.#disposeMnemopi(mnemopiState, options.mnemopiConsolidateTimeoutMs),
+		]);
+		for (const result of results) {
+			if (result.status === "rejected") {
+				logger.warn("Session dispose subsystem failed during parallel teardown", {
+					error: String(result.reason),
+				});
 			}
 		}
-		const evalExecutionsSettled = await this.#prepareEvalExecutionsForDispose();
-		if (!evalExecutionsSettled) {
-			logger.warn("Detaching retained eval-kernel ownership during dispose while eval execution is still active");
-		}
-		await disposeKernelSessionsByOwner(this.#evalKernelOwnerId);
-		await disposeRubyKernelSessionsByOwner(this.#evalKernelOwnerId);
-		await disposeJuliaKernelSessionsByOwner(this.#evalKernelOwnerId);
-		// Release headless / spawned Chromium and worker tabs this session
-		// opened via the browser tool. The tool's `tabs`/`browsers` maps are
-		// module-global — subagents and future sessions share them — so we
-		// walk by `ownerSessionId` (assigned at `acquireTab` creation, never on
-		// reuse) and touch only what THIS session created. Bounded so a broken
-		// CDP close cannot stall `/exit`; mirrors the async-job/MCP pattern.
-		// (Issue #3963.)
-		const browserOwnerId = this.sessionManager.getSessionId();
-		if (browserOwnerId) {
-			try {
-				const released = await withTimeout(
-					releaseTabsForOwner(browserOwnerId, { kill: true }),
-					3_000,
-					"Timed out releasing owned browser tabs during dispose",
-				);
-				if (released > 0) {
-					logger.debug("Released owned browser tabs during dispose", { ownerId: browserOwnerId, released });
-				}
-			} catch (error) {
-				logger.warn("Failed to release owned browser tabs during dispose", { error: String(error) });
-			}
-		}
-		await shutdownTinyTitleClient();
+
 		this.#releasePowerAssertion();
-		// Clean up an empty session created by this session's /move so it doesn't accumulate.
 		await cleanupEmptyMoveSession(this.sessionManager, this.#movedFromEmptySessionFile);
 		this.#movedFromEmptySessionFile = undefined;
+		// All teardown branches that can append session entries have settled.
 		await this.sessionManager.close();
-		// beginDispose() stopped the advisor and captured its recorder close; await
-		// it so the final advisor turn is flushed before the process may exit.
-		await this.#advisorRecorderClosed;
 		this.#closeAllProviderSessions("dispose");
-		if (this.#resourceController) {
-			try {
-				await this.#resourceController.dispose();
-			} catch (error) {
-				logger.warn("Failed to dispose session resource runtime", { error: String(error) });
-			}
-		}
-		// Disconnect the MCP manager this session OWNS so its stdio servers are
-		// not orphaned at exit. Best-effort: a failure here must never throw out
-		// of dispose. Only owning (top-level) sessions provide this callback;
-		// subagents reuse a parent's manager and must not tear it down. Idempotent
-		// with the deferred-discovery disconnect in `createAgentSession`.
-		//
-		// BOUNDED: an owned manager may hold an HTTP/SSE server whose session-
-		// termination DELETE blocks up to the MCP request timeout (30s default,
-		// unbounded when OMP_MCP_TIMEOUT_MS=0), so awaiting `disconnectAll()`
-		// unbounded would stall /exit and print-mode shutdown on a broken remote
-		// endpoint. Race it against a short deadline — stdio close (the subprocess
-		// reap this targets) completes well within the bound; a slow transport
-		// close is left to finish detached. Mirrors the bounded async-job teardown.
-		if (this.#disconnectOwnedMcpManager) {
-			try {
-				await withTimeout(
-					this.#disconnectOwnedMcpManager(),
-					3_000,
-					"Timed out disconnecting owned MCP manager during dispose",
-				);
-			} catch (error) {
-				logger.warn("Failed to disconnect owned MCP manager during dispose", { error: String(error) });
-			}
-		}
-		// Flush the retain queue BEFORE clearing the session's pointer so
-		// `HindsightRetainQueue.#doFlush` still sees `session.getHindsightSessionState() === state`.
-		// Reversed, the spliced batch survives just long enough to fail the
-		// identity check and get dropped with a `session vanished` warning.
-		const hindsightState = this.getHindsightSessionState();
-		await hindsightState?.flushRetainQueue();
+
 		this.setHindsightSessionState(undefined);
 		hindsightState?.dispose();
-		const mnemopiState = setMnemopiSessionState(this, undefined);
-		await mnemopiState?.dispose({ timeoutMs: options.mnemopiConsolidateTimeoutMs });
-		// Tear down the embeddings subprocess AFTER mnemopi state.dispose:
-		// consolidate-on-dispose may still call `embed()` to store the final
-		// memories, and that round-trips through the worker we are about to
-		// hard-kill (issue #3031).
-		await shutdownMnemopiEmbedClient();
 		this.#disconnectFromAgent();
 		if (this.#unsubscribeAppendOnly) {
 			this.#unsubscribeAppendOnly();
@@ -7317,6 +7459,53 @@ export class AgentSession {
 		await this.agent.waitForIdle();
 		await this.#waitForPostPromptRecovery();
 	}
+	/**
+	 * Prevent advisor notes from starting hidden primary turns while a headless
+	 * caller prints and drains the final primary response.
+	 */
+	prepareForHeadlessAdvisorDrain(): void {
+		this.#preserveAdvisorAdvice = true;
+	}
+
+	async #waitForPendingAdvisorCardEvents(timeoutMs: number): Promise<boolean> {
+		const deadline = Date.now() + Math.max(0, timeoutMs);
+		while (this.#pendingAdvisorCardEvents.size > 0) {
+			const remainingMs = deadline - Date.now();
+			if (remainingMs <= 0) return false;
+			const settled = Promise.allSettled([...this.#pendingAdvisorCardEvents]).then(() => true as const);
+			const { promise: timedOut, resolve } = Promise.withResolvers<false>();
+			const timer = setTimeout(() => resolve(false), remainingMs);
+			try {
+				if (!(await Promise.race([settled, timedOut]))) return false;
+			} finally {
+				clearTimeout(timer);
+			}
+		}
+		return true;
+	}
+
+	/**
+	 * Wait for active advisor reviews and their emitted card events before a
+	 * headless caller disposes the session. Returns `false` and logs work disposal
+	 * will abandon when the shared deadline expires or an advisor fails.
+	 */
+	async waitForAdvisorCatchup(timeoutMs: number): Promise<boolean> {
+		const deadline = Date.now() + timeoutMs;
+		const results = await Promise.all(this.#advisors.map(advisor => advisor.runtime.waitForCatchup(timeoutMs, 1)));
+		const cardEventsCaughtUp = await this.#waitForPendingAdvisorCardEvents(Math.max(0, deadline - Date.now()));
+		const abandoned = this.#advisors.filter(
+			(advisor, index) => results[index] === false && advisor.runtime.backlog > 0,
+		);
+		if (abandoned.length > 0 || !cardEventsCaughtUp) {
+			logger.warn("advisor shutdown drain incomplete; disposal will abandon reviews or cards", {
+				timeoutMs,
+				advisors: abandoned.map(advisor => ({ name: advisor.name, backlog: advisor.runtime.backlog })),
+				pendingAdvisorCards: this.#pendingAdvisorCardEvents.size,
+			});
+			return false;
+		}
+		return true;
+	}
 
 	async drainAsyncJobDeliveriesForAcp(options?: { timeoutMs?: number }): Promise<boolean> {
 		const manager = this.#asyncJobManager;
@@ -7335,9 +7524,14 @@ export class AgentSession {
 		}
 	}
 
-	/** Most recent assistant message in agent state. */
+	/**
+	 * Most recent settled assistant message. A classifier-refusal turn pruned
+	 * from active context at settle is still reported until the next run
+	 * starts, so terminal-outcome consumers (print mode, task executor) see
+	 * the refusal error rather than the previous turn — or nothing.
+	 */
 	getLastAssistantMessage(): AssistantMessage | undefined {
-		return this.#findLastAssistantMessage();
+		return this.#prunedTerminalRefusal ?? this.#findLastAssistantMessage();
 	}
 	/** Current effective system prompt blocks (includes any per-turn extension modifications) */
 	get systemPrompt(): string[] {
@@ -7969,7 +8163,57 @@ export class AgentSession {
 	): Promise<void> {
 		const mounted = this.#mountedXdevToolNames;
 		const normalized = normalizeToolNames(toolNames);
+		// Transport-write eligibility keys off the *current* active set: an ordinary
+		// selection change should not demote `write` unless it is already active.
+		await this.#applyToolPresentation(
+			normalized,
+			mounted,
+			this.getActiveToolNames().includes("write"),
+			promptResources,
+		);
+	}
+
+	/**
+	 * Restore an enabled tool set with its exact top-level versus `xd://` partition.
+	 *
+	 * Both inputs are required because {@link setActiveToolsByName} only receives the
+	 * enabled name list and classifies mounts from the *current* `#mountedXdevToolNames`.
+	 * Rollback/restore callers must pass the snapshotted mounted subset so names that
+	 * were top-level stay pinned (`#runtimeSelectedToolNames`) and names that were under
+	 * `xd://` remain mount-eligible, even when the live mount set has drifted.
+	 *
+	 * Names outside `mountedToolNames` are pinned top-level for this application;
+	 * names in the mounted subset remain eligible for xdev mounting. Delegates the
+	 * actual apply through `#applyActiveToolsByName` and restores the prior runtime
+	 * selection if that apply throws.
+	 */
+	async setActiveToolPresentation(toolNames: string[], mountedToolNames: string[]): Promise<void> {
+		const normalized = normalizeToolNames(toolNames);
+		// Restoration targets a snapshot, so write eligibility comes from the
+		// *target* set rather than whatever happens to be active mid-rollback.
+		await this.#withResourceManifestAdmission(undefined, resources =>
+			this.#applyToolPresentation(
+				normalized,
+				new Set(normalizeToolNames(mountedToolNames)),
+				normalized.includes("write"),
+				resources,
+			),
+		);
+	}
+
+	/**
+	 * Shared body for {@link setActiveToolsByName} and {@link setActiveToolPresentation}:
+	 * pins non-mounted names as the runtime selection (holding `write` back when it is
+	 * transport-only) and applies the set, rolling the selection back if apply throws.
+	 */
+	async #applyToolPresentation(
+		normalized: string[],
+		mounted: ReadonlySet<string>,
+		writeSelected: boolean,
+		promptResources: SessionEffectiveResources | undefined,
+	): Promise<void> {
 		const transportWriteActive =
+			writeSelected &&
 			this.#builtInToolNames.has("write") &&
 			this.#presentationPinnedToolNames?.has("write") !== true &&
 			this.#runtimeSelectedToolNames?.has("write") !== true &&
@@ -8516,6 +8760,12 @@ export class AgentSession {
 	 */
 	get hasPostPromptWork(): boolean {
 		return this.#postPromptTasks.size > 0;
+	}
+
+	/** Register post-prompt work in tests without driving a full agent turn. */
+	trackPostPromptTaskForTests(task: Promise<unknown>): void {
+		if (!isBunTestRuntime()) throw new Error("trackPostPromptTaskForTests is test-only");
+		this.#trackPostPromptTask(task);
 	}
 
 	/** All messages including custom types like BashExecutionMessage */
@@ -9313,19 +9563,18 @@ export class AgentSession {
 				timestamp,
 			});
 		}
-		if (
-			this.#magicKeywordEnabled("workflow") &&
-			containsWorkflow(text) &&
-			this.getActiveToolNames().includes("task")
-		) {
-			keywordNotices.push({
-				role: "custom",
-				customType: "workflow-notice",
-				content: renderWorkflowNotice({ taskBatch: this.settings.get("task.batch") }),
-				display: false,
-				attribution: "user",
-				timestamp,
-			});
+		if (this.#magicKeywordEnabled("workflow") && containsWorkflow(text)) {
+			const activeToolNames = this.getActiveToolNames();
+			if (activeToolNames.includes("task") && activeToolNames.includes("eval")) {
+				keywordNotices.push({
+					role: "custom",
+					customType: "workflow-notice",
+					content: renderWorkflowNotice({ taskBatch: this.settings.get("task.batch") }),
+					display: false,
+					attribution: "user",
+					timestamp,
+				});
+			}
 		}
 		return keywordNotices;
 	}
@@ -10530,6 +10779,13 @@ export class AgentSession {
 	}
 
 	#scheduleReplanTitleRefresh(): void {
+		// Headless subagent sessions have no operator-visible title, so a todo-init
+		// replan refresh only burns a tiny-model call whose result lands in JSONL
+		// and is never shown (issue #5910). In an interactive host the operator can
+		// focus a live subagent from the Agent Hub, where the status line renders
+		// its session name — so keep the refresh there and only skip subagents when
+		// no focusable UI exists (print/RPC/ACP/eval/SDK/CI).
+		if (this.#agentKind === "sub" && !isInteractiveHost()) return;
 		if (this.#replanTitleRefreshInFlight) return;
 		if (!this.settings.get("title.refreshOnReplan")) return;
 		if (this.sessionManager.titleSource === "user") return;
@@ -11179,15 +11435,16 @@ export class AgentSession {
 	}
 
 	/**
-	 * Set the thinking level. `auto` enables per-turn classification; the selector
-	 * itself is never written to the session log, but resolved concrete levels are
-	 * persisted when real user turns are classified so resumed sessions keep the
-	 * last resolved effort instead of reverting to pending auto.
+	 * Set the thinking level. `auto` enables per-turn classification. Entering
+	 * auto writes its provisional level plus `configured: "auto"` immediately,
+	 * giving external readers an authoritative selection receipt before the next
+	 * user turn. Later classifications persist only changed concrete resolutions.
 	 */
 	setThinkingLevel(level: ConfiguredThinkingLevel | undefined, persist: boolean = false): void {
 		if (level === AUTO_THINKING) {
 			const provisional = resolveProvisionalAutoLevel(this.model);
 			const wasAuto = this.#autoThinking;
+			const previousLevel = this.#thinkingLevel;
 			this.#autoThinking = true;
 			this.#autoResolvedLevel = undefined;
 			this.#thinkingLevel = provisional;
@@ -11198,7 +11455,9 @@ export class AgentSession {
 			if (persist) {
 				this.settings.set("defaultThinkingLevel", AUTO_THINKING);
 			}
-			if (!wasAuto || this.#thinkingLevel !== provisional) {
+			const isChanging = !wasAuto || previousLevel !== provisional;
+			if (isChanging) {
+				this.sessionManager.appendThinkingLevelChange(provisional, AUTO_THINKING);
 				this.#emit({ type: "thinking_level_changed", thinkingLevel: provisional, configured: AUTO_THINKING });
 			}
 			return;
@@ -11307,7 +11566,7 @@ export class AgentSession {
 
 		const effort = resolved ?? resolveProvisionalAutoLevel(model);
 		if (effort === undefined) return;
-		const shouldPersistResolution = this.#autoResolvedLevel !== effort;
+		const shouldPersistResolution = this.#thinkingLevel !== effort;
 		this.#autoResolvedLevel = effort;
 		this.#thinkingLevel = effort;
 		this.#applyThinkingLevelToAgent(effort);
@@ -12767,7 +13026,17 @@ export class AgentSession {
 		this.#pendingRecoveredRetryErrors = [];
 	}
 
-	async #persistRetryLifecycleErrorMessage(message: AssistantMessage): Promise<void> {
+	/**
+	 * Durably record a terminal empty error turn (`stopReason: "error"` with no
+	 * substantive content) that `#persistSessionMessageIfMissing` skipped, so the
+	 * session JSONL keeps a record of why the run stopped instead of ending at the
+	 * last tool result. A no-op for non-empty/non-error turns and idempotent via
+	 * the already-persisted guard; the turn is dropped from active context by the
+	 * caller (or `isProviderRefusalMessage`/`isEmptyErrorTurn` filters) so it is
+	 * never replayed on the wire. Used by the retry-lifecycle dead-ends and the
+	 * non-retry terminal error tail.
+	 */
+	async #persistTerminalEmptyErrorTurn(message: AssistantMessage): Promise<void> {
 		await this.#waitForSessionMessagePersistence(message);
 		if (!isEmptyErrorTurn(message)) return;
 		if (this.#sessionMessageAlreadyPersisted(message)) return;
@@ -12809,7 +13078,7 @@ export class AgentSession {
 		id: number,
 		options: { switchedCredential: boolean; switchedModel: boolean; delayMs: number },
 	): Promise<void> {
-		await this.#persistRetryLifecycleErrorMessage(message);
+		await this.#persistTerminalEmptyErrorTurn(message);
 		const persistenceKey = sessionMessagePersistenceKey(message);
 		if (!persistenceKey) return;
 		let branchEntry: SessionEntry | undefined;
@@ -12906,7 +13175,8 @@ export class AgentSession {
 		this.#emptyStopRetryCount++;
 		if (this.#emptyStopRetryCount > EMPTY_STOP_MAX_RETRIES) {
 			const attempts = this.#emptyStopRetryCount - 1;
-			const finalError = "Assistant returned empty stop after retry cap";
+			const finalError =
+				"Assistant returned empty stop after retry cap; try switching models or `/shake images` to remove archived frames";
 			logger.warn(finalError, {
 				attempts,
 				model: assistantMessage.model,
@@ -12921,11 +13191,11 @@ export class AgentSession {
 			this.#clearPendingRecoveredRetryErrors();
 			this.#retryAttempt = 0;
 			this.#resolveRetry();
-			// Tool-use orphans corrupt Anthropic message history (tool_result without
-			// matching tool_use). Always remove them even when the retry cap is hit.
-			if (assistantMessage.stopReason === "toolUse") {
-				this.#discardAssistantTurn(assistantMessage);
-			}
+			// A zero-content turn carries no transcript value, while its provider usage
+			// can anchor the next prompt at the full failed-request size and re-trigger
+			// compaction at the same boundary. Remove every capped empty stop; toolUse
+			// orphans still need this for Anthropic message-history validity.
+			await this.#dropPersistedAssistantTurn(assistantMessage);
 			return false;
 		}
 		this.#discardAssistantTurn(assistantMessage);
@@ -14735,35 +15005,80 @@ export class AgentSession {
 				this.#getCompactionModelCandidates(availableModels),
 				this.sessionId,
 			);
-			const preparation = prepareCompaction(pathEntries, compactionSettings, autoCompactionCandidates);
+			let pathEntriesForCompaction = pathEntries;
+			let preparation = prepareCompaction(pathEntriesForCompaction, compactionSettings, autoCompactionCandidates);
 			if (!preparation) {
-				await this.#emitSessionEvent({
-					type: "auto_compaction_end",
-					action,
-					result: undefined,
-					aborted: false,
-					willRetry: false,
-					skipped: true,
-				});
-				const noProgressDeadEnd = reason !== "idle";
-				let continuationScheduled = false;
-				if (!suppressContinuation && this.agent.hasQueuedMessages()) {
-					this.#scheduleAgentContinue({
-						delayMs: 100,
-						generation,
-						shouldContinue: () => this.agent.hasQueuedMessages(),
+				// prepareCompaction found nothing to summarize because the kept region
+				// is a single oversized recent turn — findCutPoint never cuts inside a
+				// tool result, so a huge tool-result / fenced block tail leaves nothing
+				// on the summarizable side and summary compaction cannot even start.
+				// That is exactly the dead-end the elide shake rescues: it reaches
+				// INSIDE the tail and offloads heavy content to an artifact placeholder,
+				// shrinking the tail so findCutPoint can then move the cut and leave
+				// older turns to summarize. Run the same tiered rescue the
+				// post-maintenance guard uses (elide, then image drop), with progress
+				// defined as "prepareCompaction now succeeds on the rewritten branch",
+				// and fall through to the normal compaction body when it does (writing
+				// a compaction entry anchors the stale billed usage so the
+				// auto-continue re-check cannot re-trip and loop the warning — issue
+				// #4786). `skipElide` when we already fell through from a shake
+				// strategy pass (it tried and found nothing); skip entirely on the
+				// idle timer (it re-checks usage on its own cadence).
+				let rescueRewroteHistory = false;
+				if (reason !== "idle") {
+					await this.#rescueCompactionDeadEnd(autoCompactionSignal, {
+						skipElide: fallbackFromShake,
+						hasProgress: () => {
+							// Only reached when a tier actually freed something, so the
+							// branch has been rewritten either way.
+							rescueRewroteHistory = true;
+							pathEntriesForCompaction = this.sessionManager.getBranch();
+							preparation = prepareCompaction(
+								pathEntriesForCompaction,
+								compactionSettings,
+								autoCompactionCandidates,
+							);
+							return preparation !== undefined;
+						},
 					});
-					continuationScheduled = true;
 				}
-				if (noProgressDeadEnd) {
-					this.emitNotice(
-						"warning",
-						compactionDeadEndWarning("shrink it (e.g. clear large tool output)"),
-						"compaction",
-					);
+				if (!preparation) {
+					await this.#emitSessionEvent({
+						type: "auto_compaction_end",
+						action,
+						result: undefined,
+						aborted: false,
+						willRetry: false,
+						skipped: true,
+					});
+					const noProgressDeadEnd = reason !== "idle";
+					let continuationScheduled = false;
+					if (!suppressContinuation && this.agent.hasQueuedMessages()) {
+						this.#scheduleAgentContinue({
+							delayMs: 100,
+							generation,
+							shouldContinue: () => this.agent.hasQueuedMessages(),
+						});
+						continuationScheduled = true;
+					}
+					if (noProgressDeadEnd) {
+						this.emitNotice(
+							"warning",
+							compactionDeadEndWarning("shrink it (e.g. clear large tool output)"),
+							"compaction",
+						);
+					}
+					// A rescue that offloaded content but still could not produce a
+					// preparation rewrote the branch; flag it so the overflow-recovery
+					// rollback does not re-restore the just-failed assistant turn on top
+					// of the elided tail.
+					const base = continuationScheduled
+						? COMPACTION_CHECK_CONTINUATION
+						: noProgressDeadEnd
+							? COMPACTION_CHECK_BLOCK_AUTOMATIC_CONTINUATION
+							: COMPACTION_CHECK_NONE;
+					return rescueRewroteHistory ? { ...base, historyRewritten: true } : base;
 				}
-				if (continuationScheduled) return COMPACTION_CHECK_CONTINUATION;
-				return noProgressDeadEnd ? COMPACTION_CHECK_BLOCK_AUTOMATIC_CONTINUATION : COMPACTION_CHECK_NONE;
 			}
 
 			let hookCompaction: CompactionResult | undefined;
@@ -14775,7 +15090,7 @@ export class AgentSession {
 				const hookResult = (await this.#extensionRunner.emit({
 					type: "session_before_compact",
 					preparation,
-					branchEntries: pathEntries,
+					branchEntries: pathEntriesForCompaction,
 					customInstructions: undefined,
 					signal: autoCompactionSignal,
 				})) as SessionBeforeCompactResult | undefined;
@@ -15489,6 +15804,50 @@ export class AgentSession {
 		if (this.#isClassifierRefusal(message)) return true;
 		return AIError.retriable(id, { replayUnsafe: this.#hasReplayUnsafeToolOutput(message) });
 	}
+
+	/**
+	 * Resume a stalled Cursor turn after every server-executed tool has produced
+	 * a result. The failed assistant/tool-result pair must stay in context: it
+	 * records completed side effects and lets the next request continue from
+	 * them instead of replaying the original turn.
+	 */
+	#canResumeCursorStreamStall(message: AssistantMessage): boolean {
+		if (
+			message.provider !== "cursor" ||
+			message.stopReason !== "error" ||
+			!message.errorMessage?.toLowerCase().includes("stream stall")
+		) {
+			return false;
+		}
+		const id = this.#classifyRetryMessage(message);
+		if (!AIError.retriable(id)) return false;
+
+		const resolvedToolCallIds: string[] = [];
+		for (const block of message.content) {
+			if (block.type !== "toolCall") continue;
+			if (!(kCursorExecResolved in block) || block[kCursorExecResolved] !== true) return false;
+			resolvedToolCallIds.push(block.id);
+		}
+		if (resolvedToolCallIds.length === 0) return false;
+
+		const messages = this.agent.state.messages;
+		let assistantIndex = -1;
+		for (let i = messages.length - 1; i >= 0; i--) {
+			const candidate = messages[i];
+			if (candidate.role === "assistant" && this.#isSameAssistantMessage(candidate, message)) {
+				assistantIndex = i;
+				break;
+			}
+		}
+		if (assistantIndex < 0) return false;
+
+		const unresolvedToolCallIds = new Set(resolvedToolCallIds);
+		for (let i = assistantIndex + 1; i < messages.length; i++) {
+			const candidate = messages[i];
+			if (candidate.role === "toolResult") unresolvedToolCallIds.delete(candidate.toolCallId);
+		}
+		return unresolvedToolCallIds.size === 0;
+	}
 	/**
 	 * Retried turns remove the failed assistant message from active context.
 	 * Text/thinking-only partials are safe to discard and replay. Retained
@@ -15497,6 +15856,19 @@ export class AgentSession {
 	 */
 	#hasReplayUnsafeToolOutput(message: AssistantMessage): boolean {
 		return message.content.some(block => block.type === "toolCall");
+	}
+
+	/**
+	 * OpenRouter can repeatedly close Gemini streams at the reasoning-to-payload
+	 * transition. One retry covers a transient edge failure; the normal ten-retry
+	 * budget would otherwise re-run the same expensive reasoning cycle unchanged.
+	 */
+	#isOpenRouterThinkingStreamClose(message: AssistantMessage): boolean {
+		return (
+			message.provider === "openrouter" &&
+			/server_error:\s*stream closed with reason:\s*error/i.test(message.errorMessage ?? "") &&
+			message.content.some(block => block.type === "thinking" && block.thinking.trim().length > 0)
+		);
 	}
 
 	#isClassifierRefusal(message: AssistantMessage): boolean {
@@ -16066,7 +16438,12 @@ export class AgentSession {
 	 */
 	async #handleRetryableError(
 		message: AssistantMessage,
-		options?: { allowModelFallback?: boolean; fireworksFastFallback?: boolean; hardErrorFallback?: boolean },
+		options?: {
+			allowModelFallback?: boolean;
+			fireworksFastFallback?: boolean;
+			hardErrorFallback?: boolean;
+			preserveFailedTurn?: boolean;
+		},
 	): Promise<boolean> {
 		const retrySettings = this.settings.getGroup("retry");
 		// The Fireworks Fast→base degrade is an intrinsic model-selection safety net,
@@ -16092,7 +16469,10 @@ export class AgentSession {
 		// (every rotation sets switchedCredential and skips it), so without
 		// this last resort a provider-wide usage cap never fails over to the
 		// configured chain.
-		const retryBudgetExhausted = this.#retryAttempt > retrySettings.maxRetries;
+		const maxRetries = this.#isOpenRouterThinkingStreamClose(message)
+			? Math.min(retrySettings.maxRetries, 1)
+			: retrySettings.maxRetries;
+		const retryBudgetExhausted = this.#retryAttempt > maxRetries;
 
 		const errorMessage = message.errorMessage || "Unknown error";
 		const id = this.#classifyRetryMessage(message);
@@ -16185,7 +16565,7 @@ export class AgentSession {
 		}
 		if (retryBudgetExhausted) {
 			if (!switchedModel) {
-				await this.#persistRetryLifecycleErrorMessage(message);
+				await this.#persistTerminalEmptyErrorTurn(message);
 				// Max retries exceeded and no fallback model to switch to: emit
 				// final failure and reset.
 				await this.#emitSessionEvent({
@@ -16232,7 +16612,7 @@ export class AgentSession {
 		// can act on it.
 		const maxDelayMs = retrySettings.maxDelayMs;
 		if (maxDelayMs > 0 && delayMs > maxDelayMs && !switchedCredential && !switchedModel) {
-			await this.#persistRetryLifecycleErrorMessage(message);
+			await this.#persistTerminalEmptyErrorTurn(message);
 			const attempt = this.#retryAttempt;
 			this.#retryAttempt = 0;
 			await this.#emitSessionEvent({
@@ -16251,14 +16631,17 @@ export class AgentSession {
 		await this.#emitSessionEvent({
 			type: "auto_retry_start",
 			attempt: this.#retryAttempt,
-			maxAttempts: retrySettings.maxRetries,
+			maxAttempts: maxRetries,
 			delayMs,
 			errorMessage,
 			errorId: message.errorId,
 		});
 
-		// Remove the failed assistant message from active context before retrying.
-		this.#removeAssistantMessageFromActiveContext(message, "auto-retry");
+		// Cursor exec-channel tools have already run and emitted results. Keep that
+		// failed turn intact so continuation cannot repeat their side effects.
+		if (!options?.preserveFailedTurn) {
+			this.#removeAssistantMessageFromActiveContext(message, "auto-retry");
+		}
 
 		// A thinking/response loop retried into identical context loops again. Inject a
 		// hidden redirect so the retried turn sees a directive to break the repeated
@@ -16374,20 +16757,40 @@ export class AgentSession {
 	/**
 	 * Manually retry the last failed assistant turn.
 	 * Removes the error message from agent state and re-attempts with a fresh retry budget.
+	 *
+	 * A stream that stalls or aborts mid-tool-call ends the turn with
+	 * `stopReason: "error" | "aborted"` and then appends one synthetic
+	 * {@link isSyntheticToolResultMessage tool_result} per emitted tool call to
+	 * preserve the provider's tool_use/tool_result pairing (see
+	 * `createAbortedToolResult` in `agent-loop.ts`). Those placeholders trail the
+	 * failed assistant turn, so the retry lookback walks back over them before
+	 * checking the assistant message; it strips both the placeholders and the
+	 * failed turn before re-attempting.
+	 *
 	 * @returns true if retry was initiated, false if no failed turn to retry or agent is busy
 	 */
 	async retry(): Promise<boolean> {
 		if (this.isStreaming || this.isCompacting || this.isRetrying) return false;
 
 		const messages = this.agent.state.messages;
-		const lastMsg = messages[messages.length - 1];
+
+		// Walk back past trailing synthetic tool_result placeholders emitted for
+		// tool calls that never ran because the turn stalled/aborted mid-tool-call.
+		// They shadow the failed assistant turn from the single-message lookback.
+		let turnEnd = messages.length;
+		while (turnEnd > 0 && isSyntheticToolResultMessage(messages[turnEnd - 1])) {
+			turnEnd--;
+		}
+
+		const lastMsg = messages[turnEnd - 1];
 		if (lastMsg?.role !== "assistant") return false;
 
 		const assistantMsg = lastMsg as AssistantMessage;
 		if (assistantMsg.stopReason !== "error" && assistantMsg.stopReason !== "aborted") return false;
 
-		// Remove the failed/aborted assistant message (same as auto-retry does before re-attempting)
-		this.agent.replaceMessages(messages.slice(0, -1));
+		// Remove the failed/aborted assistant message plus its synthetic tool
+		// results (same as auto-retry does before re-attempting).
+		this.agent.replaceMessages(messages.slice(0, turnEnd - 1));
 
 		// Reset retry budget for a fresh attempt
 		this.#retryAttempt = 0;
@@ -16622,7 +17025,7 @@ export class AgentSession {
 					signal: abortController.signal,
 					sessionKey: target.sessionId,
 					cwd,
-					timeout: clampTimeout("bash") * 1000,
+					timeout: clampTimeout("bash", undefined, this.settings.get("tools.maxTimeout")) * 1000,
 					onMinimizedSave: originalText => this.#saveBashOriginalArtifact(target, originalText),
 					useUserShell: options?.useUserShell,
 				});
@@ -17832,7 +18235,30 @@ export class AgentSession {
 	 */
 	async navigateTree(
 		targetId: string,
-		options: { summarize?: boolean; customInstructions?: string } = {},
+		options: {
+			summarize?: boolean;
+			customInstructions?: string;
+			/**
+			 * Opts into the two-phase `ask` toolResult re-answer protocol
+			 * (issue #5642): set only by the interactive `/tree` selector, which
+			 * knows how to re-open the picker on `reopenAsk` and complete the
+			 * navigation with `reanswerAskResult`. Every other public caller
+			 * (extensions, hooks, ACP, session-extension actions) leaves this
+			 * unset and gets the pre-#5642 plain leaf move onto `ask`
+			 * toolResults instead — they have no picker to re-open and would
+			 * otherwise report a successful no-op navigation (roboomp review on
+			 * #5895).
+			 */
+			allowAskReopen?: boolean;
+			/**
+			 * Completes an in-progress `ask` re-answer (issue #5642): the caller
+			 * already received `reopenAsk` from a prior call on the same
+			 * `targetId`, re-opened the picker, and is handing back the fresh
+			 * answer. Branches a new toolResult sibling instead of landing on
+			 * the original one.
+			 */
+			reanswerAskResult?: AgentToolResult<AskToolDetails>;
+		} = {},
 	): Promise<{
 		editorText?: string;
 		cancelled: boolean;
@@ -17840,12 +18266,36 @@ export class AgentSession {
 		summaryEntry?: BranchSummaryEntry;
 		/** Raw session context built during navigation — pass to renderInitialMessages to skip a second O(N) walk. */
 		sessionContext?: SessionContext;
+		/**
+		 * Set when `targetId` is an `ask` toolResult, `options.allowAskReopen`
+		 * was set, and `options.reanswerAskResult` was not supplied: nothing was
+		 * mutated. The caller must re-open the ask picker with these
+		 * `questions`, then call `navigateTree(targetId, { ...options,
+		 * reanswerAskResult })` with the produced result to actually branch
+		 * (issue #5642).
+		 */
+		reopenAsk?: { toolCallId: string; questions: AskToolInput["questions"] };
 	}> {
 		await this.#flushPendingBashMessages();
 		const oldLeafId = this.sessionManager.getLeafId();
 
-		// No-op if already at target
-		if (targetId === oldLeafId) {
+		const targetEntry = this.sessionManager.getEntry(targetId);
+		if (!targetEntry) {
+			throw new Error(`Entry ${targetId} not found`);
+		}
+		const targetIsAskResult =
+			targetEntry.type === "message" &&
+			targetEntry.message.role === "toolResult" &&
+			targetEntry.message.toolName === "ask";
+
+		// No-op if already at target — except mid-flight through the `ask`
+		// re-answer protocol (issue #5642): a probe or completion call can
+		// legitimately target the *current* leaf (e.g. the user interrupted
+		// right after answering `ask`, before a follow-up assistant message
+		// landed, or another caller navigated straight onto the ask result),
+		// and must still return `reopenAsk` / branch the new answer instead of
+		// silently reporting a no-op (chatgpt-codex review on #5895).
+		if (targetId === oldLeafId && !(options.allowAskReopen && targetIsAskResult)) {
 			return { cancelled: false };
 		}
 
@@ -17854,16 +18304,47 @@ export class AgentSession {
 			throw new Error("No model available for summarization");
 		}
 
-		const targetEntry = this.sessionManager.getEntry(targetId);
-		if (!targetEntry) {
-			throw new Error(`Entry ${targetId} not found`);
+		// `ask` toolResult, first pass: hand control back to the caller to
+		// re-open the picker instead of landing on the stale answer in place.
+		// Nothing is mutated here — see the `reanswerAskResult` branch below for
+		// the actual sibling-branch construction once the caller has an answer.
+		// Gated on `allowAskReopen` — callers that don't understand `reopenAsk`
+		// fall straight through to the plain leaf move below instead of
+		// reporting a successful no-op (roboomp review on #5895).
+		if (
+			options.allowAskReopen &&
+			!options.reanswerAskResult &&
+			targetEntry.type === "message" &&
+			targetEntry.message.role === "toolResult" &&
+			targetEntry.message.toolName === "ask"
+		) {
+			const toolCallId = targetEntry.message.toolCallId;
+			const questions = this.#recoverAskReanswerQuestions(targetEntry.parentId, toolCallId);
+			if (questions) {
+				return { cancelled: false, reopenAsk: { toolCallId, questions } };
+			}
+			// Original arguments couldn't be recovered (corrupted/legacy session
+			// data) — fall through to a plain leaf move so navigation still works.
 		}
 
-		// Collect entries to summarize (from old leaf to common ancestor)
+		// Collect entries to summarize (from old leaf to common ancestor). For an
+		// `ask` re-answer completion, the branch point is `targetEntry.parentId`
+		// (the new sibling toolResult lands there, not on `targetId`) — anchor
+		// the collection there too, or the old answer entry is neither on the
+		// new branch nor included in the summary (chatgpt-codex review on
+		// #5895).
+		const summaryAnchorId =
+			options.reanswerAskResult !== undefined &&
+			targetEntry.type === "message" &&
+			targetEntry.message.role === "toolResult" &&
+			targetEntry.message.toolName === "ask" &&
+			targetEntry.parentId !== null
+				? targetEntry.parentId
+				: targetId;
 		const { entries: entriesToSummarize, commonAncestorId } = collectEntriesForBranchSummary(
 			this.sessionManager,
 			oldLeafId,
-			targetId,
+			summaryAnchorId,
 		);
 
 		// Prepare event data
@@ -17959,6 +18440,27 @@ export class AgentSession {
 							.filter((c): c is { type: "text"; text: string } => c.type === "text")
 							.map(c => c.text)
 							.join("");
+		} else if (
+			targetEntry.type === "message" &&
+			targetEntry.message.role === "toolResult" &&
+			targetEntry.message.toolName === "ask" &&
+			options.reanswerAskResult
+		) {
+			// `ask` toolResult, second pass: the caller re-opened the picker and
+			// is handing back a fresh answer. Branch a *new* sibling toolResult
+			// off the same `ask` toolCall instead of reusing `targetId` — the
+			// original answer's branch stays reachable (issue #5642).
+			const reanswer = options.reanswerAskResult;
+			const toolResultMessage: ToolResultMessage = {
+				role: "toolResult",
+				toolCallId: targetEntry.message.toolCallId,
+				toolName: "ask",
+				content: reanswer.content,
+				details: reanswer.details,
+				isError: reanswer.isError === true,
+				timestamp: Date.now(),
+			};
+			newLeafId = this.sessionManager.appendMessageToBranch(toolResultMessage, targetEntry.parentId);
 		} else {
 			// Non-user message (or a user-invoked skill-prompt injection): land the
 			// leaf on the selected node so it stays on the active branch. Skill
@@ -18019,6 +18521,73 @@ export class AgentSession {
 			return { editorText, cancelled: false, summaryEntry, sessionContext: rawContext };
 		}
 		return { editorText, cancelled: false, summaryEntry, sessionContext: stateContext };
+	}
+
+	/**
+	 * Look up the `ask` toolCall's persisted `arguments` and validate them
+	 * back into `questions`, for `/tree` `ask` re-answer (issue #5642). Walks
+	 * up from the toolResult's parent past any interleaved ancestor entries
+	 * — sibling toolResults from other tool calls in the same turn (`ask`
+	 * runs `exclusive`, which only serializes *execution*, not persistence
+	 * order — roboomp review on #5895), and bookkeeping entries such as the
+	 * `tool_execution_start` custom entry `#recordToolExecutionStart()`
+	 * appends before every toolResult in real persisted sessions (chatgpt-codex
+	 * review on #5895) — until it finds the assistant entry that actually
+	 * emitted `toolCallId`. Stops at a `user` message (turn boundary) or a
+	 * dead end. Returns `undefined` when no ancestor entry holds a matching
+	 * `ask` toolCall, or the arguments can't be resolved — the caller falls
+	 * back to a plain leaf move rather than opening a picker with bad data.
+	 */
+	#recoverAskReanswerQuestions(parentId: string | null, toolCallId: string): AskToolInput["questions"] | undefined {
+		let current = parentId;
+		while (current !== null) {
+			const entry = this.sessionManager.getEntry(current);
+			if (!entry) return undefined;
+			if (entry.type === "message") {
+				if (entry.message.role === "assistant") {
+					const toolCall = entry.message.content.find(
+						(block): block is AgentToolCall => block.type === "toolCall" && block.id === toolCallId,
+					);
+					if (!toolCall) return undefined;
+					if (toolCall.name !== "ask") return undefined;
+					const args = this.#obfuscator?.hasSecrets()
+						? deobfuscateToolArguments(this.#obfuscator, toolCall.arguments)
+						: toolCall.arguments;
+					return recoverAskQuestions(args);
+				}
+				if (entry.message.role === "user") return undefined;
+			}
+			current = entry.parentId;
+		}
+		return undefined;
+	}
+
+	/**
+	 * Build a standalone `AgentToolContext` for running `AskTool.execute()`
+	 * outside a normal agent turn, for `/tree` `ask` re-answer (issue #5642).
+	 * `SelectorController` has no reachable `ToolContextStore` (that store is
+	 * built inside `sdk.ts` and never threaded through to mode controllers),
+	 * so this mirrors `refreshMCPTools()`'s `getCustomToolContext` factory
+	 * with real session state instead of a `{ ... } as unknown as
+	 * AgentToolContext` cast that could silently compile with an incomplete
+	 * context (roboomp review on #5895) — every `CustomToolContext` field is
+	 * backed by live session state, so a future required field fails to
+	 * compile here instead of surfacing as `undefined` at runtime.
+	 */
+	buildAskReanswerContext(uiContext: ExtensionUIContext): AgentToolContext {
+		return {
+			sessionManager: this.sessionManager,
+			modelRegistry: this.#modelRegistry,
+			model: this.model,
+			isIdle: () => !this.isStreaming,
+			hasQueuedMessages: () => this.queuedMessageCount > 0,
+			abort: () => {
+				this.agent.abort();
+			},
+			settings: this.settings,
+			ui: uiContext,
+			hasUI: true,
+		};
 	}
 
 	/**

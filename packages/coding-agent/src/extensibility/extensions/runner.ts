@@ -179,17 +179,22 @@ export type SwitchSessionHandler = (sessionPath: string) => Promise<{ cancelled:
 export type ShutdownHandler = () => void;
 
 /**
- * Helper function to emit session_shutdown event to extensions.
- * Returns true if the event was emitted, false if there were no handlers.
+ * Emit `session_shutdown` and clear timers owned by an extension runner.
+ *
+ * Returns whether any shutdown handlers were present. Timer cleanup runs even
+ * when a handler fails so extension background work cannot outlive its host.
  */
 export async function emitSessionShutdownEvent(extensionRunner: ExtensionRunner | undefined): Promise<boolean> {
-	if (extensionRunner?.hasHandlers("session_shutdown")) {
+	if (!extensionRunner) return false;
+	try {
+		if (!extensionRunner.hasHandlers("session_shutdown")) return false;
 		await extensionRunner.emit({
 			type: "session_shutdown",
 		});
 		return true;
+	} finally {
+		extensionRunner.clearManagedTimers();
 	}
-	return false;
 }
 
 const noOpUIContext: ExtensionUIContext = {
@@ -887,14 +892,15 @@ export class ExtensionRunner {
 		return undefined;
 	}
 
-	createContext(): ExtensionContext {
+	/** Creates an extension context, optionally scoped to a provider request model. */
+	createContext(model?: Model): ExtensionContext {
 		const runner = this;
 		const generation = this.#generation;
 		const isCurrentGeneration = () =>
 			runner.#generation === generation && (!runner.#deactivated || runner.#deactivating);
 		const canMutateGeneration = () =>
 			runner.#generation === generation && !runner.#deactivated && !runner.#deactivating;
-		const getModel = () => (isCurrentGeneration() ? runner.#getModel() : undefined);
+		const getModel = () => (isCurrentGeneration() ? (model ?? runner.#getModel()) : undefined);
 		const canScheduleTimer = () => canMutateGeneration();
 		return {
 			get ui() {
@@ -1403,9 +1409,10 @@ export class ExtensionRunner {
 		return currentMessages;
 	}
 
-	async emitBeforeProviderRequest(payload: unknown): Promise<BeforeProviderRequestEventResult> {
+	/** Runs request payload hooks with the model used for that provider request. */
+	async emitBeforeProviderRequest(payload: unknown, model?: Model): Promise<BeforeProviderRequestEventResult> {
 		if (this.#deactivated) return payload;
-		const ctx = this.createContext();
+		const ctx = this.createContext(model);
 		let currentPayload = payload;
 
 		for (const ext of this.extensions) {
